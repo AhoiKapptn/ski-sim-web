@@ -3,3 +3,4 @@ shots/
 dist
 .DS_Store
 .staging/
+.claude/
