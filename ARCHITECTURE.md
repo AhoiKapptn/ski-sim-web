@@ -43,6 +43,19 @@ subsystem each frame. Read what you need; only the owner writes each field.
 |---|---|---|
 | `world/sky.js` | `createSky(scene, renderer)` | sky dome, sun, atmosphere, IBL env, time of day, clouds |
 | `world/terrain.js` | `class Terrain` | heightfield + LOD mesh. `height(x,z)`/`normal(x,z)` are authoritative for physics |
+
+### `Terrain.normal(x, z, third)` — two call conventions
+
+Both are in use and both must keep working; an integration broke once because
+only one was implemented.
+
+- `normal(x, z, outVec3)` — analytic gradient written into the caller's vector.
+- `normal(x, z, epsilon)` — normal finite-differenced over a footprint of that
+  radius. The physics passes `1.6`–`2.2` so metre-scale surface noise doesn't
+  jitter the skier's orientation.
+
+Dispatch on `typeof third === 'number'`.
+
 | `world/snow-material.js` | `createSnowMaterial(opts)` | the snow shader: sparkle, sheen, subsurface, wind ripples |
 | `world/scatter.js` | `createScatter(scene, terrain)` | instanced trees, rocks, lift towers, gates, fences |
 | `player/skier.js` | `createSkier(scene)` | skier mesh/rig + procedural animation from `state` |
