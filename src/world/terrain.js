@@ -23,10 +23,18 @@
  *
  * LOD
  * ---
- * A geometry clipmap: 10 concentric levels, cell size 0.4 m -> 205 m, covering
- * 19.6 km. Geometry is a single static unit-lattice ring instanced per level;
- * levels are positioned by the model matrix and displaced entirely on the GPU,
- * so moving the camera costs zero CPU work — no re-tessellation, ever.
+ * A geometry clipmap: 9 concentric levels, cell size 0.4 m -> 102 m, covering
+ * 19.7 km. Levels are positioned by the model matrix and displaced entirely on
+ * the GPU, so moving the camera costs zero CPU work — no re-tessellation, ever.
+ * The *ring resolution* is not constant: it ramps from 96 up to 384 with the
+ * level, because a uniform-resolution clipmap facets its far rings exactly as
+ * badly as its near ones (see LEVEL_RES). The outer rings run the cheap vertex
+ * path, so the extra triangles there are close to free.
+ *
+ * Beyond the geometry, the fragment program re-runs the same bicubic
+ * reconstruction per pixel past ~400 m, so shading normals and terrain data
+ * channels in the far field come from the field itself rather than from an
+ * interpolated 25-100 m triangle.
  */
 import * as THREE from 'three';
 import { createSnowMaterial, getLattice, GLSL_LATTICE_NOISE } from './snow-material.js';
@@ -38,10 +46,28 @@ const MAP_STEP = MAP_EXT / MAP_RES;   // 8 m / texel
 const MAP_ORIGIN = -MAP_EXT / 2;
 
 // --- clipmap -----------------------------------------------------------------
-const RING_RES = 96;           // cells per side of each level
-const RING_HOLE = 48;          // cells of the hole punched in levels >= 1
+// Per-level lattice resolution. A *uniform* ring resolution R gives every level
+// the same angular cell size — 2/R rad at its outer edge and 4/R at its inner
+// edge — which is the whole point of a clipmap, but it also means the coarse
+// far rings facet exactly as badly as the fine near ones. At R=96 that worst
+// case is 1/24 rad: seventy pixels of flat triangle, which is precisely the
+// sawtooth you see along a 4 km skyline.
+//
+// So the resolution ramps with the level instead. It costs almost nothing where
+// it matters: the outer rings run the *cheap* vertex path (the metre-scale
+// detail layers have already faded out there), so they are pure bandwidth, and
+// the near rings — which carry the expensive noise — stay at 96.
+//
+// Nesting constraint: hole(k) * cell(k) / 2 == extent(k-1), i.e. hole(k) must be
+// res(k-1)/2 exactly, or the rings gap.
+const LEVEL_RES = [96, 96, 128, 160, 192, 320, 384, 384, 384];
 const CELL0 = 0.4;             // finest cell size, metres
-const LEVELS = 10;
+const LEVELS = LEVEL_RES.length;
+const LEVEL_HOLE = LEVEL_RES.map((_, k) => (k === 0 ? 0 : LEVEL_RES[k - 1] / 2));
+
+// Prevailing wind, world XZ. Must match `uWindDir` in snow-material.js: the
+// cornice displacement and the shader's wind-loading masks have to agree.
+const WIND_X = 0.82, WIND_Z = 0.57;
 
 // =============================================================================
 // CPU noise — the exact twin of GLSL `latNoise` in snow-material.js
@@ -315,6 +341,8 @@ export class Terrain {
         uniforms: this.uniforms,
         prelude: GLSL_DISPLACE_PRELUDE,
         body: GLSL_DISPLACE_BODY,
+        fragPrelude: GLSL_MACRO_RECON,
+        fragRefine: GLSL_FRAG_REFINE,
       },
     });
     this.snowUniforms = this.material.userData.snowUniforms;
@@ -438,9 +466,20 @@ export class Terrain {
         delta[k] = -Math.min(38, 0.26 * Math.pow(flow[k], 0.45)) * clamp(slope * 2.4 - 0.10, 0.0, 1);
       }
     }
-    for (let k = 0; k < R * R; k++) { H[k] += delta[k]; }
+    // The channel carve leaves a stepped trench that has to be relaxed. A
+    // *blanket* Laplacian relax is what turns every face into a smooth dome
+    // though: four passes at 0.3 removes essentially all the 30-60 m structure,
+    // which from three kilometres is exactly the band that reads as buttresses,
+    // ribs and gullies. So the relaxation is weighted by how much each cell was
+    // actually carved — the trenches get smoothed, the faces keep their bones.
+    const relaxW = new Float32Array(R * R);
+    for (let k = 0; k < R * R; k++) {
+      H[k] += delta[k];
+      relaxW[k] = clamp(-delta[k] * 0.28, 0.10, 1.0);
+    }
 
     // -- 4. relax the carve, then a light smooth -----------------------------
+    const relax2 = new Float32Array(R * R);
     for (let it = 0; it < 4; it++) {
       delta.fill(0);
       for (let j = 1; j < R - 1; j++) {
@@ -449,7 +488,17 @@ export class Terrain {
           delta[k] = (H[k - 1] + H[k + 1] + H[k - R] + H[k + R]) * 0.25 - H[k];
         }
       }
-      for (let k = 0; k < R * R; k++) H[k] += delta[k] * 0.30;
+      // Blur the weight alongside, or the boundary between relaxed and
+      // unrelaxed ground becomes a visible seam down the side of every gully.
+      for (let j = 1; j < R - 1; j++) {
+        for (let i = 1; i < R - 1; i++) {
+          const k = j * R + i;
+          relax2[k] = (relaxW[k] * 2 + relaxW[k - 1] + relaxW[k + 1]
+            + relaxW[k - R] + relaxW[k + R]) * (1 / 6);
+        }
+      }
+      relaxW.set(relax2);
+      for (let k = 0; k < R * R; k++) H[k] += delta[k] * 0.30 * relaxW[k];
     }
 
     // -- 5. the piste --------------------------------------------------------
@@ -615,6 +664,7 @@ export class Terrain {
     ];
 
     let h = 0, dx = 0, dz = 0;
+    let cv = 0, cvx = 0, cvz = 0;
     for (let n = 0; n < 4; n++) {
       const jj = clamp(iz + n - 1, 0, R - 1);
       const row = jj * R;
@@ -622,13 +672,20 @@ export class Terrain {
       const c2 = clamp(ix + 1, 0, R - 1), c3 = clamp(ix + 2, 0, R - 1);
       const r0 = F[(row + c0) * 4], r1 = F[(row + c1) * 4];
       const r2 = F[(row + c2) * 4], r3 = F[(row + c3) * 4];
+      const q0 = F[(row + c0) * 4 + 1], q1 = F[(row + c1) * 4 + 1];
+      const q2 = F[(row + c2) * 4 + 1], q3 = F[(row + c3) * 4 + 1];
       const v = wx0 * r0 + wx1 * r1 + wx2 * r2 + wx3 * r3;
       const g = gx0 * r0 + gx1 * r1 + gx2 * r2 + gx3 * r3;
+      const cq = wx0 * q0 + wx1 * q1 + wx2 * q2 + wx3 * q3;
       h += wz[n] * v;
       dx += wz[n] * g;
       dz += gz[n] * v;
+      cv += wz[n] * cq;
+      cvx += wz[n] * (gx0 * q0 + gx1 * q1 + gx2 * q2 + gx3 * q3);
+      cvz += gz[n] * cq;
     }
     dx /= MAP_STEP; dz /= MAP_STEP;
+    cvx /= MAP_STEP; cvz /= MAP_STEP;
 
     // ---- analytic micro detail (mirrors GLSL `terrMicro`) ----
     const slope = Math.sqrt(dx * dx + dz * dz);
@@ -637,12 +694,44 @@ export class Terrain {
 
     let mh = 0, mgx = 0, mgy = 0;
 
+    // Cornices and wind lips — the CPU twin of the block in GLSL_DISPLACE_BODY.
+    // Gated to slopes past 24 degrees, which the piste corridor never reaches,
+    // so the ski surface is untouched; but it has to be evaluated here anyway or
+    // the physics surface and the rendered mesh would part company on the aretes.
+    {
+      const ct = clamp((-cv - 0.16) / 0.46, 0, 1);
+      const ca = ct * ct * (3 - 2 * ct);
+      const dca = 6 * ct * (1 - ct) / 0.46;
+      const cb = smoothstep(0.45, 0.85, slope);
+      if (ca * cb > 0.002) {
+        const sc = latNoise(x * (1 / 70), z * (1 / 70), _n3);
+        const scal = 0.55 + 0.9 * sc[0];
+        const inv = 1 / Math.max(slope, 1e-4);
+        const lee = clamp(-(dx * inv) * WIND_X - (dz * inv) * WIND_Z, 0, 1);
+        const camp = -2 + 12 * lee * lee;
+        mh += ca * cb * scal * camp;
+        mgx += ((-dca * cvx * cb) * scal + (ca * cb) * 0.9 * sc[1] * (1 / 70)) * camp;
+        mgy += ((-dca * cvz * cb) * scal + (ca * cb) * 0.9 * sc[2] * (1 / 70)) * camp;
+      }
+    }
+
     // rolling drift band
     {
       const amp = 2.2 * soft + 1.6 * rocky, f = 1 / 64;
       const r = this._fbmD(x * f, z * f, 4, 0.5);
       mh += r[0] * amp;
       mgx += r[1] * amp * f; mgy += r[2] * amp * f;
+    }
+    // hectometre ridged bands — the ones that survive to the horizon
+    if (rocky > 0.002) {
+      const amp = 24 * rocky, f = 1 / 200;
+      const r = this._ridgedD(x * f, z * f, 2, 0.5);
+      mh += (r[0] - 0.36) * amp;
+      mgx += r[1] * amp * f; mgy += r[2] * amp * f;
+      const amp2 = 10 * rocky, f2 = 1 / 85;
+      const r2 = this._ridgedD(x * f2, z * f2, 1, 0.5);
+      mh += (r2[0] - 0.33) * amp2;
+      mgx += r2[1] * amp2 * f2; mgy += r2[2] * amp2 * f2;
     }
     // ridged rock ribs
     {
@@ -728,19 +817,24 @@ export class Terrain {
   // --------------------------------------------------------------- clipmap --
   _buildClipmap() {
     this.levels = [];
-    const solid = buildLevelGeometry(RING_RES, 0);
-    const ring = buildLevelGeometry(RING_RES, RING_HOLE);
+    const cache = new Map();
     for (let k = 0; k < LEVELS; k++) {
       const cell = CELL0 * Math.pow(2, k);
-      const mesh = new THREE.Mesh(k === 0 ? solid : ring, this.material);
+      const res = LEVEL_RES[k], hole = LEVEL_HOLE[k];
+      const key = res + ':' + hole;
+      let geo = cache.get(key);
+      if (!geo) { geo = buildLevelGeometry(res, hole); cache.set(key, geo); }
+      const mesh = new THREE.Mesh(geo, this.material);
       mesh.customDepthMaterial = this.depthMaterial;
       mesh.scale.set(cell, 1, cell);
       mesh.frustumCulled = false;
-      // Only the rings that actually fall inside a plausible sun-shadow frustum
-      // take part in shadowing. Beyond that the shadow lookup samples outside
-      // the map, and clamped border texels streak across the distant faces.
-      const inShadowRange = k <= 6;
-      mesh.receiveShadow = inShadowRange;
+      // Only the rings that actually fall inside the sun-shadow frustum take
+      // part in shadowing. That box is ±95 m around the skier (see sky.js), so
+      // level 4 — whose outer edge is 614 m out — is already generous margin.
+      // Every ring past it would just be a few hundred thousand triangles
+      // rasterised into a depth map they cannot possibly intersect.
+      const inShadowRange = k <= 4;
+      mesh.receiveShadow = k <= 6;
       mesh.castShadow = inShadowRange;
       mesh.renderOrder = -10 + k;
       mesh.name = 'terrain-lod' + k;
@@ -782,7 +876,7 @@ export class Terrain {
         if (scene.fog.isFogExp2) {
           // Soften: uniform exp2 fog erases the far peaks entirely. Ours falls
           // off with altitude so summits stay readable.
-          u.uAerialDensity.value = scene.fog.density * 0.62;
+          u.uAerialDensity.value = scene.fog.density * 0.52;
         }
       }
     }
@@ -792,7 +886,12 @@ export class Terrain {
     this.heightTex.dispose();
     this.material.dispose();
     this.depthMaterial.dispose();
-    for (const l of this.levels) l.mesh.geometry.dispose();
+    const seen = new Set();
+    for (const l of this.levels) {
+      if (seen.has(l.mesh.geometry)) continue;
+      seen.add(l.mesh.geometry);
+      l.mesh.geometry.dispose();
+    }
   }
 }
 
@@ -856,11 +955,12 @@ function buildLevelGeometry(res, hole) {
 // =============================================================================
 // GPU side of the surface function. Line-for-line the twin of `_sample` above.
 // =============================================================================
-const GLSL_DISPLACE_PRELUDE = /* glsl */`
+// Shared by the vertex program (displacement) and the fragment program (far
+// field shading normals) — both have to read exactly the same surface.
+const GLSL_MACRO_RECON = /* glsl */`
 uniform sampler2D uHeightTex;
 uniform vec4 uMapInfo;     // origin, 1/step, resolution, step
 uniform vec3 uFocus;
-attribute float aSkirt;
 
 const float TRC = 0.8, TRS = 0.6, TLAC = 2.07;
 
@@ -868,8 +968,10 @@ vec4 terrTexel( ivec2 c ) {
   return texelFetch( uHeightTex, clamp( c, ivec2( 0 ), ivec2( int( uMapInfo.z ) - 1 ) ), 0 );
 }
 
-// Catmull-Rom bicubic with analytic first derivative for the height channel.
-void terrMacro( vec2 p, out vec4 data, out vec2 grad ) {
+// Catmull-Rom bicubic with analytic first derivatives. 'grad' is the gradient of
+// the height channel; 'cgrad' that of the curvature channel, which the cornice
+// term needs and which costs four extra MACs, not another texel fetch.
+void terrMacro( vec2 p, out vec4 data, out vec2 grad, out vec2 cgrad ) {
   vec2 q = ( p - vec2( uMapInfo.x ) ) * uMapInfo.y;
   vec2 i = floor( q );
   vec2 f = q - i;
@@ -894,7 +996,7 @@ void terrMacro( vec2 p, out vec4 data, out vec2 grad ) {
 
   ivec2 b = ivec2( i ) - 1;
   data = vec4( 0.0 );
-  float dhx = 0.0, dhy = 0.0;
+  float dhx = 0.0, dhy = 0.0, dcx = 0.0, dcy = 0.0;
   for ( int n = 0; n < 4; n ++ ) {
     vec4 t0 = terrTexel( b + ivec2( 0, n ) );
     vec4 t1 = terrTexel( b + ivec2( 1, n ) );
@@ -902,11 +1004,15 @@ void terrMacro( vec2 p, out vec4 data, out vec2 grad ) {
     vec4 t3 = terrTexel( b + ivec2( 3, n ) );
     vec4 rowV = wx.x * t0 + wx.y * t1 + wx.z * t2 + wx.w * t3;
     float rowD = gx.x * t0.x + gx.y * t1.x + gx.z * t2.x + gx.w * t3.x;
+    float rowC = gx.x * t0.y + gx.y * t1.y + gx.z * t2.y + gx.w * t3.y;
     data += wy[ n ] * rowV;
     dhx  += wy[ n ] * rowD;
     dhy  += gy[ n ] * rowV.x;
+    dcx  += wy[ n ] * rowC;
+    dcy  += gy[ n ] * rowV.y;
   }
-  grad = vec2( dhx, dhy ) * uMapInfo.y;
+  grad  = vec2( dhx, dhy ) * uMapInfo.y;
+  cgrad = vec2( dcx, dcy ) * uMapInfo.y;
 }
 
 vec3 terrFbmD( vec2 p, int oct, float gain ) {
@@ -954,11 +1060,78 @@ vec3 terrRidgedD( vec2 p, int oct, float gain ) {
 }
 `;
 
+// Fragment side. The far rings are 25-100 m per cell, so both the interpolated
+// normal and the interpolated data channels are smeared across triangles the
+// size of a city block: ridges shade as flat facets and the snowline snaps to
+// triangle edges. Re-running the *same* reconstruction per pixel decouples
+// shading from tessellation entirely — the silhouette is still polygonal, but
+// nothing inside it is.
+const GLSL_FRAG_REFINE = /* glsl */`
+{
+  float mMix = smoothstep( 240.0, 620.0, snViewDist );
+  if ( mMix > 0.003 ) {
+    vec4 md; vec2 mg, mc;
+    terrMacro( P.xz, md, mg, mc );
+    vec2 mMacroG = mg;                       // macro-only: the masks are keyed on it
+    float mslope = length( mg );
+    float mrocky = smoothstep( 0.62, 1.15, mslope );
+
+    // The same two geometric detail bands the vertex program displaces by. They
+    // have to be here too, or the per-pixel normal would be *smoother* than the
+    // mesh it is shading — the opposite error, and every bit as visible on a
+    // rock face as the facets were.
+    float mfd = distance( P.xz, uFocus.xz );
+    if ( mrocky > 0.002 ) {
+      mg += terrRidgedD( P.xz * ( 1.0 / 200.0 ), 2, 0.5 ).yz * ( 24.0 * mrocky / 200.0 );
+      float fC = smoothstep( 5000.0, 3000.0, mfd );
+      if ( fC > 0.004 ) {
+        mg += terrRidgedD( P.xz * ( 1.0 / 85.0 ), 1, 0.5 ).yz * ( 10.0 * mrocky * fC / 85.0 );
+      }
+    }
+    float fA = smoothstep( 2400.0, 1200.0, mfd );
+    float fB = smoothstep( 1900.0,  900.0, mfd );
+    if ( fA > 0.004 ) {
+      float amp = ( 2.2 * ( 1.0 - mrocky ) + 1.6 * mrocky ) * fA * ( 1.0 / 64.0 );
+      mg += terrFbmD( P.xz * ( 1.0 / 64.0 ), 4, 0.5 ).yz * amp;
+    }
+    if ( fB > 0.004 && mrocky > 0.004 ) {
+      float amp = 17.0 * mrocky * fB * ( 1.0 / 58.0 );
+      mg += terrRidgedD( P.xz * ( 1.0 / 58.0 ), 4, 0.52 ).yz * amp;
+    }
+
+    float mSteep = atan( length( mg ) );
+    // Cornice lip — the vertex program's twin, evaluated per pixel so the lit
+    // edge of the lip stays sharp however coarse the mesh under it is.
+    float ct = clamp( ( -md.y - 0.16 ) / 0.46, 0.0, 1.0 );
+    float ca = ct * ct * ( 3.0 - 2.0 * ct );
+    float dca = 6.0 * ct * ( 1.0 - ct ) / 0.46;
+    float cb = smoothstep( 0.45, 0.85, mslope );
+    float cornAmt = 0.0;
+    if ( ca * cb > 0.002 ) {
+      vec3 sc = latNoise( P.xz * ( 1.0 / 70.0 ) );
+      float scal = 0.55 + 0.9 * sc.x;
+      float lee = clamp( dot( -mMacroG / max( mslope, 1e-4 ), vec2( ${WIND_X}, ${WIND_Z} ) ), 0.0, 1.0 );
+      float camp = -2.0 + 12.0 * lee * lee;
+      mg += ( ( -dca * mc * cb ) * scal + ( ca * cb ) * 0.9 * sc.yz * ( 1.0 / 70.0 ) ) * camp;
+      cornAmt = ca * cb * scal * lee;
+    }
+    vec3 mn = normalize( vec3( -mg.x, 1.0, -mg.y ) );
+    Ng = normalize( mix( Ng, mn, mMix ) );
+    snData = mix( snData, vec4( mSteep, md.y, md.z, md.w - cornAmt * 1.6 ), mMix );
+  }
+}
+`;
+
+const GLSL_DISPLACE_PRELUDE = /* glsl */`
+attribute float aSkirt;
+${GLSL_MACRO_RECON}
+`;
+
 const GLSL_DISPLACE_BODY = /* glsl */`
 {
   vec2 P = wpos.xz;
-  vec4 mdata; vec2 mgrad;
-  terrMacro( P, mdata, mgrad );
+  vec4 mdata; vec2 mgrad, mcgrad;
+  terrMacro( P, mdata, mgrad, mcgrad );
 
   float slope = length( mgrad );
   float rocky = smoothstep( 0.62, 1.15, slope );
@@ -966,13 +1139,62 @@ const GLSL_DISPLACE_BODY = /* glsl */`
 
   // Detail fades with distance from the player, never from the camera — the
   // shadow pass renders from the sun and must agree with the beauty pass.
+  // The cut-offs sit where the ring cell size stops being able to carry the
+  // band; the resolution ramp in LEVEL_RES halved the cell size at every
+  // distance, so they moved out with it.
   float fd = distance( P, uFocus.xz );
-  float fadeA = smoothstep( 1400.0, 700.0, fd );
-  float fadeB = smoothstep( 1100.0, 520.0, fd );
-  float fadeM = smoothstep(  300.0, 110.0, fd );
+  float fadeA = smoothstep( 2400.0, 1200.0, fd );
+  float fadeB = smoothstep( 1900.0, 900.0, fd );
+  float fadeM = smoothstep(  300.0,  110.0, fd );
 
   float h = mdata.x;
   vec2 g = mgrad;
+
+  // Two ridged bands that outlive everything else. Deliberately low frequency —
+  // 200 m is still four cells across on the outermost ring — so they survive all
+  // the way to the horizon without aliasing, and they are the only geometry
+  // keeping a 3 km face from being a smooth dome once the thermal erosion in the
+  // bake has relaxed it and the metre-scale bands have gone.
+  if ( rocky > 0.002 ) {
+    float amp = 24.0 * rocky, f = 1.0 / 200.0;
+    vec3 r = terrRidgedD( P * f, 2, 0.5 );
+    h += ( r.x - 0.36 ) * amp;
+    g += r.yz * amp * f;
+    float fC = smoothstep( 5000.0, 3000.0, fd );
+    if ( fC > 0.004 ) {
+      float amp2 = 10.0 * rocky * fC, f2 = 1.0 / 85.0;
+      vec3 r2 = terrRidgedD( P * f2, 1, 0.5 );
+      h += ( r2.x - 0.33 ) * amp2;
+      g += r2.yz * amp2 * f2;
+    }
+  }
+
+  // --- cornices and wind lips ------------------------------------------------
+  // Curvature is negative where the ground is convex, so -mdata.y peaks exactly
+  // along the crest of an arete. Spindrift blown over that lip settles on the
+  // lee side and stands there as a cornice; the windward side gets scoured back.
+  // Scalloped with a 70 m noise so the lip waves along the crest the way a real
+  // one does instead of reading as a chamfer.
+  // Held back until after coarseSteep is taken: a cornice is snow standing on
+  // a steep face, and folding it into the slope that drives the rock mask would
+  // paint the one feature that is always white as bedrock.
+  float cornH = 0.0, cornAmt = 0.0;
+  vec2 cornG = vec2( 0.0 );
+  {
+    float ct = clamp( ( -mdata.y - 0.16 ) / 0.46, 0.0, 1.0 );
+    float ca = ct * ct * ( 3.0 - 2.0 * ct );
+    float dca = 6.0 * ct * ( 1.0 - ct ) / 0.46;
+    float cb = smoothstep( 0.45, 0.85, slope );   // steep ground only; the piste is concave and mellow
+    if ( ca * cb > 0.002 ) {
+      vec3 sc = latNoise( P * ( 1.0 / 70.0 ) );
+      float scal = 0.55 + 0.9 * sc.x;
+      float lee = clamp( dot( -mgrad / max( slope, 1e-4 ), vec2( ${WIND_X}, ${WIND_Z} ) ), 0.0, 1.0 );
+      float camp = -2.0 + 12.0 * lee * lee;
+      cornH = ca * cb * scal * camp;
+      cornG = ( ( -dca * mcgrad * cb ) * scal + ( ca * cb ) * 0.9 * sc.yz * ( 1.0 / 70.0 ) ) * camp;
+      cornAmt = ca * cb * scal * lee;
+    }
+  }
 
   if ( fadeA > 0.002 ) {
     float amp = ( 2.2 * soft + 1.6 * rocky ) * fadeA;
@@ -992,6 +1214,8 @@ const GLSL_DISPLACE_BODY = /* glsl */`
   // detail: a mask keyed on the full normal snaps to LOD triangle edges,
   // because per-vertex normals are only linearly interpolated across a face.
   float coarseSteep = atan( length( g ) );
+  h += cornH;
+  g += cornG;
   if ( fadeM > 0.002 ) {
     float gate = smoothstep( 0.16, 0.34, slope ) * smoothstep( 1.05, 0.62, slope ) * soft;
     float amp = 0.28 * gate * fadeM;
@@ -1014,7 +1238,9 @@ const GLSL_DISPLACE_BODY = /* glsl */`
 
   dspH = h;
   dspN = normalize( vec3( -g.x, 1.0, -g.y ) );
-  dspD = vec4( coarseSteep, mdata.y, mdata.z, mdata.w );
+  // Rock-exposure channel is pulled negative under a cornice so the shader's
+  // talus threshold rises there and the lip stays white.
+  dspD = vec4( coarseSteep, mdata.y, mdata.z, mdata.w - cornAmt * 1.6 );
   // LOD skirt. Only has to swallow the sub-cell reconstruction difference
   // between neighbouring levels, so it is kept to about one cell: a deep skirt
   // on a 100 m coarse level hangs hundreds of metres and pokes out of the

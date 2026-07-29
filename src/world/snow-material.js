@@ -116,8 +116,11 @@ uniform float uGrainFade;
 uniform vec3  uSnowTint;       // sunlit albedo
 uniform vec3  uShadeTint;      // multiple-scattering colour in shadow
 uniform vec3  uSSSTint;        // forward-scatter colour
-uniform vec3  uRockLo;
-uniform vec3  uRockHi;
+uniform vec3  uRockLo;         // joint / crack shadow
+uniform vec3  uRockHi;         // lit granite face
+uniform vec3  uRockWarm;       // lit limestone face
+uniform vec3  uRockIron;       // oxide staining
+uniform vec3  uRockLichen;     // crustose lichen
 uniform vec3  uBedding;        // bedding-plane normal, world space
 uniform float uRockAmount;
 uniform vec3  uAerialColor;
@@ -312,20 +315,31 @@ float snIce;
 float snPowder;
 float snViewDist;
 float snMicroAO = 1.0;
+float snRockAO = 1.0;
+float snSpecTint = 1.0;
 
 {
   vec3 P  = vSnowWPos;
   vec3 Ng = normalize( vSnowWNrm );
+  vec4 snData = vSnowData;
   snViewDist = length( P - cameraPosition );
+
+  // Hook for the terrain module: re-reconstructs the macro field per pixel so
+  // that out where the mesh is 25-100 m per cell, neither the shading normal nor
+  // the terrain data channels are hostage to the tessellation.
+  /*__TERRAIN_REFINE__*/
 
   float slope  = clamp( 1.0 - Ng.y, 0.0, 1.0 );            // 0 flat .. 1 vertical
   // Coarse (LOD-stable) inclination from the vertex program, nudged by the
   // real one so metre-scale steps can still expose rock up close.
-  float steep  = mix( vSnowData.x, acos( clamp( Ng.y, -1.0, 1.0 ) ), 0.32 );
-  float dFar   = snFade( 2600.0, 700.0, snViewDist );        // 1 near, 0 far
-  float curv   = vSnowData.y * dFar;
-  float flow   = vSnowData.z;
-  float expo   = vSnowData.w;
+  float steep  = mix( snData.x, acos( clamp( Ng.y, -1.0, 1.0 ) ), 0.32 );
+  float dFar   = snFade( 5200.0, 900.0, snViewDist );        // 1 near, 0 far
+  float curv   = snData.y * dFar;
+  // The rock masks want curvature alive all the way to the horizon — it is what
+  // wedges snow into the ledges — so they get their own, much longer, ramp.
+  float curvR  = snData.y * snFade( 11000.0, 1800.0, snViewDist );
+  float flow   = snData.z;
+  float expo   = snData.w;
 
   // Wind is not a constant: it wraps round spurs and pours through cols. A
   // slow rotation field keeps the sastrugi from looking combed with a rake.
@@ -341,40 +355,115 @@ float snMicroAO = 1.0;
   float wind   = clamp(  aspect * sqrt( slope ) * 2.4, 0.0, 1.0 );
 
   // --------------------------------------------------------------- rock ----
-  // Bedrock shows where the slope beats the angle snow can hold, and where the
-  // erosion sim already stripped the mantle. Perturbed so the snowline is ragged.
-  float rockNear = snFade( 1600.0, 320.0, snViewDist );
+  // Rock relief runs as a band cascade rather than one blob with a single fade.
+  // Each band is switched off only once its own features drop below a couple of
+  // pixels, so a face at 4 km still has 20 m ledges and 80 m buttresses on it
+  // instead of collapsing to the flat clay grey that a single 'fade to nothing'
+  // always produces.
+  float fRk0 = 1.0;                                        // ~80 m, to the horizon
+  float fRk1 = snFade( 9000.0, 2600.0, snViewDist );       // ~20 m
+  float fRk2 = snFade( 3400.0,  800.0, snViewDist );       // ~4 m
+  float fRk3 = snFade(  950.0,  200.0, snViewDist );       // ~1 m
+  float fRk4 = snFade(  200.0,   32.0, snViewDist );       // ~0.2 m
+
   vec3 rn  = snFbm( P.xz * 0.021, 3, 0.5 );
   vec3 rn2 = snFbm( P.xz * 0.0047, 3, 0.5 );
-  float talus = 0.71 + rn.x * 0.14 + rn2.x * 0.12 - expo * 0.30;   // ~41 deg nominal
-  float rockRaw = ( steep - talus ) * 4.2;
 
-  // Rock micro-relief. Fractures (ridged, so they read as edges rather than
-  // lumps) carry the structure; bedding strata ride on top of them. The strata
-  // deliberately do *not* feed the snow/rock mask — banded bedrock is right,
-  // a banded snowline is a contour map.
   vec3 rGrad = vec3( 0.0 );
-  float rH = 0.0, rFrac = 0.0;
+  float rLedge = 0.0, rFrac = 0.0, rB0 = 0.0, rB1 = 0.0;
   vec3 rw = pow( abs( Ng ), vec3( 3.0 ) );
   rw /= ( rw.x + rw.y + rw.z );
-  // Ledge scale — the only band allowed to steer the snowline.
-  fractureLayer( P, rw, 0.048, 0.62 * rockNear, 3, rGrad, rH );
-  // Structure scale — buttresses, slabs, cracks. Pure appearance.
-  fractureLayer( P, rw, 0.23,  0.105 * rockNear, 3, rGrad, rFrac );
-  fractureLayer( P, rw, 1.10,  0.024 * rockNear, 3, rGrad, rFrac );
-  fractureLayer( P, rw, 4.60,  0.0055 * snFade( 220.0, 40.0, snViewDist ), 2, rGrad, rFrac );
+  // Buttress and ledge scales — the two bands allowed to steer the snowline.
+  // Their amplitudes are metres, sized so that amp*freq matches the finer bands
+  // and the face keeps the same apparent roughness at every range. That is far
+  // too much *height* for the snowline blend, though, so only a scaled fraction
+  // is handed on to it.
+  fractureLayer( P, rw, 0.0125, 7.0 * fRk0, 2, rGrad, rB0 );
+  fractureLayer( P, rw, 0.048,  1.6 * fRk1, 3, rGrad, rB1 );
+  rLedge = rB0 * 0.030 + rB1 * 0.24;
+  // Structure scale — slabs, joints, cracks. Pure appearance.
+  fractureLayer( P, rw, 0.23,   0.105 * fRk2, 3, rGrad, rFrac );
+  fractureLayer( P, rw, 1.10,   0.024 * fRk3, 3, rGrad, rFrac );
+  fractureLayer( P, rw, 4.60,   0.0055 * fRk4, 2, rGrad, rFrac );
+
+  // Fractured facets. Rock parts along its joint sets into flat plates with hard
+  // edges; smooth noise alone can only make dough. Two world-scale cell grids,
+  // each retired once its plates fall under a few pixels, tilt the normal by a
+  // per-cell constant — flat inside, discontinuous at the joint.
+  // The grid is sheared and non-cubic so the plates read as joint blocks rather
+  // than as voxels, and the tilt is kept modest — enough to break the light
+  // across a face, not enough to look quarried by Minecraft.
+  vec3 facet = vec3( 0.0 );
+  vec3 fp = vec3( P.x * 0.97 + P.z * 0.24, P.y * 1.35, P.z * 0.97 - P.x * 0.24 );
+  float fFacetA = snFade( 2600.0, 500.0, snViewDist );
+  if ( fFacetA > 0.01 ) {
+    facet += ( hash33( floor( fp * 0.105 + 0.5 ) ) * 2.0 - 1.0 ) * 0.20 * fFacetA;
+  }
+  float fFacetB = snFade( 460.0, 70.0, snViewDist );
+  if ( fFacetB > 0.01 ) {
+    facet += ( hash33( floor( fp * 0.52 + 17.0 ) ) * 2.0 - 1.0 ) * 0.13 * fFacetB;
+  }
+
+  // --- bedding ---------------------------------------------------------------
+  // A tilted plane family whose dip and thickness both wander, so the massif
+  // reads as folded sedimentary rock rather than as a contour map. Granite units
+  // get almost none of it — they are massive, and their structure is the joints.
+  vec3 gu  = snFbm( P.xz * 0.00082, 3, 0.5 );
+  float unit = clamp( gu.x * 1.7 + 0.5, 0.0, 1.0 );        // 0 granite .. 1 limestone
+  vec3 bw  = snFbm( P.xz * 0.0016, 2, 0.5 );
+  vec3 dipN = normalize( uBedding + vec3( gu.y * 0.26, gu.z * 0.14, -gu.y * 0.22 ) );
+  // Folded: the beds undulate over hundreds of metres, so they cross a face as
+  // sweeping curves rather than as a ruled grating.
+  float fold = snFbm( P.xz * 0.00055, 2, 0.5 ).x * 2.6;
+  float bed = dot( P, dipN ) * ( 0.026 + 0.015 * bw.x ) + fold;
+  vec3 bn = snFbm( vec2( bed * 2.4, dot( P.xz, vec2( 0.021, -0.014 ) ) ), 3, 0.5 );
+  float strata = sin( bed * 6.2831 + bn.x * 3.4 );
+  strata = sign( strata ) * pow( abs( strata ), 0.75 );
+  // Thin laminations inside each bed — visible only close in.
+  float lamin = sin( bed * 27.0 + bn.y * 2.0 ) * snFade( 700.0, 140.0, snViewDist );
+
+  // Where the bedding plane runs nearly *parallel* to the ground, its trace on
+  // the surface degenerates into contour lines — arbitrarily close together and
+  // wrapping the peak like a topographic map. That is a geometric singularity,
+  // not a look; fade the bands out by how steeply the plane cuts the surface.
+  vec3 dipT = dipN - Ng * dot( dipN, Ng );
+  float cut = smoothstep( 0.20, 0.58, length( dipT ) );
+  float bedAmt = ( 0.25 + 0.75 * unit ) * cut * snFade( 4200.0, 900.0, snViewDist );
+  strata *= bedAmt;
+  lamin  *= bedAmt;
+
+  // Bedding planes are weaknesses: they step the face. Feed them into the relief
+  // gradient (along the dip direction) but *not* into the snowline — banded
+  // bedrock is right, a banded snowline is a topographic map.
+  rGrad += dipT * ( strata * 0.30 + lamin * 0.10 );
+
+  // --- where the snow stops --------------------------------------------------
+  // Ragged, and driven by everything that actually drives it: repose angle,
+  // erosion history, wind aspect, drainage and curvature. Plus long fall-line
+  // streaks, because on a steep face snow does not sit in patches — it sits in
+  // stripes running down the gullies between the ribs.
+  vec2 dHill = normalize( Ng.xz + vec2( 1e-5, 1e-5 ) );
+  vec2 dCross = vec2( -dHill.y, dHill.x );
+  vec3 strk = snFbm( vec2( dot( P.xz, dCross ) * 0.055,
+                           dot( P.xz, dHill ) * 0.0075 ), 3, 0.5 );
+
+  // Budget matters here: every one of these terms lowers the angle at which the
+  // mountain stops being white, and if their swings add up the snowline walks
+  // down onto the piste. Nominal 41 deg, and no combination can pull it under 30.
+  float talus = 0.735 + rn.x * 0.105 + rn2.x * 0.095 - expo * 0.28;
+  talus += strk.x * 0.058 * smoothstep( 0.55, 1.05, steep );       // fall-line streaking
+  talus += clamp( curvR, -1.0, 1.0 ) * 0.045;                      // snow wedges into hollows/ledges
+  talus += clamp( flow * 1.4 - 0.15, 0.0, 1.0 ) * 0.055;           // gullies fill in
+  talus += ( lee - wind ) * 0.045;                                 // windward blows clear, lee loads up
+  float rockRaw = ( steep - talus ) * 4.2;
 
   // Height-blend: snow settles into the low spots of the rock, so the boundary
   // follows real ledges instead of a soft lerp.
-  snRockMask = smoothstep( -0.62, 0.62, rockRaw + rH * 1.5 ) * uRockAmount;
-  rH += rFrac;
-
-  vec3 bw = snFbm( P.xz * 0.0016, 2, 0.5 );
-  float bed = dot( P, uBedding ) * ( 0.030 + 0.014 * bw.x );
-  vec3 bn = snFbm( vec2( bed * 2.4, dot( P.xz, vec2( 0.021, -0.014 ) ) ), 3, 0.5 );
-  float strata = sin( bed * 6.2831 + bn.x * 3.4 );
-  strata = sign( strata ) * pow( abs( strata ), 0.62 ) * rockNear;
-  rH += strata * 0.22;
+  // Snow lying on rock has a *hard* edge — it is a wedge of drift ending against
+  // a slab, not an airbrushed gradient — so the blend is tight up close and only
+  // widens far out, where a tight one would alias along the snowline.
+  float rEdge = mix( 0.34, 0.72, smoothstep( 300.0, 2000.0, snViewDist ) );
+  snRockMask = smoothstep( -rEdge, rEdge, rockRaw + rLedge * 1.5 ) * uRockAmount;
 
   // --------------------------------------------------------------- snow ----
   // Multi-scale relief. Everything is faded by view distance so the far field
@@ -382,10 +471,16 @@ float snMicroAO = 1.0;
   vec3 sw = pow( abs( Ng ), vec3( 4.0 ) );
   sw /= ( sw.x + sw.y + sw.z );
 
-  float fDrift  = snFade( 1800.0, 420.0, snViewDist );
-  float fDune   = snFade(  380.0,  90.0, snViewDist );
-  float fRipple = snFade(  110.0,  18.0, snViewDist );
-  float fGrain  = snFade(   18.0,   2.5, snViewDist ) * uGrainFade;
+  // The 35 m band is a *mid-field* band: close up the piste already has the 12 m
+  // drifts and the sastrugi, and stacking a third metre-scale wave on top of
+  // them just combs the near snow into stripes.
+  float fDeca   = snFade( 4600.0, 1000.0, snViewDist )
+                * smoothstep( 70.0, 280.0, snViewDist );     // ~35 m
+  float fDrift  = snFade( 2600.0,  500.0, snViewDist );      // ~12 m
+  float fSastr  = snFade(  800.0,  160.0, snViewDist );      // ~2.4 m
+  float fDune   = snFade(  380.0,   90.0, snViewDist );
+  float fRipple = snFade(  110.0,   18.0, snViewDist );
+  float fGrain  = snFade(   18.0,    2.5, snViewDist ) * uGrainFade;
 
   // Wind loading: pillows on the lee, hard scoured ripple on the windward side.
   float loadA = 0.55 + 0.85 * lee;
@@ -393,12 +488,15 @@ float snMicroAO = 1.0;
 
   vec3 grad = vec3( 0.0 );
   float relief = 0.0, fine = 0.0;
-  // Hectometre band: only switched on in the far field, where the clipmap
-  // geometry is 100 m per cell and the faces would otherwise be flat card.
-  float fFar = smoothstep( 500.0, 1500.0, snViewDist );
-  detailLayer( P, sw, 0.010, 4.5 * fFar, 1.0, 3, grad, relief );
-  detailLayer( P, sw, 0.085, 1.25 * fDrift * loadA, 1.0, 4, grad, relief );
-  detailLayer( P, sw, 0.42,  0.27 * fDrift * loadA, 0.86, 3, grad, relief );
+  // The far field is a *cascade*, not a fade-out. Every octave hands over to the
+  // next coarser one as it drops under a few pixels, so a snowfield at 1-3 km
+  // still has hectometre wind rolls and decametre drifts on it instead of the
+  // flat white wash you get when the last band simply expires.
+  float fFar = smoothstep( 280.0, 900.0, snViewDist );
+  detailLayer( P, sw, 0.0085, 6.0 * fFar, 1.0, 3, grad, relief );
+  detailLayer( P, sw, 0.030,  2.1 * fDeca, 1.0, 3, grad, relief );
+  detailLayer( P, sw, 0.085,  1.25 * fDrift * loadA, 1.0, 4, grad, relief );
+  detailLayer( P, sw, 0.42,   0.27 * fSastr * loadA, 0.86, 3, grad, relief );
   // The sub-metre bands are tracked separately: their pits are what carry the
   // micro-occlusion that stops snow reading as a painted surface.
   detailLayer( P, sw, 1.55,  0.072 * fDune * scour, 0.56, 3, grad, fine );
@@ -410,15 +508,25 @@ float snMicroAO = 1.0;
   relief += fine;
 
   // Convex wind lips get scoured to ice; hollows collect powder.
-  snIce = clamp( ( curv * 1.5 + wind * 0.55 - 0.22 ) * 1.6 + relief * 0.5, 0.0, 1.0 );
+  // The relief accumulator is in *metres*, and the coarse bands carry several of them, so it
+  // has to enter bounded — otherwise every drift bigger than a wheelbarrow
+  // saturates the ice term and the snow comes out as blue satin combing.
+  snIce = clamp( ( curv * 1.5 + wind * 0.55 - 0.22 ) * 1.6
+                 + clamp( relief * 0.4, -0.45, 0.45 ), 0.0, 1.0 );
   snIce = smoothstep( 0.18, 0.85, snIce ) * smoothstep( 0.06, 0.30, slope ) * dFar;
   snPowder = clamp( -curv * 1.9 + lee * 0.5 + flow * 0.45, 0.0, 1.0 );
 
   // Surface-gradient normal perturbation (correct on steeps, no UV stretch).
-  vec3 g = mix( grad, rGrad * 1.5, snRockMask );
+  vec3 g = mix( grad, rGrad * 2.1, snRockMask );
   g -= Ng * dot( g, Ng );
   float ds = uDetailStrength * mix( 1.0, 0.72, snIce );
   snNormalW = normalize( Ng - g * ds );
+  // Joint facets rotate the whole plate rather than dimpling it, so they are
+  // applied to the normal directly instead of through the gradient.
+  if ( snRockMask > 0.004 ) {
+    vec3 fN = facet - Ng * dot( facet, Ng );
+    snNormalW = normalize( snNormalW + fN * snRockMask );
+  }
 
   // ------------------------------------------------------------- albedo ----
   // Snow albedo is high and slightly blue; grain size (powder vs. wind slab)
@@ -428,14 +536,39 @@ float snMicroAO = 1.0;
   snowAlb = mix( snowAlb, uSnowTint * vec3( 0.93, 0.96, 1.03 ), snIce );
   snowAlb = mix( snowAlb, uSnowTint * vec3( 1.02, 1.02, 1.03 ), snPowder * 0.6 );
 
-  // Everything that bands with altitude must vanish with distance or it turns
-  // the far peaks into a topographic map.
-  float bandMix = clamp( 0.5 + ( strata * 0.42 + bn.x * 0.30 ) * rockNear, 0.0, 1.0 );
-  vec3 rockAlb = mix( uRockLo, uRockHi, bandMix );
+  // Two rock types, interleaved in broad geological units: a cool grey granite
+  // and a warmer buff limestone. Which one you are standing on is the single
+  // biggest cue that the mountain is made of something.
+  vec3 rockFace = mix( uRockHi, uRockWarm, unit );
+  float bandMix = clamp( 0.5 + strata * 0.32 + bn.x * 0.26 + lamin * 0.14
+                             + rn2.x * 0.20 * ( 1.0 - unit ), 0.0, 1.0 );
+  vec3 rockAlb = mix( uRockLo, rockFace, bandMix );
   // Cracks go near-black; the faces catch the light. This contrast is most of
-  // what separates rock from clay.
-  rockAlb *= 0.20 + 1.15 * clamp( rFrac * 5.5 + 0.62, 0.0, 1.0 );
-  rockAlb = mix( rockAlb, rockAlb * vec3( 1.14, 1.0, 0.82 ), clamp( rn2.x * 0.5 + 0.5, 0.0, 1.0 ) * rockNear );
+  // what separates rock from clay. The *coarse* bands are in this sum as well,
+  // so a face four kilometres away still has dark chimneys and pale buttresses
+  // on it long after the metre-scale crack field has been retired.
+  rockAlb *= 0.34 + 1.00 * clamp( rFrac * 5.5 + rLedge * 1.15 + 0.62, 0.0, 1.0 );
+  // The facet tilt doubles as a per-plate lightness jitter — freshly split faces
+  // are pale, weathered ones are not.
+  rockAlb *= 1.0 + facet.y * 0.30;
+
+  // Iron oxide bleeds out of the bedding and runs down the wet lines.
+  float iron = clamp( rn2.x * 1.6 + 0.18, 0.0, 1.0 )
+             * clamp( 0.30 + flow * 1.3 + strata * 0.35, 0.0, 1.0 );
+  rockAlb = mix( rockAlb, uRockIron, iron * 0.48 );
+  // Crustose lichen: it wants gentler, lower, less scoured rock.
+  float lichen = clamp( rn.x * 1.7 + 0.24, 0.0, 1.0 )
+               * snFade( 1.22, 0.78, steep )
+               * snFade( 1500.0, 900.0, P.y )
+               * snFade( 2600.0, 700.0, snViewDist );
+  rockAlb = mix( rockAlb, uRockLichen, lichen * 0.42 );
+  // Meltwater seeps darken and gloss the gullies.
+  float wetRock = clamp( flow * 1.7 - 0.28, 0.0, 1.0 ) * clamp( 0.4 + curvR, 0.0, 1.0 );
+  rockAlb *= mix( 1.0, 0.42, wetRock );
+
+  // Cavity occlusion from the crack field — the cheapest thing that stops a
+  // rock face reading as a decal on a smooth surface.
+  snRockAO = mix( 1.0, clamp( 0.58 + rFrac * 3.0 + rLedge * 0.35, 0.42, 1.0 ), snRockMask );
 
   diffuseColor.rgb = mix( snowAlb, rockAlb, snRockMask );
 
@@ -445,7 +578,15 @@ float snMicroAO = 1.0;
   float snowRough = mix( 0.84, 0.32, snIce ) - slab * 0.13;
   snowRough = mix( snowRough, 0.92, snPowder * 0.55 );
   snowRough -= 0.10 * fGrain;
-  roughnessFactor = mix( clamp( snowRough, 0.16, 0.97 ), 0.88, snRockMask );
+  // Rock is not a uniform matte either: a fresh split face has a hard sheen,
+  // weathered limestone is chalky, and anything wet goes properly glossy. That
+  // spread is what gives the rock a specular identity instead of a flat value.
+  float rockRough = mix( 0.90, 0.74, unit )
+                  - 0.16 * clamp( rFrac * 4.0 + 0.4, 0.0, 1.0 )
+                  - 0.34 * wetRock
+                  + 0.06 * lichen;
+  roughnessFactor = mix( clamp( snowRough, 0.16, 0.97 ), clamp( rockRough, 0.24, 0.96 ), snRockMask );
+  snSpecTint = mix( 1.0, 1.9, snRockMask * ( 0.25 + 0.75 * wetRock ) );
   // Distance-based specular anti-aliasing. Once a square metre of surface is
   // smaller than a pixel, a tight lobe can only shimmer; widen it instead.
   roughnessFactor = max( roughnessFactor, 0.72 * smoothstep( 400.0, 1600.0, snViewDist ) );
@@ -531,6 +672,20 @@ const SNOW_SCATTER = /* glsl */`
   reflectedLight.indirectDiffuse += diffuseColor.rgb * uShadeTint * snowness
     * ( 0.08 + 0.40 * ( 1.0 - lit ) );
   reflectedLight.directDiffuse *= snMicroAO * mix( 1.0, snMicroAO, 0.6 );
+
+  // Rock. Cavity occlusion from the crack field, and an actual specular
+  // response: bedrock was the only thing in the frame that never caught a
+  // highlight, which is most of why it read as untextured clay. Wet gullies get
+  // the strongest lobe, freshly split faces the next.
+  reflectedLight.indirectDiffuse *= snRockAO;
+  reflectedLight.directDiffuse *= mix( 1.0, 0.45 + 0.55 * snRockAO, snRockMask );
+  reflectedLight.directSpecular *= snSpecTint;
+  // Grazing sheen on the big faces — real rock has a slightly polished, dusty
+  // Fresnel that lifts the far silhouettes off the haze.
+  if ( snRockMask > 0.004 ) {
+    float rf = pow( 1.0 - clamp( dot( N, V ), 0.0, 1.0 ), 4.0 );
+    reflectedLight.directSpecular += C * shd * max( ndl, 0.0 ) * rf * 0.10 * snRockMask;
+  }
 }
 #endif
 `;
@@ -632,9 +787,14 @@ export function createSnowMaterial(opts = {}) {
     uSnowTint: { value: new THREE.Color(0.64, 0.675, 0.745) },
     uShadeTint: { value: new THREE.Color(0.60, 0.71, 1.14) },
     uSSSTint: { value: new THREE.Color(0.86, 0.92, 1.0) },
-    uRockLo: { value: new THREE.Color(0.018, 0.018, 0.021) },
-    uRockHi: { value: new THREE.Color(0.112, 0.109, 0.107) },
-    uBedding: { value: new THREE.Vector3(0.22, 0.94, -0.26).normalize() },
+    uRockLo: { value: new THREE.Color(0.026, 0.026, 0.030) },
+    uRockHi: { value: new THREE.Color(0.114, 0.120, 0.138) },     // cool grey granite
+    uRockWarm: { value: new THREE.Color(0.205, 0.168, 0.114) },   // buff limestone
+    uRockIron: { value: new THREE.Color(0.104, 0.052, 0.022) },   // oxide staining
+    uRockLichen: { value: new THREE.Color(0.066, 0.074, 0.048) },
+    // A near-horizontal bedding plane makes contour terraces out of every face.
+    // Real strata dip, and the dip is what tells you the massif was folded.
+    uBedding: { value: new THREE.Vector3(0.74, 0.30, -0.60).normalize() },
     uRockAmount: { value: rock ? 1.0 : 0.0 },
     uAerialColor: { value: new THREE.Color(0.34, 0.47, 0.70) },
     uAerialSun: { value: new THREE.Color(0.86, 0.84, 0.78) },
@@ -671,9 +831,17 @@ export function createSnowMaterial(opts = {}) {
     }
 
     // ---- fragment ----
+    // The displacement provider may also inject a fragment-side refinement (the
+    // terrain re-reconstructs its macro field per pixel so far-field shading is
+    // not hostage to 100 m triangles); it needs its own prelude, without the
+    // vertex attributes.
+    const surface = SNOW_SURFACE.replace(
+      '/*__TERRAIN_REFINE__*/', () => (displacement && displacement.fragRefine) || '',
+    );
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\n' + GLSL_LATTICE_NOISE + SNOW_FRAG_PRELUDE)
-      .replace('#include <roughnessmap_fragment>', SNOW_SURFACE + '\n')
+      .replace('#include <common>', '#include <common>\n' + GLSL_LATTICE_NOISE + SNOW_FRAG_PRELUDE
+        + ((displacement && displacement.fragPrelude) || ''))
+      .replace('#include <roughnessmap_fragment>', surface + '\n')
       .replace('#include <normal_fragment_begin>', SNOW_NORMAL)
       .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + SNOW_SCATTER)
       .replace('#include <tonemapping_fragment>', SNOW_AERIAL + '\n#include <tonemapping_fragment>');

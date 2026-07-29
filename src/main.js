@@ -58,6 +58,10 @@ const harness = {
   ready: false,
   frames: 0,
   state,
+  // Live subsystem handles, so diagnostics can measure the scene instead of
+  // guessing from pixels (e.g. compare the rig's ski base against terrain
+  // height to prove a grounding bug).
+  debug: { terrain, sky, scatter, skier, physics, spray, tracks, postfx, chaseCam, camera, scene, renderer },
   setPlayer(x, z, heading = Math.PI) {
     physics.reset(state, x, z, heading);
     controls.update(0, state);

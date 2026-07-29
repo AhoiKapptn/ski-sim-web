@@ -10,15 +10,24 @@
  *          ──► TAA resolve   reprojected history, YCoCg variance clipping;
  *                            also applies exposure, so everything downstream
  *                            is sensor-referred rather than scene-referred
- *          ──► UnrealBloom   threshold 2.3 exposed-linear, wide soft falloff
- *          ──► DOF           depth CoC, golden-angle gather bokeh
- *          ──► motion blur   depth reprojection against a *virtual* previous
- *                            camera derived from state.vel (so it works in
- *                            stills too), subject-masked, + speed lines
+ *          ──► UnrealBloom   threshold 2.6 exposed-linear, tight pyramid: only
+ *                            specular glints and the sun disc, never the snow
+ *          ──► DOF           depth CoC, golden-angle gather bokeh. Deep focus:
+ *                            the far field is essentially sharp (no CoC at all
+ *                            inside 1 km, ~1 px at the horizon), the near field
+ *                            gets what defocus there is, like a 35 mm at f/8.
+ *          ──► motion blur   true per-pixel velocity: the frame is reprojected
+ *                            against a virtual camera placed one *shutter* back
+ *                            along the real camera path (translation from
+ *                            state.vel, rotation slerped from last frame), so
+ *                            displacement is depth-correct — near ground streaks,
+ *                            distant peaks do not move. Hard-capped in PIXELS,
+ *                            and gated off entirely below ~55 km/h.
  *          ──► grade         lateral CA, white balance, ASC-CDL + split-tone
  *                            + saturation in LOG space, then the Uchimura GT
  *                            display transform, then sRGB
- *          ──► SMAA
+ *          ──► SMAA          off by default — TAA already resolves the edges
+ *                            and a second pass only rounds off the ridgelines
  *          ──► film          contrast-adaptive sharpen, animated grain that
  *                            scales with shadow depth, vignette + speed
  *                            vignette → screen
@@ -41,41 +50,61 @@ import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 export const PARAMS = {
   taa: { enabled: true, feedback: 0.89, clipScale: 1.0, sharpen: 0.20 },
 
+  // SMAA on top of TAA is belt-and-braces that costs real sharpness: the jitter
+  // already resolves every edge in the frame, and running a second morphological
+  // pass over the result rounds off exactly the ridgelines and ski edges the
+  // terrain team spent their budget on. Measured A/B at the `trees` framing: the
+  // peaks read visibly crisper with it off and no aliasing appears. Kept in the
+  // chain, switched off, in case TAA is ever disabled — then this must come back.
+  smaa: { enabled: false },
+
   bloom: {
     enabled: true,
     // Threshold is in *exposed* linear units. Sunlit snow lands around 1.0–1.6
-    // after exposure, so 2.3 means only genuine speculars, the sun disc and
-    // ice glints bloom — never the snow field itself.
-    threshold: 2.3,
-    strength: 0.20,
-    radius: 0.85,
+    // after exposure, so 2.6 means only genuine speculars, the sun disc and ice
+    // glints bloom — never the snow field itself. Radius is deliberately tight:
+    // a wide pyramid turns every snow sparkle into a 25 px orb and the frame
+    // starts to look like a dirty lens.
+    threshold: 2.6,
+    strength: 0.18,
+    radius: 0.30,
   },
 
+  // Deep focus. A chase camera on a 35 mm-equivalent lens stopped down to f/8
+  // is sharp from a couple of metres to infinity; the *only* legitimate defocus
+  // in this frame is a whisper on the very near foreground and a barely-there
+  // softening on peaks kilometres away. The distant ridgeline is the most
+  // detailed thing on screen and must survive intact.
   dof: {
     enabled: true,
     focus: 9.0,        // metres, driven by update()
     focusSpeed: 3.0,   // focus-pull rate (1/s)
-    nearStrength: 0.55,
-    farStrength: 0.40,
-    farRange: 40,      // far blur reaches full strength at focus*(1+farRange)
-    maxCoC: 5.0,       // px at 900p; scaled with resolution
+    nearStrength: 1.0, // full CoC only for things basically touching the lens
+    nearRange: 0.62,   // fraction of the focus distance the near ramp spans
+    farStrength: 0.34, // ceiling on the far CoC (× maxCoC px)
+    farStart: 260,     // metres — nothing before this softens at all
+    farEnd: 2600,      // metres — far CoC ceiling reached here
+    maxCoC: 3.0,       // px at 900p; scaled with resolution
   },
 
   motion: {
     enabled: true,
-    shutter: 0.009,     // seconds of open shutter (≈ 1/110 s)
-    maxVelocity: 0.010, // uv units — hard cap so nothing ever smears
+    shutter: 0.008,     // seconds of open shutter (≈ 1/125 s, a sports shutter)
+    maxPixels: 4.0,     // px at 900p — hard cap; nothing ever smears past this
     strength: 1.0,      // driven by update() from state.speed
-    speedLines: 0.0022, // extra radial streak at frame edges at full speed
-    nearFade: 1.4,      // metres — anything closer than this never blurs
-    subjectRadius: 0.075,  // uv radius of the "rides with the camera" mask
-    subjectProtect: 0.92,
+    // Gate. Below `speedLo` there is no blur at all; it reaches full weight at
+    // `speedHi`. 15 m/s ≈ 54 km/h, 30 m/s ≈ 108 km/h.
+    speedLo: 15.0,
+    speedHi: 30.0,
+    nearFade: 1.2,      // metres — anything closer than this never blurs
+    subjectRadius: 0.085,  // uv radius of the "rides with the camera" mask
+    subjectProtect: 0.94,
   },
 
   grade: {
     // Applied before bloom (sensor-referred). Mid grey after this should sit
     // near 0.18 linear; sunlit snow around 1.0–1.6.
-    exposure: 0.78,
+    exposure: 0.88,
     trim: 1.0,          // small post-bloom exposure trim
     // Uchimura "GT" tonemap. m/l give a linear section through mid grey (0.18
     // maps to 0.18) and then a long exponential shoulder — linear 1.0 lands at
@@ -88,22 +117,25 @@ export const PARAMS = {
     lift: [-0.002, 0.0, 0.006],
     gamma: [1.0, 1.0, 1.006],
     gain: [1.004, 1.0, 0.996],
-    shadowTint: [0.972, 0.992, 1.030],   // cool shadows
-    highTint: [1.016, 1.003, 0.980],     // warm highlights
-    contrast: 1.07,
+    // Split tone. Snow shadows are already lit by a blue sky, so the cool push
+    // here is tiny — any more and the shade goes lavender.
+    shadowTint: [0.982, 0.996, 1.020],   // cool shadows
+    highTint: [1.018, 1.004, 0.982],     // warm highlights
+    contrast: 1.075,
+    sCurve: 0.16,           // extra mid-tone slope; decays to 0 at both ends
     pivot: 0.553,           // log position of 0.18 mid grey
-    saturation: 1.06,
-    highlightDesat: 0.35,   // pull extreme highlights toward neutral
-    chromatic: 0.55,        // px of lateral CA at the corners
+    saturation: 1.05,
+    highlightDesat: 0.30,   // pull extreme highlights toward neutral
+    chromatic: 0.40,        // px of lateral CA at the corners
   },
 
   film: {
-    sharpen: 0.26,
-    grain: 0.017,
-    grainShadowBias: 1.8,   // grain multiplier in the deepest shadows
-    vignette: 0.20,
+    sharpen: 0.32,
+    grain: 0.012,
+    grainShadowBias: 1.6,   // grain multiplier in the deepest shadows
+    vignette: 0.13,
     speedVignette: 0.0,     // driven by update()
-    speedVignetteMax: 0.24,
+    speedVignetteMax: 0.10,
   },
 };
 
@@ -342,33 +374,42 @@ uniform vec2  uTexel;
 uniform vec2  uNearFar;
 uniform float uFocus;
 uniform float uNearStrength;
+uniform float uNearRange;
 uniform float uFarStrength;
-uniform float uFarRange;
+uniform vec2  uFarBand;     // x = start metres, y = end metres
 uniform float uMaxCoC;      // pixels
 ${COMMON}
 ${DEPTH_GLSL}
 
-const int TAPS = 22;
+const int TAPS = 20;
 const float GOLDEN = 2.39996323;
 
 float cocAt(vec2 uv) {
   float z = linearDepth(texture2D(tDepth, uv).x, uNearFar.x, uNearFar.y);
   if (z >= uFocus) {
-    // A true thin-lens far CoC saturates within ~3x the focus distance, which
-    // turns the whole landscape to mush. Stretch the ramp instead so trees and
-    // mid-ground stay crisp and only genuinely distant peaks soften.
-    float t = smoothstep(0.0, 1.0, (z - uFocus) / max(uFocus * uFarRange, 1e-3));
+    // DEEP FOCUS. A thin-lens far CoC saturates within ~3x the focus distance,
+    // which turns an entire mountain range into brushed metal — the single most
+    // expensive detail in the frame destroyed by the cheapest effect in it.
+    // Instead the far ramp does not even begin until uFarBand.x metres and
+    // tops out at a fraction of a pixel, so peaks read as *aerial haze soft*,
+    // never as out of focus. The ramp is log-spaced so it matches how
+    // atmospheric extinction actually falls off with distance.
+    float a = log2(max(z, uFarBand.x) / uFarBand.x);
+    float b = log2(uFarBand.y / uFarBand.x);
+    float t = smoothstep(0.0, 1.0, a / max(b, 1e-3));
     return t * uFarStrength;
   }
-  float t = clamp((uFocus - z) / max(uFocus, 1e-3), 0.0, 1.0);
-  return -t * uNearStrength;
+  // Near field carries what little defocus there is: only geometry inside
+  // uNearRange of the focus plane — spray, a ski tip, a passing gate.
+  float t = clamp((uFocus - z) / max(uFocus * uNearRange, 1e-3), 0.0, 1.0);
+  return -t * t * uNearStrength;
 }
 
 void main() {
   float cocC = cocAt(vUv);
   float rPix = abs(cocC) * uMaxCoC;
 
-  if (rPix < 0.6) {
+  if (rPix < 0.75) {
     gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb, 1.0);
     return;
   }
@@ -399,8 +440,19 @@ void main() {
 `;
 
 // -----------------------------------------------------------------------------
-// Motion blur — depth reprojection against a virtual previous camera, plus a
-// speed-line term for the sky/far field where reprojection velocity is ~0.
+// Motion blur — TRUE per-pixel velocity.
+//
+// Every pixel is unprojected with its own depth and reprojected through a
+// virtual camera sitting one shutter-open back along the real camera path. The
+// resulting screen-space displacement is therefore parallax-correct: the snow a
+// metre under the lens sweeps, a tree at 40 m barely moves, and a peak at 3 km
+// is mathematically pinned. That is the whole difference between camera blur
+// and the radial zoom smear that ruins so many racing games — a radial streak
+// keyed off a global speed scalar blurs the *distant* image hardest, which is
+// exactly backwards, and is why there is no such term here.
+//
+// The displacement is then clamped in PIXELS, not uv, so it cannot exceed a few
+// pixels at any resolution, and the whole pass is gated off below ~55 km/h.
 // -----------------------------------------------------------------------------
 const MB_FRAG = /* glsl */ `
 precision highp float;
@@ -409,17 +461,16 @@ uniform sampler2D tDiffuse;
 uniform sampler2D tDepth;
 uniform mat4  uReproject;
 uniform vec2  uNearFar;
-uniform vec2  uFocalCentre;
+uniform vec2  uTexel;
 uniform float uStrength;
-uniform float uMaxVel;
-uniform float uSpeedLines;
+uniform float uMaxPixels;
 uniform float uNearFade;
 uniform vec3  uSubject;        // xy = screen uv of the skier, z = its distance
 uniform vec2  uSubjectShape;   // x = screen radius, y = protection amount
 ${COMMON}
 ${DEPTH_GLSL}
 
-const int SAMPLES = 11;
+const int SAMPLES = 9;
 
 void main() {
   float d = texture2D(tDepth, vUv).x;
@@ -443,15 +494,17 @@ void main() {
   float prot = exp(-dd * dd) * (1.0 - smoothstep(0.18, 0.55, zrel));
   vel *= 1.0 - uSubjectShape.y * prot;
 
-  // Stylised radial streak, strongest at the corners. Sells speed on the sky
-  // and distant ridges, which have almost no parallax velocity.
-  vec2 rd = vUv - uFocalCentre;
-  vel += rd * dot(rd, rd) * uSpeedLines * 4.0;
-
   vel *= uStrength;
-  float len = length(vel);
-  if (len > uMaxVel) vel *= uMaxVel / len;
-  if (len < 0.00035) { gl_FragColor = vec4(base, 1.0); return; }
+
+  // Clamp in pixels. uMaxPixels is the *total* streak length, so the half
+  // sweep either side of the pixel is half that.
+  vec2 velPix = vel / uTexel;
+  float lenPix = length(velPix);
+  if (lenPix > uMaxPixels) vel *= uMaxPixels / lenPix;
+
+  // Under a pixel of travel there is nothing to integrate — bail before paying
+  // for nine taps. At walking pace this is every pixel in the frame.
+  if (lenPix < 1.0) { gl_FragColor = vec4(base, 1.0); return; }
 
   float jitter = hash12(gl_FragCoord.xy) - 0.5;
   vec3 acc = vec3(0.0);
@@ -459,7 +512,7 @@ void main() {
   for (int i = 0; i < SAMPLES; i++) {
     float t = (float(i) + 0.5 + jitter) / float(SAMPLES) - 0.5;
     vec2 uv2 = clamp(vUv - vel * t, vec2(0.001), vec2(0.999));
-    float w = 1.0 - abs(t) * 0.7;          // slight centre bias
+    float w = 1.0 - abs(t) * 0.6;          // slight centre bias
     acc += texture2D(tDiffuse, uv2).rgb * w;
     wsum += w;
   }
@@ -480,7 +533,7 @@ uniform vec2  uGT2;        // c, b
 uniform vec2  uWhiteBalance;
 uniform vec3  uLift, uGamma, uGain;
 uniform vec3  uShadowTint, uHighTint;
-uniform float uContrast, uPivot, uSaturation, uHighDesat;
+uniform float uContrast, uPivot, uSaturation, uHighDesat, uSCurve;
 uniform float uChromatic;
 uniform vec2  uTexel;
 ${COMMON}
@@ -543,8 +596,17 @@ void main() {
   // word, so sunlit snow can never lose its texture to a gain.
   vec3 lg = clamp((log2(col + 1e-4) + LOG_LO) / LOG_RANGE, 0.0, 1.2);
 
-  lg = (lg - uPivot) * uContrast + uPivot;            // S-curve about mid grey
+  lg = (lg - uPivot) * uContrast + uPivot;            // straight log gain
   lg = pow(max(lg * uGain + uLift, vec3(0.0)), uGamma); // ASC-CDL
+
+  // Gentle S. uContrast above is a straight slope change and it drags the
+  // shoulder and the toe around with it; this adds the actual *S* — a little
+  // extra slope through the mid-tones whose effect decays to nothing at both
+  // ends. Snow highlights and rock shadows therefore keep every code they had
+  // while the mid-tones (the modelling on the slope, the folds in the jacket)
+  // gain bite. Driven off luminance so it never shifts hue.
+  float sd = dot(lg, vec3(0.3333)) - uPivot;
+  lg = max(lg + uSCurve * sd * exp(-sd * sd * 11.0), vec3(0.0));
   float w = smoothstep(0.30, 0.86, dot(lg, vec3(0.3333)));
   lg *= mix(uShadowTint, uHighTint, w);              // split tone
   float Yl = luma(lg);
@@ -616,6 +678,14 @@ void main() {
   float sv = 1.0 - uSpeedVignette * pow(smoothstep(0.10, 0.95, r), 2.0);
   c *= vig * sv;
 
+  // Output dither. This is the last stop before an 8-bit framebuffer and the
+  // sky is a 3000 m smooth gradient — without ±half a code of triangular noise
+  // it lays down visible contour rings, and the grain above is deliberately too
+  // fine and too shadow-weighted to hide them up in the highlights.
+  float t1 = hash12(gl_FragCoord.xy + vec2(uTime * 17.3, uTime * 11.9));
+  float t2 = hash12(gl_FragCoord.yx - vec2(uTime * 13.1, uTime * 19.7));
+  c += (t1 + t2 - 1.0) / 255.0;
+
   gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }
 `;
@@ -682,8 +752,9 @@ export function createPostFX(renderer, scene, camera) {
       uNearFar: { value: new THREE.Vector2(camera.near, camera.far) },
       uFocus: { value: PARAMS.dof.focus },
       uNearStrength: { value: PARAMS.dof.nearStrength },
+      uNearRange: { value: PARAMS.dof.nearRange },
       uFarStrength: { value: PARAMS.dof.farStrength },
-      uFarRange: { value: PARAMS.dof.farRange },
+      uFarBand: { value: new THREE.Vector2(PARAMS.dof.farStart, PARAMS.dof.farEnd) },
       uMaxCoC: { value: PARAMS.dof.maxCoC },
     },
     vertexShader: VERT,
@@ -697,10 +768,9 @@ export function createPostFX(renderer, scene, camera) {
       tDepth: { value: depthTexture },
       uReproject: { value: new THREE.Matrix4() },
       uNearFar: { value: new THREE.Vector2(camera.near, camera.far) },
-      uFocalCentre: { value: new THREE.Vector2(0.5, 0.5) },
+      uTexel: { value: new THREE.Vector2(1 / W, 1 / H) },
       uStrength: { value: 0 },
-      uMaxVel: { value: PARAMS.motion.maxVelocity },
-      uSpeedLines: { value: 0 },
+      uMaxPixels: { value: PARAMS.motion.maxPixels },
       uNearFade: { value: PARAMS.motion.nearFade },
       uSubject: { value: new THREE.Vector3(0.5, 0.5, 9) },
       uSubjectShape: { value: new THREE.Vector2(PARAMS.motion.subjectRadius, PARAMS.motion.subjectProtect) },
@@ -724,6 +794,7 @@ export function createPostFX(renderer, scene, camera) {
       uShadowTint: { value: new THREE.Vector3(...g.shadowTint) },
       uHighTint: { value: new THREE.Vector3(...g.highTint) },
       uContrast: { value: g.contrast },
+      uSCurve: { value: g.sCurve },
       uPivot: { value: g.pivot },
       uSaturation: { value: g.saturation },
       uHighDesat: { value: g.highlightDesat },
@@ -758,6 +829,7 @@ export function createPostFX(renderer, scene, camera) {
   composer.addPass(dofPass);
   composer.addPass(mbPass);
   composer.addPass(gradePass);
+  smaaPass.enabled = PARAMS.smaa.enabled || !PARAMS.taa.enabled;
   composer.addPass(smaaPass);
   composer.addPass(filmPass);
 
@@ -767,17 +839,23 @@ export function createPostFX(renderer, scene, camera) {
   const currVP = new THREE.Matrix4();
   const currVPInv = new THREE.Matrix4();
   const prevVP = new THREE.Matrix4();
-  const tmpM = new THREE.Matrix4();
-  const trans = new THREE.Matrix4();
+  const virtWorld = new THREE.Matrix4();
+  const virtView = new THREE.Matrix4();
   const camVel = new THREE.Vector3();
-  const foeWorld = new THREE.Vector3();
-  const foe = new THREE.Vector3();
+  const camPos = new THREE.Vector3();
+  const camQuat = new THREE.Quaternion();
+  const camScale = new THREE.Vector3(1, 1, 1);
+  const prevQuat = new THREE.Quaternion();
+  const shutterQuat = new THREE.Quaternion();
+  const virtPos = new THREE.Vector3();
   const subjWorld = new THREE.Vector3(0, 0, 0);
   const subj = new THREE.Vector3();
   let subjDist = 9;
   let jitterIndex = 0;
   let havePrev = false;
+  let haveQuat = false;
   let time = 0;
+  let lastDt = 1 / 60;
 
   let cocScale = 1;
   let focus = PARAMS.dof.focus;
@@ -796,6 +874,7 @@ export function createPostFX(renderer, scene, camera) {
       sceneRT.setSize(W, H);
       composer.setSize(W, H);
       dofPass.uniforms.uTexel.value.set(1 / W, 1 / H);
+      mbPass.uniforms.uTexel.value.set(1 / W, 1 / H);
       gradePass.uniforms.uTexel.value.set(1 / W, 1 / H);
       filmPass.uniforms.uTexel.value.set(1 / W, 1 / H);
       cocScale = H / 900;
@@ -815,10 +894,18 @@ export function createPostFX(renderer, scene, camera) {
       focus += (target - focus) * k;
 
       // --- speed-driven terms ----------------------------------------------
-      const sp = THREE.MathUtils.clamp((state.speed - 5) / 32, 0, 1);
+      // The motion-blur gate. A skier pushing off at 14 km/h has, to a camera,
+      // no motion blur whatsoever, so `mb` is flatly zero until 55 km/h and only
+      // reaches full weight at 108 km/h. `sp` (the gentler ramp) drives the
+      // speed vignette, which is a peripheral-vision cue rather than an optical
+      // one and may start much earlier.
+      const m = PARAMS.motion;
+      const mb = THREE.MathUtils.clamp(
+        (state.speed - m.speedLo) / Math.max(m.speedHi - m.speedLo, 1e-3), 0, 1);
+      const sp = THREE.MathUtils.clamp((state.speed - 6) / 30, 0, 1);
       const gf = THREE.MathUtils.clamp(state.gForce / 2.5, 0, 1);
-      const wantMB = Math.pow(sp, 1.15) * PARAMS.motion.strength;
-      const wantVig = (sp * 0.78 + gf * 0.22) * PARAMS.film.speedVignetteMax;
+      const wantMB = mb * mb * m.strength;              // quadratic — soft entry
+      const wantVig = (sp * sp * 0.8 + gf * 0.2) * PARAMS.film.speedVignetteMax;
       const kk = 1 - Math.exp(-6 * d);
       mbAmount += (wantMB - mbAmount) * kk;
       speedVig += (wantVig - speedVig) * kk;
@@ -826,14 +913,6 @@ export function createPostFX(renderer, scene, camera) {
       camVel.copy(state.vel);
       subjWorld.set(state.pos.x, state.pos.y + 1.0, state.pos.z);
       subjDist = target;
-
-      // Focus of expansion: where the camera is heading, in screen space. The
-      // speed lines radiate from there, not from the frame centre.
-      if (state.speed > 1) {
-        foeWorld.copy(camera.position).addScaledVector(state.vel, 200 / Math.max(state.speed, 1));
-      } else {
-        foeWorld.copy(state.pos);
-      }
     },
 
     render(dt) {
@@ -877,22 +956,32 @@ export function createPostFX(renderer, scene, camera) {
       if (!havePrev) prevVP.copy(currVP);
       taaPass.uniforms.uReproject.value.multiplyMatrices(prevVP, currVPInv);
 
-      // --- motion blur: virtual previous camera at pos - vel*shutter ---------
-      const shutter = PARAMS.motion.shutter;
-      trans.makeTranslation(camVel.x * shutter, camVel.y * shutter, camVel.z * shutter);
-      tmpM.multiplyMatrices(viewU, trans);   // prev view
-      tmpM.premultiply(projU);               // prev viewProj
-      mbPass.uniforms.uReproject.value.multiplyMatrices(tmpM, currVPInv);
-      mbPass.uniforms.uStrength.value = mbAmount;
-      mbPass.uniforms.uMaxVel.value = PARAMS.motion.maxVelocity;
-      mbPass.uniforms.uSpeedLines.value = PARAMS.motion.speedLines * mbAmount;
-      mbPass.uniforms.uNearFade.value = PARAMS.motion.nearFade;
-      mbPass.enabled = PARAMS.motion.enabled && mbAmount > 0.002;
+      // --- motion blur: a virtual camera one shutter back along the path -----
+      // Translation comes from the sim velocity (so this is correct even in a
+      // paused still, where there is no frame-to-frame camera delta at all) and
+      // rotation from the real orientation delta scaled to the shutter, which is
+      // what makes a hard carve sweep the frame. Everything else — how far each
+      // individual pixel actually travels — falls out of the depth buffer.
+      camera.matrixWorld.decompose(camPos, camQuat, camScale);
+      if (!haveQuat) { prevQuat.copy(camQuat); haveQuat = true; }
 
-      foe.copy(foeWorld).project(camera);
-      mbPass.uniforms.uFocalCentre.value.set(
-        THREE.MathUtils.clamp(foe.x * 0.5 + 0.5, -0.6, 1.6),
-        THREE.MathUtils.clamp(foe.y * 0.5 + 0.5, -0.6, 1.6));
+      const shutter = PARAMS.motion.shutter;
+      const f = THREE.MathUtils.clamp(shutter / Math.max(lastDt, 1e-4), 0, 1);
+      shutterQuat.copy(camQuat).slerp(prevQuat, f);
+      virtPos.copy(camPos).addScaledVector(camVel, -shutter);
+      virtWorld.compose(virtPos, shutterQuat, camScale);
+      virtView.copy(virtWorld).invert();
+
+      mbPass.uniforms.uReproject.value
+        .multiplyMatrices(projU, virtView)     // virtual previous viewProj
+        .multiply(currVPInv);
+      mbPass.uniforms.uStrength.value = mbAmount;
+      mbPass.uniforms.uMaxPixels.value = PARAMS.motion.maxPixels * cocScale;
+      mbPass.uniforms.uNearFade.value = PARAMS.motion.nearFade;
+      mbPass.enabled = PARAMS.motion.enabled && mbAmount > 0.004;
+
+      prevQuat.copy(camQuat);
+      lastDt = dt > 1e-4 ? Math.min(dt, 0.1) : lastDt;
 
       subj.copy(subjWorld).project(camera);
       mbPass.uniforms.uSubject.value.set(subj.x * 0.5 + 0.5, subj.y * 0.5 + 0.5, subjDist);
@@ -902,11 +991,14 @@ export function createPostFX(renderer, scene, camera) {
       dofPass.enabled = PARAMS.dof.enabled;
       dofPass.uniforms.uFocus.value = focus;
       dofPass.uniforms.uNearStrength.value = PARAMS.dof.nearStrength;
+      dofPass.uniforms.uNearRange.value = PARAMS.dof.nearRange;
       dofPass.uniforms.uFarStrength.value = PARAMS.dof.farStrength;
-      dofPass.uniforms.uFarRange.value = PARAMS.dof.farRange;
+      dofPass.uniforms.uFarBand.value.set(PARAMS.dof.farStart, PARAMS.dof.farEnd);
       dofPass.uniforms.uNearFar.value.set(camera.near, camera.far);
       mbPass.uniforms.uNearFar.value.set(camera.near, camera.far);
 
+      // TAA is the anti-aliaser; SMAA only comes back if TAA is switched off.
+      smaaPass.enabled = PARAMS.smaa.enabled || !PARAMS.taa.enabled;
       bloomPass.enabled = PARAMS.bloom.enabled;
       bloomPass.strength = PARAMS.bloom.strength;
       bloomPass.radius = PARAMS.bloom.radius;
@@ -925,6 +1017,7 @@ export function createPostFX(renderer, scene, camera) {
       gu.uShadowTint.value.fromArray(gp.shadowTint);
       gu.uHighTint.value.fromArray(gp.highTint);
       gu.uContrast.value = gp.contrast;
+      gu.uSCurve.value = gp.sCurve;
       gu.uPivot.value = gp.pivot;
       gu.uSaturation.value = gp.saturation;
       gu.uHighDesat.value = gp.highlightDesat;

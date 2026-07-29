@@ -7,9 +7,13 @@
  * airborne, speed) with analytic two-bone IK on the legs, so the boots are
  * rigidly locked to the bindings and the skis always ride the snow.
  *
- * Local frame convention (inside `group`, which carries pos/heading/pitch/roll):
- *   +Z = forward (ski tips)   +X = skier's LEFT   y = 0 is the snow surface.
+ * Local frame convention. `group` carries a basis built from state.pos and
+ * state.groundNormal, so inside it:
+ *   +Z = direction of travel (ski tips)   +X = skier's LEFT   y = 0 = the snow.
  *   state.edge > 0  => turning left => inside is +X.
+ * Nothing in the rig ever sees world pitch/roll: the skis are simply placed on
+ * y = 0 and the body leans off it by the physics inclination. That is what keeps
+ * the bases on the snow at any edge angle on any slope.
  */
 import * as THREE from 'three';
 
@@ -347,6 +351,22 @@ function makeSkiGeometry(o = {}) {
   const morph = new THREE.Float32BufferAttribute(mpos, 3);
   g.morphAttributes.position = [morph];
   g.morphTargetsRelative = false;
+
+  // The running surface, sampled along the ski, in the ski mesh's own space.
+  // `contactY` is the height of the lowest running point: the plane the ski
+  // stands on. Everything that grounds the rig is derived from this, so the
+  // geometry stays the single source of truth.
+  const samples = [];
+  let contactY = Infinity;
+  for (let i = 0; i <= 24; i++) {
+    const t = i / 24;
+    const y = baseY(t, false), w = halfWidth(t), z = (t - 0.5) * L;
+    samples.push([-w, y, z], [w, y, z]);
+    if (t > 0.05 && t < 0.95) contactY = Math.min(contactY, y);
+  }
+  g.userData.baseSamples = samples;
+  g.userData.contactY = contactY;
+  g.userData.length = L;
   return g;
 }
 
@@ -563,6 +583,7 @@ function buildPole(mats, side) {
   const basket = mesh(new THREE.CylinderGeometry(0.031, 0.020, 0.011, 10), mats.basket, g, 0, by, 0);
   mesh(new THREE.CylinderGeometry(0.0075, 0.0075, 0.03, 8), mats.basket, g, 0, by + 0.02, 0);
   mesh(new THREE.ConeGeometry(0.0042, 0.055, 8), mats.metal, g, 0, -len + 0.028, 0).rotation.x = Math.PI;
+  g.userData.tipY = -len + 0.0005;   // the steel tip, in the pole's own space
   return g;
 }
 
@@ -639,24 +660,31 @@ export function createSkier(scene) {
 
   const group = new THREE.Group();
   group.name = 'skier';
-  const rig = new THREE.Group();
-  group.add(rig);
+  // `group` carries a snow-aligned basis (see update): local y = 0 IS the contact
+  // plane and local +Z is the direction of travel. skiRoot holds everything that
+  // must stay welded to the snow; bodyRoot everything that leans off it.
+  const skiRoot = new THREE.Group();
+  const bodyRoot = new THREE.Group();
+  group.add(skiRoot, bodyRoot);
 
   // ---- skis, bindings, boots ----------------------------------------------
   const legs = [];
   for (const side of [1, -1]) {
-    const pivot = node(rig);           // sits on the contact edge, rolls with the carve
+    const pivot = node(skiRoot);       // sits ON the contact edge, rolls with the carve
     const body = node(pivot);          // ski centreline
     const skiParts = buildSki(mats);
     body.add(skiParts.group);
     const boot = buildBoot(mats, side);
     body.add(boot.root);
     const ankle = node(body, 0, 0.0175 + 0.006 + D.ankleY, -0.012);
-    legs.push({ side, pivot, body, ski: skiParts.ski, boot, ankle });
+    // the running surface of this ski, in the ski's own space: the rig grounds
+    // itself on this number instead of a hand-tuned fudge
+    const contactY = skiParts.ski.geometry.userData.contactY;
+    legs.push({ side, pivot, body, ski: skiParts.ski, boot, ankle, contactY, ankleLocal: new THREE.Vector3() });
   }
 
   // ---- pelvis / spine / chest ---------------------------------------------
-  const pelvis = node(rig, 0, 0.8, 0);
+  const pelvis = node(bodyRoot, 0, 0.98, 0);
   mesh(lathe([
     [0.075, 0.118], [0.114, 0.085], [0.128, 0.030], [0.130, -0.020],
     [0.121, -0.062], [0.101, -0.092], [0.076, -0.108],
@@ -720,7 +748,7 @@ export function createSkier(scene) {
     const poleGrip = node(wrist, 0, -0.055, 0.012);
     const pole = buildPole(mats, side);
     poleGrip.add(pole);
-    arms.push({ side, shoulder, elbow, wrist, poleGrip, glove });
+    arms.push({ side, shoulder, elbow, wrist, poleGrip, glove, pole });
   }
 
   // ---- leg meshes (driven by IK) -------------------------------------------
@@ -748,10 +776,12 @@ export function createSkier(scene) {
   // animation state
   // -------------------------------------------------------------------------
   const A = {
-    t: 0, edge: 0, gF: 0, crouch: 0, air: 0, spd: 0,
-    absorb: 0, absorbV: 0, prevVy: 0, prevAir: false, airT: 0,
+    t: 0, edge: 0, gF: 0, crouch: 0, air: 0, spd: 0, incl: 0,
+    absorb: 0, absorbV: 0, prevVn: 0, prevAir: false, airT: 0,
     plantSide: 0, plantT: 99, prevEdgeSign: 0, phi: 0, airSpin: 0,
+    pop: 0, retract: 0, reach: 0, airPhase: 'ground',
     envAssigned: env,
+    dbg: { tilt: 0, angul: 0, hipTilt: 0, extT: 0, R: 0, load: 0, stance: 0, edgeMag: 0 },
   };
 
   // scratch
@@ -762,7 +792,10 @@ export function createSkier(scene) {
   const _m = new THREE.Matrix4();
   const _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _qp = new THREE.Quaternion();
   const _thighQ = new THREE.Quaternion(), _shinQ = new THREE.Quaternion();
-  const rigX = new THREE.Vector3(), rigY = new THREE.Vector3(), rigZ = new THREE.Vector3();
+  const _gX = new THREE.Vector3(1, 0, 0), _gY = new THREE.Vector3(0, 1, 0), _gZ = new THREE.Vector3(0, 0, 1);
+  const _hipL = new THREE.Vector3(), _ankL = new THREE.Vector3(), _pel = new THREE.Vector3();
+  const _eul = new THREE.Euler();
+  const ZAX = new THREE.Vector3(0, 0, 1);
 
   /** world-space basis from a bone direction (bone points down its local -Y). */
   function boneQuat(dir, front, out) {
@@ -808,6 +841,95 @@ export function createSkier(scene) {
   const _poleDirW = new THREE.Vector3();
   const _poleQ = new THREE.Quaternion();
 
+  // -------------------------------------------------------------------------
+  // measurement probe — the rig grades itself so "the boots are not in the
+  // snow" is a number, not an opinion. Used by tools/skier-rig.mjs.
+  // -------------------------------------------------------------------------
+  function measure() {
+    const s = A.lastState;
+    if (!s || !s.pos) return null;
+    group.updateMatrixWorld(true);
+    const P = s.pos, N = s.groundNormal || new THREE.Vector3(0, 1, 0);
+    const deg = (r) => +(r * 180 / Math.PI).toFixed(1);
+    const v = new THREE.Vector3();
+    const hgt = (o, lx = 0, ly = 0, lz = 0) => {
+      v.set(lx, ly, lz); o.localToWorld(v);
+      return v.clone().sub(P).dot(N);
+    };
+    const wp = (o, lx = 0, ly = 0, lz = 0) => { const q = new THREE.Vector3(lx, ly, lz); o.localToWorld(q); return q; };
+
+    const F = new THREE.Vector3(-Math.sin(s.heading || 0), 0, -Math.cos(s.heading || 0));
+    F.addScaledVector(N, -F.dot(N)).normalize();
+    const R = new THREE.Vector3().crossVectors(F, N).normalize();   // skier's RIGHT
+    const sgn = A.sgn || 0;
+
+    const out = { skis: [], legs: [], poles: [] };
+    for (const L of legs) {
+      const g = L.ski.geometry.userData;
+      let lo = 1e9, hi = -1e9;
+      for (const p of g.baseSamples) lo = Math.min(lo, hgt(L.ski, p[0], p[1], p[2]));
+      for (const p of g.baseSamples) hi = Math.max(hi, hgt(L.ski, p[0], p[1], p[2]));
+      const tip = wp(L.ski, 0, 0, g.length * 0.5), tail = wp(L.ski, 0, 0, -g.length * 0.5);
+      out.skis.push({
+        side: L.side, inside: L.side * sgn > 0,
+        baseMin: +lo.toFixed(4), baseMax: +hi.toFixed(4),
+        tipY: +(tip.clone().sub(P).dot(N)).toFixed(3),
+        tailY: +(tail.clone().sub(P).dot(N)).toFixed(3),
+        tipsForward: +tip.clone().sub(tail).normalize().dot(F).toFixed(3),
+      });
+      const hip = wp(L.hip), ank = wp(L.ankle);
+      out.legs.push({
+        side: L.side, inside: L.side * sgn > 0,
+        ext: +(hip.distanceTo(ank) / (D.thigh + D.shin)).toFixed(3),
+        hipY: +(hip.clone().sub(P).dot(N)).toFixed(3),
+      });
+    }
+    for (const a of arms) {
+      const tipY = hgt(a.pole, 0, a.pole.userData.tipY, 0);
+      out.poles.push({
+        side: a.side, inside: a.side * sgn > 0,
+        tipY: +tipY.toFixed(3), gripY: +hgt(a.poleGrip).toFixed(3),
+      });
+    }
+
+    // frontal-plane angles, measured about the forward axis
+    const ang = (a, b) => {
+      const d = b.clone().sub(a);
+      return Math.atan2(d.dot(R), d.dot(N));   // + = leaning to the skier's RIGHT
+    };
+    const hipMid = wp(legs[0].hip).add(wp(legs[1].hip)).multiplyScalar(0.5);
+    const ankMid = wp(legs[0].ankle).add(wp(legs[1].ankle)).multiplyScalar(0.5);
+    const shO = arms.find((a) => a.side * sgn <= 0) || arms[0];
+    const shI = arms.find((a) => a.side * sgn > 0) || arms[1];
+    const shOut = wp(shO.shoulder), shIn = wp(shI.shoulder);
+    const shMid = shOut.clone().add(shIn).multiplyScalar(0.5);
+    // sgn > 0 = turning left = leaning to the skier's LEFT = negative R
+    const dir = sgn >= 0 ? -1 : 1;
+    const incl = ang(ankMid, hipMid) * dir;
+    const body = ang(hipMid, shMid) * dir;
+    const shAxis = shIn.clone().sub(shOut).normalize();
+    out.pose = {
+      inclDeg: deg(incl), bodyDeg: deg(body), angulationDeg: deg(incl - body),
+      // + = outside shoulder LOW (what we want), - = banked into the turn
+      shoulderTiltDeg: deg(Math.asin(clamp(shAxis.dot(N), -1, 1))),
+      headTopY: +hgt(head, 0, 0.135, 0).toFixed(3),
+      hipY: +hipMid.clone().sub(P).dot(N).toFixed(3),
+      shoulderY: +shMid.clone().sub(P).dot(N).toFixed(3),
+      // + = shoulders ahead of the hips (forward), - = backseat
+      shoulderLead: +shMid.clone().sub(hipMid).dot(F).toFixed(3),
+      hipOverBoot: +hipMid.clone().sub(ankMid).dot(F).toFixed(3),
+      edge: +(s.edge || 0).toFixed(3), crouch: +(s.crouch || 0).toFixed(3),
+      gForce: +(s.gForce || 0).toFixed(2), speed: +(s.speed || 0).toFixed(1),
+      airborne: !!s.airborne, vy: +(s.vel ? s.vel.y : 0).toFixed(2),
+      airPhase: A.airPhase || 'ground', absorb: +A.absorb.toFixed(3),
+    };
+    out.dbg = {};
+    for (const k in (A.dbg || {})) out.dbg[k] = +A.dbg[k].toFixed(3);
+    out.dbg.pop = +A.pop.toFixed(2); out.dbg.retract = +A.retract.toFixed(2); out.dbg.reach = +A.reach.toFixed(2);
+    return out;
+  }
+  if (typeof window !== 'undefined') window.__skier = { group, measure, A, legs, arms };
+
   return {
     group,
     materials: mats,
@@ -816,6 +938,7 @@ export function createSkier(scene) {
       dt = clamp(dt || 0, 0, 0.05);
       A.t += dt;
       const s = state || {};
+      A.lastState = s;
 
       // optional pose override used by tools/skier-lab — never set in game
       const ov = (typeof window !== 'undefined' && window.__skierPose) || null;
@@ -826,9 +949,24 @@ export function createSkier(scene) {
         return Number.isFinite(v) ? v : d;
       };
 
-      // ---- transform from physics -----------------------------------------
+      // ---- ground-aligned transform -----------------------------------------
+      // The whole rig hangs off a basis built from the published contact point
+      // and surface normal: +Y = snow normal, +Z = direction of travel, y = 0 is
+      // the snow surface. Grounding then costs nothing — the ski bases are simply
+      // placed at y = 0 and can never punch through a slope they are parallel to.
       if (s.pos && Number.isFinite(s.pos.x + s.pos.y + s.pos.z)) group.position.copy(s.pos);
-      group.rotation.set(get('pitch', 0), get('heading', 0), get('roll', 0), 'YXZ');
+      const gn = _gY;
+      const sn = s.groundNormal;
+      if (sn && Number.isFinite(sn.x + sn.y + sn.z) && sn.y > 0.1) gn.copy(sn).normalize();
+      else gn.set(0, 1, 0);
+      const hd = get('heading', 0);
+      _gZ.set(-Math.sin(hd), 0, -Math.cos(hd));           // physics forward
+      _gZ.addScaledVector(gn, -_gZ.dot(gn));
+      if (_gZ.lengthSq() < 1e-8) _gZ.set(-Math.sin(hd), 0, -Math.cos(hd));
+      _gZ.normalize();
+      _gX.crossVectors(gn, _gZ).normalize();               // skier's LEFT
+      _m.makeBasis(_gX, gn, _gZ);
+      group.quaternion.setFromRotationMatrix(_m);
 
       // ---- smoothed drivers -------------------------------------------------
       const rawEdge = clamp(get('edge', 0), -1, 1);
@@ -840,34 +978,72 @@ export function createSkier(scene) {
       A.spd = damp(A.spd, Math.max(0, get('speed', 0)), 3, dt);
 
       const e = A.edge;
-      const sgn = e >= 0 ? 1 : -1;
+      const sgn = e >= 0 ? 1 : -1;   // which way the player is steering
       const ae = Math.abs(e);
-      const gN = Math.min(A.gF, 1.8) / 1.8;
+      const gN = Math.min(A.gF, 2.0) / 2.0;
       const load = clamp(ae * (0.42 + 0.58 * gN), 0, 1);          // carve intensity
-      // inclination of the whole body into the turn
-      const phi = sgn * Math.min(0.74, (0.46 * ae + 0.50 * gN * ae) * 1.05) * (1 - 0.55 * A.air);
-      A.phi = phi;
-      const aphi = Math.abs(phi);
+      const spdN = clamp(A.spd / 26, 0, 1);
 
-      // ---- landing / absorption spring --------------------------------------
-      const vy = s.vel && Number.isFinite(s.vel.y) ? s.vel.y : 0;
-      if (dt > 0) {
-        const acc = (vy - A.prevVy) / dt;
-        A.absorbV += clamp(acc, -60, 60) * 0.0022;
+      // ---- inclination -------------------------------------------------------
+      // The balance angle is a physics quantity — the lean along the resultant of
+      // gravity and the turn force — so take it from physics rather than inventing
+      // a second one on top of it, which is what used to double the lean and bank
+      // the whole skier. It already carries the cross-slope term too: on a traverse
+      // the edge has to hold gravity, and that is exactly what stands the body up
+      // off the slope normal.
+      const mo = s.motion || {};
+      const inclRaw = Number.isFinite(mo.inclination) ? mo.inclination : get('roll', 0) / 0.6;
+      A.incl = damp(A.incl, clamp(inclRaw, -1.0, 1.0), 11, dt);
+      // you cannot lay a ski over at walking pace: no speed, no lean
+      const tilt = clamp(A.incl * 0.92 * (1 - 0.80 * A.air)
+        * THREE.MathUtils.smoothstep(A.spd, 1.5, 7.0), -0.72, 0.72);
+      const es = tilt >= 0 ? 1 : -1;          // which edge is the downhill one
+      const atilt = Math.abs(tilt);
+      A.phi = tilt;
+      A.sgn = es;
+      // Angulation: the hips go further inside and the body flexes the other way at
+      // the hip joint and the spine, so the chest ends up back outside the CoM line
+      // and the shoulder line comes level. Grows with the lean, and again with load
+      // — the harder the turn, the sharper the break at the hip.
+      const angul = clamp(1.35 * (atilt - 0.08), 0, 0.95) * (0.55 + 0.45 * load) * (1 - A.air);
+
+      // ---- air phases + landing spring ---------------------------------------
+      // vn = closing speed with the snow, the only honest driver for takeoff /
+      // apex / descent — a jump is not a state, it is a sequence.
+      const vn = s.vel && Number.isFinite(s.vel.y) ? s.vel.dot(gn) : 0;
+      if (dt > 0 && !airborne) {
+        const acc = (vn - A.prevVn) / dt;
+        A.absorbV += clamp(acc, -70, 70) * 0.0016;
       }
-      A.prevVy = vy;
-      if (A.prevAir && !airborne) A.absorbV -= 0.75 * clamp(A.airT * 1.6, 0.25, 1.4);
+      if (A.prevAir && !airborne) {
+        // hard landing absorb: ~0.32 m of hip travel for a 10 m/s touchdown
+        const impact = clamp(-A.prevVn, 0, 16);
+        A.absorbV -= clamp(0.6 + impact * 0.55, 0.6, 6.4);
+      }
+      A.prevVn = vn;
       A.airT = airborne ? A.airT + dt : 0;
       A.prevAir = airborne;
-      A.absorbV += (-105 * A.absorb - 13.5 * A.absorbV) * dt;
-      A.absorb = clamp(A.absorb + A.absorbV * dt, -0.26, 0.09);
+      // omega 10.5 rad/s => bottoms out in ~0.15 s; zeta 0.36 => a real rebound
+      A.absorbV += (-110 * A.absorb - 7.6 * A.absorbV) * dt;
+      A.absorb = clamp(A.absorb + A.absorbV * dt, -0.40, 0.10);
+
+      // takeoff pop -> apex retraction -> descent reach
+      const popT = airborne ? clamp(1 - A.airT / 0.24, 0, 1) * clamp(vn / 2.0, 0, 1) : 0;
+      const descend = clamp(-vn / 4.5, 0, 1);
+      const retT = A.air * clamp((A.airT - 0.10) / 0.18, 0, 1) * (1 - descend);
+      const reachT = A.air * descend * clamp(A.airT / 0.25, 0, 1);
+      A.pop = damp(A.pop, popT, 16, dt);
+      A.retract = damp(A.retract, retT, 11, dt);
+      A.reach = damp(A.reach, reachT, 13, dt);
+      A.airPhase = !airborne ? (A.absorb < -0.05 ? 'absorb' : 'ground')
+        : A.pop > 0.4 ? 'pop' : A.reach > A.retract ? 'reach' : 'retract';
 
       // ---- pole plant timing -------------------------------------------------
-      const es = ae > 0.14 ? sgn : 0;
-      if (es !== 0 && es !== A.prevEdgeSign && A.spd > 3.5) {
-        A.plantSide = es; A.plantT = 0;
+      const eSign = ae > 0.14 ? sgn : 0;
+      if (eSign !== 0 && eSign !== A.prevEdgeSign && A.spd > 3.5 && !airborne) {
+        A.plantSide = eSign; A.plantT = 0;
       }
-      if (es !== 0) A.prevEdgeSign = es;
+      if (eSign !== 0) A.prevEdgeSign = eSign;
       A.plantT += dt;
       const plant = A.plantT < 0.55 ? Math.sin(clamp(A.plantT / 0.55, 0, 1) * Math.PI) : 0;
       const plantSharp = A.plantT < 0.55
@@ -879,89 +1055,162 @@ export function createSkier(scene) {
       const jitter = (Math.sin(A.t * 7.3) + Math.sin(A.t * 11.7 + 2.1)) * 0.5;
       const chatter = clamp(A.spd / 24, 0, 1) * (1 - A.air) * 0.006;
 
-      // in the air the whole body drifts a little off-axis and noses up
+      // in the air the whole body drifts a little off-axis and the tips come up
       A.airSpin = damp(A.airSpin, airborne ? e * 0.20 : 0, 3.2, dt);
-      rig.rotation.set(0.07 * A.air, A.airSpin, 0);
+      // tips up off the lip, level at the apex, nosed down into the landing
+      const airPitch = A.air * (-0.13 + 0.34 * A.reach - 0.05 * A.retract);
+      skiRoot.rotation.set(airPitch, A.airSpin, 0);
+      bodyRoot.rotation.set(
+        airPitch * 0.5 + clamp(get('pitch', 0) - Math.asin(clamp(_gZ.y, -1, 1)), -0.14, 0.14) * -0.7,
+        A.airSpin, 0);
 
       // =======================================================================
-      // SKIS — roll onto edge about the contact edge so they stay planted
+      // SKIS — the running surface IS the snow plane; edge angle rolls the ski
+      // about its downhill edge so the contact line never leaves y = 0.
       // =======================================================================
-      const edgeAngle = clamp(aphi * 1.18 + load * 0.06, 0, 1.02) * sgn;
-      const halfStance = 0.148 + 0.058 * load + 0.03 * A.crouch;
+      const edgeMag = clamp(Math.max(ae * 1.02, atilt + 0.10 * load), 0, 1.12) * (1 - 0.55 * A.air);
+      const edgeAngle = edgeMag * es;
+      // the stance opens as the body lays over — otherwise the inside leg has to
+      // fold into itself to reach a ski that is directly under the hip
+      const halfStance = 0.140 + 0.050 * load + 0.028 * A.crouch + 0.135 * atilt;
       const contactX = 0.033;   // half the ski waist width
+      // The bases ride a hair proud of the snow. 24 mm of it is the gap between
+      // the analytic contact height physics publishes and the height the terrain
+      // actually triangulates to under the skier — measured, not guessed — and the
+      // rest is the ski's own shape: the shovel is 2.5 cm wider than the waist the
+      // roll pivots on, so at a big edge angle its outboard corner would dip under.
+      const CLEAR = 0.070 + 0.014 * Math.sin(edgeMag);
+      const skiLift = 0.30 * A.retract - 0.02 * A.pop;
       for (const L of legs) {
         const side = L.side;
-        const inside = side * sgn;                    // +1 if this is the inside ski
-        const lead = inside * (0.055 + 0.05 * load);  // inside ski leads
-        L.pivot.position.set(side * halfStance + sgn * contactX, -0.004 - chatter * jitter, lead);
-        L.pivot.rotation.set(-0.11 * A.air, side * 0.008, -edgeAngle);
-        L.body.position.x = -sgn * contactX;
+        const inside = side * es;                     // +1 if this is the inside ski
+        const lead = inside * (0.055 + 0.05 * load + 0.10 * atilt);  // inside ski leads
+        L.pivot.position.set(side * halfStance + es * contactX,
+          CLEAR + skiLift - chatter * jitter, lead);
+        L.pivot.rotation.set(0, side * 0.008, -edgeAngle);
+        // the pivot sits exactly on the edge that is cutting, so rolling onto edge
+        // pivots about the snow contact instead of swinging the base through it
+        L.body.position.set(-es * contactX, -L.contactY, 0);
         // reverse camber when loaded
         if (L.ski.morphTargetInfluences) {
           L.ski.morphTargetInfluences[0] = damp(L.ski.morphTargetInfluences[0] || 0,
             clamp(load * (inside > 0 ? 0.55 : 1.0) * (1 - A.air), 0, 1), 8, dt);
         }
+        // ankle position in skiRoot space — the pelvis solve needs it analytically
+        L.ankleLocal.set(0, 0.0175 + 0.006 + D.ankleY - L.contactY, -0.012)
+          .add(L.body.position).applyAxisAngle(ZAX, -edgeAngle).add(L.pivot.position);
       }
 
       // =======================================================================
-      // PELVIS — inclination about the snow contact + angulation offset
+      // PELVIS — stand up. A ski stance is 25-35 deg of knee flex, not a wall-sit:
+      // the hip rides ~0.94 m off the snow and only drops when something asks it to.
       // =======================================================================
-      const hipH = clamp(
-        0.795
-        - 0.030 * clamp(A.spd / 26, 0, 1)
-        - 0.215 * A.crouch
-        - 0.105 * load
-        - 0.185 * A.air
-        + A.absorb
-        + breath * 0.004
-        + Math.sin(A.t * 2.9) * 0.004 * clamp(A.spd / 20, 0, 1),
-        0.50, 0.93);
-      // the body inclines about the outside ski's edge, not about the centreline
-      const pivotX = -sgn * (halfStance * 0.55 + contactX);
-      const angulationX = sgn * (0.075 * load + 0.03 * gN);
-      pelvis.position.set(
-        pivotX * (1 - Math.cos(phi)) + Math.sin(phi) * hipH + angulationX + sway * 0.008,
-        pivotX * Math.sin(phi) + Math.cos(phi) * hipH,
-        -0.015 - 0.085 * A.crouch - 0.02 * load + 0.02 * A.air);
-      const torsoPitch = 0.185 + 1.06 * A.crouch + 0.10 * clamp(A.spd / 30, 0, 1) + 0.10 * load - 0.10 * A.air;
+      // The pose is authored as an EXTENSION, not a height: "the outside leg is
+      // 92% straight" is the thing a skier actually controls, and it stays true
+      // whatever the lean or the ski lift does to the geometry underneath.
+      const crouchEff = A.crouch * (1 - 0.85 * A.pop);
+      const extT = clamp(
+        0.925
+        - 0.340 * crouchEff
+        + 1.050 * A.absorb
+        - 0.260 * A.retract
+        + 0.070 * A.pop
+        + 0.060 * A.reach
+        - 0.030 * spdN
+        + 0.035 * load          // a loaded outside leg pushes long against the arc
+        + breath * 0.005,
+        0.34, 0.955);
+      const hipDrop = clamp((0.925 - extT) / 0.40, -0.25, 1.2);
+
+      const outSide = -es;
+      const pivotX = (outSide * halfStance + es * contactX) * clamp(atilt / 0.40, 0, 1);
+      const hipTilt = clamp(tilt + es * angul * 0.25, -0.95, 0.95);
+      const pelZ = -0.02 - 0.10 * crouchEff - 0.05 * hipDrop + 0.03 * A.retract;
+      // the hips stay on the flight path while the SKIS come up: that is what
+      // retraction is. Adding skiLift here would just levitate the whole skier.
+      const baseY = CLEAR;
+      // The femur abducts at the hip joint, so the pelvis does NOT roll all the way
+      // over with the leg line; the rest of the counter comes from the spine. That
+      // split is the whole difference between angulating and banking.
+      const pelvisRoll = hipTilt - es * angul * 0.55;
+
+      // Solve the leg-line length so the OUTSIDE leg lands exactly on `extT`.
+      // Newton on a monotone distance — 4 iterations is convergence to under a mm,
+      // and it is what keeps a laid-over carve standing on a long outside leg
+      // instead of collapsing into a squat.
+      const sx = Math.sin(hipTilt), sy = Math.cos(hipTilt);
+      const outLeg = legs[0].side === outSide ? legs[0] : legs[1];
+      _hipL.set(outSide * D.hipHalf, -0.045, 0).applyAxisAngle(ZAX, -pelvisRoll);
+      const ax = outLeg.ankleLocal.x, ay = outLeg.ankleLocal.y - skiLift, az = outLeg.ankleLocal.z;
+      const target = extT * (D.thigh + D.shin);
+      let R = 0.90;
+      for (let it = 0; it < 4; it++) {
+        const dx = pivotX + sx * R + _hipL.x - ax;
+        const dy = baseY + sy * R + _hipL.y - ay;
+        const dz = pelZ + _hipL.z - az;
+        const d = Math.hypot(dx, dy, dz);
+        const grad = (dx * sx + dy * sy) / Math.max(d, 1e-4);
+        if (Math.abs(d - target) < 0.001) break;
+        R = clamp(R + (target - d) / (Math.abs(grad) < 0.15 ? 0.15 : grad), 0.20, 1.10);
+      }
+      _pel.set(pivotX + sx * R + sway * 0.006, baseY + sy * R, pelZ);
+      pelvis.position.copy(_pel);
+      const dbg = A.dbg;   // preallocated: this runs every frame
+      dbg.tilt = tilt; dbg.angul = angul; dbg.hipTilt = hipTilt; dbg.extT = extT;
+      dbg.R = R; dbg.load = load; dbg.stance = halfStance; dbg.edgeMag = edgeMag;
+
+      // Backseat killer: the shoulders come forward as the hips drop, so the mass
+      // stays over the balls of the feet instead of trailing behind the boots.
+      const torsoPitch = 0.15 + 0.62 * crouchEff + 0.95 * hipDrop + 0.10 * spdN
+        + 0.10 * load - 0.30 * A.retract + 0.10 * A.reach;
       pelvis.rotation.set(
-        torsoPitch * 0.26 - 0.05 * A.air,
+        torsoPitch * 0.26,
         sgn * 0.16 * load,
-        -phi * 1.02 + sway * 0.006);
+        -pelvisRoll + sway * 0.006);
 
-      // spine / chest: counter-rotate and stack upright over the outside ski
-      spine.rotation.set(torsoPitch * 0.36, -sgn * 0.11 * load, phi * 0.36 + sway * 0.004);
+      const spineRoll = es * angul * 0.35;
+      const spineYaw = -sgn * 0.11 * load;
+      spine.rotation.set(torsoPitch * 0.36, spineYaw, spineRoll);
+      const chestYaw = -sgn * (0.22 * load + 0.06 * gN);
+      // A pitched-forward torso that is also counter-rotated tips its own shoulder
+      // line — sin(pitch)*sin(yaw) of unwanted roll, straight back into the bank we
+      // just removed. Cancel it explicitly.
+      const chestFlex = es * angul * 0.30
+        - Math.sin(torsoPitch) * Math.sin(sgn * 0.16 * load + spineYaw + chestYaw);
       chest.rotation.set(
-        torsoPitch * 0.38 + breath * 0.012 - 0.06 * A.air,
-        -sgn * (0.22 * load + 0.06 * gN),
-        phi * 0.30);
+        torsoPitch * 0.38 + breath * 0.012,
+        chestYaw,
+        chestFlex);
       torso.scale.set(1 + breath * 0.012, 1, 1 + breath * 0.02);
-      // chest roll now totals -0.36*phi: shoulders stay far more level than the skis
 
-      // head leads into the turn and stays level
+      // head leads into the turn and keeps its eyes on the horizon
+      const chestRoll = -pelvisRoll + spineRoll + chestFlex;
       const headYaw = sgn * (0.34 * load + 0.16 * ae) + Math.sin(A.t * 0.41) * 0.03;
       head.rotation.set(
-        -torsoPitch * 0.74 + 0.10 + Math.sin(A.t * 0.9) * 0.012,
+        -torsoPitch * 0.80 + 0.14 + Math.sin(A.t * 0.9) * 0.012,
         headYaw,
-        phi * 0.26 + Math.sin(A.t * 0.7) * 0.012);
+        -chestRoll * 0.75 + Math.sin(A.t * 0.7) * 0.012);
 
       // =======================================================================
       // ARMS
       // =======================================================================
       for (const arm of arms) {
         const side = arm.side;
-        const inside = side * sgn;
+        const inside = side * es;
         const isPlant = A.plantSide === side ? 1 : 0;
         // in a tuck the humerus swings forward until it is roughly square to the
         // (now almost horizontal) spine — that is what makes an egg read as an egg
-        const fwd = 0.52 + 0.92 * A.crouch + 0.14 * load * (inside > 0 ? 1 : 0.3);
-        const out = 0.34 - 0.24 * A.crouch + 0.40 * A.air + 0.08 * inside * load;
-        const bend = 1.24 - 0.06 * A.crouch + 0.12 * inside * load - 0.38 * A.air;
+        const fwd = 0.34 + 1.08 * A.crouch + 0.14 * load * (inside > 0 ? 1 : 0.3)
+          + 0.42 * A.reach - 0.10 * A.retract + 0.30 * torsoPitch * (1 - A.crouch);
+        const out = 0.30 - 0.22 * A.crouch + 0.80 * A.retract + 0.34 * A.reach
+          + 0.26 * A.pop + 0.10 * inside * load;
+        const bend = 1.02 + 0.16 * A.crouch + 0.12 * inside * load
+          - 0.55 * A.reach + 0.50 * A.retract - 0.45 * A.pop;
 
         arm.shoulder.rotation.set(
-          -(fwd + 0.42 * plantSharp * isPlant + 0.05 * A.air) + Math.sin(A.t * 1.1 + side) * 0.02,
+          -(fwd + 0.42 * plantSharp * isPlant) + Math.sin(A.t * 1.1 + side) * 0.02,
           side * (-0.14 - 0.16 * A.crouch + 0.12 * plantSharp * isPlant),
-          side * (out + 0.12 * plantSharp * isPlant) + phi * 0.12);
+          side * (out + 0.12 * plantSharp * isPlant) - chestRoll * 0.10);
         arm.elbow.rotation.set(
           -(bend - 0.30 * plantSharp * isPlant) + Math.sin(A.t * 1.3 + side * 2) * 0.02,
           0,
@@ -972,20 +1221,14 @@ export function createSkier(scene) {
       // -----------------------------------------------------------------------
       group.updateMatrixWorld(true);
 
-      // rig basis in world space (for IK pole vectors and pole aiming)
-      rigX.setFromMatrixColumn(rig.matrixWorld, 0).normalize();
-      rigY.setFromMatrixColumn(rig.matrixWorld, 1).normalize();
-      rigZ.setFromMatrixColumn(rig.matrixWorld, 2).normalize();
-
       // ---- legs: two-bone IK to the boot ------------------------------------
       for (let i = 0; i < legs.length; i++) {
         const L = legs[i];
         const side = L.side;
-        // knee points forward, slightly out, and tips with the carve
         // knees drive forward and roll into the hill with the edge angle
-        _p.copy(rigZ).multiplyScalar(1.0)
-          .addScaledVector(rigX, side * 0.10 + Math.sin(phi) * 0.62)
-          .addScaledVector(rigY, 0.26 + 0.22 * A.crouch)
+        _p.copy(_gZ)
+          .addScaledVector(_gX, side * 0.10 + Math.sin(hipTilt) * 0.70)
+          .addScaledVector(gn, 0.26 + 0.22 * A.crouch + 0.30 * A.retract)
           .normalize();
         const q = solveLeg(L, _p);
         if (q) _shinWorld[i].copy(q);
@@ -998,28 +1241,42 @@ export function createSkier(scene) {
         L.boot.cuff.parent.getWorldQuaternion(_qp).invert();
         _q.copy(_qp).multiply(_shinWorld[i]);
         // limit to a plausible cuff range
-        const eul = new THREE.Euler().setFromQuaternion(_q, 'ZXY');
-        eul.x = clamp(eul.x, -0.34, 0.30);
-        eul.y = clamp(eul.y, -0.22, 0.22);
-        eul.z = clamp(eul.z, -0.30, 0.30);
-        L.boot.cuff.quaternion.setFromEuler(eul);
+        _eul.setFromQuaternion(_q, 'ZXY');
+        _eul.x = clamp(_eul.x, -0.34, 0.30);
+        _eul.y = clamp(_eul.y, -0.22, 0.22);
+        _eul.z = clamp(_eul.z, -0.30, 0.30);
+        L.boot.cuff.quaternion.setFromEuler(_eul);
       }
 
-      // ---- poles: aim in rig space, independent of the wrist ----------------
+      // =======================================================================
+      // POLES — 1.22 m of pole against a ~0.95 m grip only fits one way: solve
+      // the shaft angle from the measured grip height so the tip keeps its
+      // clearance, and let it touch the snow only during an actual plant.
+      // =======================================================================
+      const POLE_L = 1.22;
       for (const arm of arms) {
         const side = arm.side;
         const isPlant = A.plantSide === side ? plant : 0;
-        // trailing pose -> plant pose
-        const back = lerp(-0.62, 0.30, isPlant);
-        const down = lerp(-0.78, -0.95, isPlant);
-        const tuckB = A.crouch * 0.92;
+        arm.poleGrip.getWorldPosition(_p);
+        const gripY = _p.sub(group.position).dot(gn);
+        // horizontal aim: trailing back and out, swinging forward for the plant
         _poleDirW.set(0, 0, 0)
-          .addScaledVector(rigZ, lerp(back, -0.99, tuckB))
-          .addScaledVector(rigY, lerp(down, 0.10, tuckB))
-          .addScaledVector(rigX, side * (0.16 - 0.13 * A.crouch) - Math.sin(phi) * 0.2)
-          .normalize();
+          .addScaledVector(_gZ, lerp(-0.96, 0.55, isPlant) - 0.25 * A.crouch)
+          .addScaledVector(_gX, side * (0.34 - 0.22 * A.crouch) + Math.sin(tilt) * 0.28
+            - side * 0.25 * isPlant)
+          .addScaledVector(gn, -0.0);
+        _poleDirW.addScaledVector(gn, -_poleDirW.dot(gn));
+        if (_poleDirW.lengthSq() < 1e-8) _poleDirW.copy(_gZ).multiplyScalar(-1);
+        _poleDirW.normalize();
+        // vertical component that puts the tip exactly `clear` above the snow
+        const clear = lerp(0.065 + 0.10 * A.air, -0.02, clamp(isPlant * 1.6, 0, 1));
+        const kSolve = clamp((clear - gripY) / POLE_L, -1, -0.05);
+        // in a tuck the poles are carried flat under the arms — but never below
+        // whatever the clearance solve allows
+        const k = Math.max(lerp(kSolve, -0.06, A.crouch * 0.95), kSolve);
+        _poleDirW.multiplyScalar(Math.sqrt(Math.max(0, 1 - k * k))).addScaledVector(gn, k);
         arm.poleGrip.parent.getWorldQuaternion(_qp).invert();
-        boneQuat(_poleDirW, rigZ, _poleQ);
+        boneQuat(_poleDirW, _gZ, _poleQ);
         arm.poleGrip.quaternion.copy(_qp).multiply(_poleQ);
       }
 

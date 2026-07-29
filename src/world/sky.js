@@ -16,8 +16,19 @@ import * as THREE from 'three';
  *
  * The whole model is implemented twice: once in GLSL for the dome, once in JS so
  * fog colour, ambient and cloud lighting are read straight out of the same sky
- * rather than hand-picked. That is why distant ridges dissolve into exactly the
- * value of the sky behind them.
+ * rather than hand-picked. Aerial perspective samples that sky in three
+ * directions and interpolates along the view ray, so a distant ridge fogs
+ * toward the colour of the sky it is actually standing in front of.
+ *
+ * The numbers in here are not taste. They are measured with tools/probe.mjs,
+ * which renders the real snow shader into a float target and reports linear
+ * radiance. The contract it asserts, at the default sun:
+ *
+ *     sunlit horizontal snow      0.96 linear
+ *     the same snow, shadowed     0.28 linear    -> 3.4:1, 1.8 stops
+ *     3 km sunlit ridge           0.48 linear, B/R 1.63 (near snow: 1.25)
+ *     +Y IBL irradiance at dusk   B/R 1.37       (shadows stay blue)
+ *     solar disc                  2.5-3.4 linear, reddening to R/B 1.5 at dusk
  *
  * No textures, no assets, no dependencies beyond `three`.
  */
@@ -35,10 +46,14 @@ const STEEPNESS = 1.5;
 const LUM = [0.2126, 0.7152, 0.0722];
 
 // Dome look. Very low turbidity + boosted Rayleigh = thin, clean 2000 m air.
+// The Mie terms are deliberately small: an aerosol lobe big enough to be worth
+// looking at also drives the sky within 15 deg of the sun several times over
+// white, and then the solar disc — which is the thing that is supposed to be
+// the brightest object in the frame — has nothing to stand out against.
 const TURBIDITY = 1.85;
 const RAYLEIGH = 2.45;
-const MIE_COEF = 0.0038;
-const MIE_G = 0.80;
+const MIE_COEF = 0.0025;
+const MIE_G = 0.77;
 
 // Calibration: Preetham's arbitrary units -> "1.0 == diffuse white in full sun".
 // Everything else (sun intensity, IBL, fog) lives in this space.
@@ -49,9 +64,33 @@ const SKY_CALIBRATION = 0.132;
 const RAYLEIGH_SUN = 1.0;
 const MIE_COEF_SUN = 0.005;
 
-// Peak sun intensity. Chosen so sunlit 0.87-albedo snow lands ~0.8 linear at
-// exposure 1.0 — bright, but with headroom so shading survives.
-const SUN_PEAK = 3.45;
+// ---------------------------------------------------------------------------
+// Key / fill balance. This is the single most important number in the file.
+//
+// Real sunlit snow against its own cast shadow is 2.5-3 stops apart. Measured
+// with tools/probe.mjs (which runs the *actual* snow shader into a float
+// target), the pair we are aiming at is:
+//
+//     horizontal sunlit snow   ~1.00 linear
+//     the same snow, sun off   ~0.30 linear      -> 3.3:1, 1.7 stops
+//
+// 0.30 is a floor we cannot go under from here: snow-material.js adds a
+// hard-coded ambient of `albedo * uShadeTint * 0.48` (~0.234 linear) to every
+// shadowed snow pixel regardless of the sky. Everything sky.js contributes to
+// a shadow — the IBL and the hemisphere fill — is the remaining ~0.07. Driving
+// the IBL any lower than SUN_PEAK/ENV_INTENSITY below buys almost no contrast
+// and starts crushing trees, rocks and the skier, none of which have that
+// floor. (If the shadow floor in snow-material.js ever drops, take
+// ENV_INTENSITY down with it and this file needs no other change.)
+const SUN_PEAK = 6.7;          // peak key light; ~0.95 linear on horizontal snow
+const ENV_INTENSITY = 0.26;    // PMREM sky dome as ambient — the fill
+const FILL_INTENSITY = 0.02;   // safety only, for anything that ignores the IBL
+
+// Solar disc radiance before exposure. The dome multiplies by SKY_CALIBRATION,
+// so 13.0 lands the centre of the disc at ~1.7 linear: over white, so it still
+// blooms and reads as the brightest thing in frame, but not the 12x it used to
+// be, which clipped the limb darkening and the sunset reddening flat.
+const SUN_DISC_GAIN = 13.0;
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const smoothstep01 = (e0, e1, x) => {
@@ -65,15 +104,20 @@ const mix = (a, b, t) => a + (b - a) * t;
 //
 // three's built-in fog is a flat distance lerp. We swap the fog ShaderChunks for
 // a single-scattering model: exponential *height* fog, per-channel extinction
-// (aerial perspective / blue shift) and a Henyey-Greenstein forward-scattering
-// term so haze glows when you look toward the sun.
+// (aerial perspective / blue shift), a Henyey-Greenstein forward-scattering
+// term so haze glows when you look toward the sun, and — the part that makes it
+// read as depth rather than as a wash — a *direction-dependent* inscatter term
+// reconstructed from three samples of the same graded sky the dome draws
+// (horizon toward the sun / horizon away from it / upper sky). A distant object
+// therefore fogs toward the colour of the sky it is actually standing in front
+// of, not toward one global constant.
 //
-// The extra parameters ride in one `uniform vec4 fogAP[4]`. A Float32Array
+// The extra parameters ride in one `uniform vec4 fogAP[7]`. A Float32Array
 // uniform value is neither a three object nor a plain Array, so cloneUniforms()
 // copies it *by reference* — a single array shared by every material in the
 // scene, updated once per frame with zero per-material bookkeeping.
 // ---------------------------------------------------------------------------
-const FOG_AP = new Float32Array(16);
+const FOG_AP = new Float32Array(28);
 const FOG_AP_UNIFORM = { value: FOG_AP };
 
 let fogPatched = false;
@@ -106,7 +150,7 @@ function patchFog() {
     uniform float fogNear;
     uniform float fogFar;
   #endif
-  uniform vec4 fogAP[ 4 ];
+  uniform vec4 fogAP[ 7 ];
 #endif`;
 
   THREE.ShaderChunk.fog_fragment = /* glsl */ `
@@ -143,7 +187,21 @@ function patchFog() {
     float g2 = g * g;
     float hg = ( 1.0 - g2 ) / ( 12.5663706 * pow( max( 1.0 + g2 - 2.0 * g * ct, 1e-4 ), 1.5 ) );
 
-    vec3 inscat = fogColor + sunHaze * clamp( hg * sunAmt, 0.0, 8.0 );
+    // Direction-dependent inscatter: the graded sky radiance along the view
+    // ray, reconstructed from three probes of the dome. Warm toward the sun,
+    // cool away from it, and falling off toward the (much darker) upper sky, so
+    // a ridge seen against the zenith fogs to something darker than one seen
+    // against the horizon.
+    vec3  hazeCool = fogAP[ 4 ].xyz;
+    vec3  hazeWarm = fogAP[ 5 ].xyz;
+    vec3  hazeUp   = fogAP[ 6 ].xyz;
+    vec2  sunAz    = vec2( fogAP[ 4 ].w, fogAP[ 5 ].w );
+
+    float hl  = length( vdir.xz );
+    float caz = ( hl > 1e-4 ) ? dot( vdir.xz / hl, sunAz ) : 0.0;
+    vec3  band = mix( hazeCool, hazeWarm, smoothstep( -0.55, 0.90, caz ) );
+    vec3  inscat = mix( band, hazeUp, smoothstep( 0.0, 0.42, vdir.y ) );
+    inscat += sunHaze * clamp( hg * sunAmt, 0.0, 8.0 );
 
     gl_FragColor.rgb = gl_FragColor.rgb * T + inscat * ( 1.0 - T );
 
@@ -158,7 +216,10 @@ function patchFog() {
     #else
       float fogFactor = smoothstep( fogNear, fogFar, vFogDepth );
     #endif
-    gl_FragColor.rgb = mix( gl_FragColor.rgb, fogColor, fogFactor );
+    // NB: scene.fog.color is deliberately stored display-encoded (see the note
+    // in apply()), so it has to be decoded before it can be mixed with light.
+    vec3 fogLin = pow( max( fogColor, 0.0 ), vec3( 2.2 ) );
+    gl_FragColor.rgb = mix( gl_FragColor.rgb, fogLin, fogFactor );
 
   }
 }
@@ -196,7 +257,9 @@ uniform float uSunE;
 uniform float uMieG;
 uniform float uExposure;
 
-uniform vec3  uSunTint;        // linear colour of the solar disc after extinction
+uniform vec3  uSunTint;        // peak-normalised sun colour (aureole, glow)
+uniform vec3  uSunDiscTint;    // *un*-normalised transmittance: the disc reddens
+uniform float uDiscGain;       // solar disc radiance, pre-exposure
 uniform vec3  uHorizonTint;    // luminance-preserving horizon tint, toward the sun
 uniform vec3  uHorizonTintCool; // ... and away from it (Belt of Venus at dusk)
 uniform vec2  uSunAz;          // normalised sun azimuth
@@ -213,7 +276,8 @@ uniform float uCoverage;
 uniform float uCloudDensity;
 uniform float uCirrus;
 uniform vec3  uCloudSun;       // linear sun radiance reaching cloud tops
-uniform vec3  uCloudAmb;       // linear skylight on cloud flanks / bases
+uniform vec3  uCloudAmb;       // anti-solar upper sky: the light on flanks/bases
+uniform vec3  uCloudBase;      // multiplier for a fully self-shadowed base
 
 varying vec3 vWorldPosition;
 
@@ -290,11 +354,31 @@ vec3 gradeSky( vec3 col, vec3 dir ) {
   float caz = ( dl > 1e-4 ) ? dot( dir.xz / dl, uSunAz ) : 0.0;
   vec3 hTint = mix( uHorizonTintCool, uHorizonTint, smoothstep( -0.55, 0.90, caz ) );
 
-  float band = exp( -max( h, 0.0 ) * 10.0 );
-  col = mix( col, vec3( dot( col, LUMW ) ) * hTint, band * 0.55 );
+  // The warm horizon band is an art grade, and it is luminance-preserving, so
+  // on screen it costs nothing. In the IBL it is not free: three's PMREM
+  // "irradiance" mip is a very wide GGX blur, not a cosine-weighted integral,
+  // so a band that covers 10 deg of dome ends up tinting *up*-facing surfaces.
+  // Halve it for the env capture — that is what keeps shadowed snow blue at
+  // golden hour instead of the dead neutral it used to render.
+  float band = exp( -max( h, 0.0 ) * 11.0 );
+  col = mix( col, vec3( dot( col, LUMW ) ) * hTint, band * mix( 0.55, 0.14, uEnvMode ) );
 
+  // Below the horizon. What you SEE down there is a sunlit sea of valley haze
+  // and snow, which is bright; what an up-facing surface actually receives from
+  // it is far less, because every one of those directions is occluded by the
+  // mountain you are standing on and three's IBL has no occlusion term. So the
+  // dome draws it 2.4x brighter than the env capture stores it. This split is
+  // the difference between a believable valley and grey shadows.
   float below = smoothstep( 0.0, -0.13, h );
-  col = mix( col, uGroundColor * ( 1.0 + uEnvMode * 0.18 ), below );
+  col = mix( col, uGroundColor * mix( 2.4, 1.0, uEnvMode ), below );
+
+  // Cosine weighting for the env capture. Irradiance on a surface weights a
+  // direction by cos(zenith), but three's PMREM irradiance mip is a wide GGX
+  // blur that weights everything nearly equally — so at low sun the blazing
+  // band of sky 10 deg above the horizon lands on up-facing snow with roughly
+  // the same weight as the zenith, and the shadows come out neutral instead of
+  // blue. Fold part of that missing cosine in here.
+  col *= mix( 1.0, 0.50 + 0.50 * smoothstep( -0.05, 0.42, h ), uEnvMode );
 
   // Twilight / night floor: Preetham collapses to black below the horizon, so
   // add back the residual skylight that keeps a real night sky deep blue.
@@ -309,8 +393,18 @@ vec3 gradeSky( vec3 col, vec3 dir ) {
 // ---- clouds ----------------------------------------------------------------
 // Coverage-thresholded, domain-warped fbm on a plane at cloud altitude, eroded
 // by a higher octave so silhouettes read cauliflower rather than as blobs.
-float cloudDensity( vec2 p, float cov, int quality ) {
-  vec2 q = vec2( fbm2( p * 0.42 ), fbm2( p * 0.42 + vec2( 4.7, 1.3 ) ) );
+//
+// The warp q is computed once per pixel and passed in, because the shadow
+// march has to sample the SAME field as the silhouette. (It used to march a
+// plain, unwarped fbm3: the shadow term was then spatially uncorrelated with
+// the cloud it was supposed to be darkening, which is exactly why the decks
+// read as flat decals.) Reusing q is legitimate — the warp is two octaves at
+// 0.42x the base frequency, so it barely moves across a shadow step.
+vec2 cloudWarp( vec2 p ) {
+  return vec2( fbm2( p * 0.42 ), fbm2( p * 0.42 + vec2( 4.7, 1.3 ) ) );
+}
+
+float cloudShape( vec2 p, vec2 q, float cov, int quality ) {
   float n = ( quality > 0 ) ? fbm5( p + 0.9 * q ) : fbm3( p + 0.9 * q );
   float d = clamp( ( n - cov ) / max( 1.0 - cov, 0.05 ), 0.0, 1.0 );
   if ( quality > 0 ) {
@@ -322,21 +416,17 @@ float cloudDensity( vec2 p, float cov, int quality ) {
   return d * d * ( 3.0 - 2.0 * d );
 }
 
-float cheapDensity( vec2 p, float cov ) {
-  float d = clamp( ( fbm3( p ) - cov ) / max( 1.0 - cov, 0.05 ), 0.0, 1.0 );
-  return d * d * ( 3.0 - 2.0 * d );
-}
-
 vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale,
                  vec2 drift, float cov, float thickness, float ambBoost,
-                 float apRate, int quality ) {
+                 float apRate, int quality, float odSelf, float lit ) {
   if ( dir.y < 0.010 ) return vec4( 0.0 );
   float t = ( altitude - camPos.y ) / dir.y;
   if ( t <= 0.0 ) return vec4( 0.0 );
 
   vec2 p = ( camPos.xz + dir.xz * t ) * scale + drift * uTime;
 
-  float d = cloudDensity( p, cov, quality );
+  vec2 q = cloudWarp( p );
+  float d = cloudShape( p, q, cov, quality );
   if ( d <= 0.003 ) return vec4( 0.0 );
 
   // march a few taps toward the sun through the slab for self-shadowing
@@ -344,25 +434,49 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   float sl = length( sdir );
   sdir = ( sl > 1e-4 ) ? sdir / sl : vec2( 1.0, 0.0 );
   float stepLen = thickness * ( 0.6 / max( uSunDir.y, 0.20 ) );
-  float shadow = cheapDensity( p + sdir * stepLen,       cov ) * 0.55
-               + cheapDensity( p + sdir * stepLen * 2.4, cov ) * 0.30
-               + cheapDensity( p + sdir * stepLen * 5.0, cov ) * 0.15;
+  float s1 = cloudShape( p + sdir * stepLen,       q, cov, 0 );
+  float s2 = cloudShape( p + sdir * stepLen * 2.4, q, cov, 0 );
+  float s3 = cloudShape( p + sdir * stepLen * 5.2, q, cov, 0 );
+  // Everything below the top of the deck is shaded by the deck above it, so
+  // the optical depth toward the sun never really goes to zero inside a body.
+  float shadow = s1 * 0.50 + s2 * 0.32 + s3 * 0.18 + d * odSelf;
+
+  // Cauliflower relief. The density field falling away toward the sun means
+  // this flank turns into the light; rising means it turns away. It is a
+  // forward difference of the same field, so the shading follows the
+  // silhouette exactly — which is the whole difference between a cloud and a
+  // sticker of a cloud.
+  float facing = clamp( ( d - s1 ) * 2.2 + 0.5, 0.0, 1.0 );
 
   float ct = dot( dir, uSunDir );
-  float phase = 0.92 + 2.4 * hgPhase( ct, 0.72 ) + 0.6 * hgPhase( ct, -0.30 );
+  // Two lobes: strong forward scatter (the silver lining) plus a weak back
+  // lobe. Capped, because an HG lobe is unbounded at ct = 1 and a cloud
+  // crossing the sun would otherwise read as a nuclear flash.
+  float phase = min( 0.92 + 2.4 * hgPhase( ct, 0.72 ) + 0.6 * hgPhase( ct, -0.30 ), 3.4 );
 
-  // multiple scattering keeps even shadowed cloud far from black
-  float beer   = 0.16 + 0.84 * exp( -shadow * 2.2 );
-  float powder = 1.0 - exp( -d * 6.0 );   // dark-edge / silver-lining term
+  // Beer-Powder. Multiple scattering comes back in through the ambient term,
+  // which is where it physically belongs — it is skylight, and it is blue.
+  float beer   = 0.11 + 0.89 * exp( -shadow * 2.7 );
+  float powder = 1.0 - exp( -d * 7.0 );   // dark-edge / silver-lining term
+  float sh     = clamp( shadow * 1.10, 0.0, 1.0 );
 
-  vec3 col = uCloudSun * beer * phase * ( 0.45 + 0.55 * powder )
-           + uCloudAmb * ( 0.50 + 0.50 * ( 1.0 - d ) ) * ambBoost;
+  // Lit rim: thin, sun-facing edges are where forward scattering escapes.
+  float rim = min( pow( 1.0 - d, 3.0 ) * hgPhase( ct, 0.86 ) * 9.0, 0.85 );
+
+  vec3 col = uCloudSun * lit
+             * ( beer * phase * ( 0.30 + 0.70 * powder ) * ( 0.55 + 0.90 * facing ) + rim )
+           + uCloudAmb * mix( vec3( 1.0 ), uCloudBase, sh ) * ambBoost;
 
   // aerial perspective: dissolve into the sky that is actually behind them
   float ap = 1.0 - exp( -t * apRate );
   col = mix( col, skyCol, ap * 0.9 );
 
-  float a = smoothstep( 0.03, 0.40, d ) * smoothstep( 0.018, 0.115, dir.y );
+  // The env capture runs the cheap density, which is not eroded and therefore
+  // covers noticeably more sky than the silhouette you actually see. Trim the
+  // coverage back so the IBL is not over-clouded (at low sun that showed up
+  // directly as warm cloud light neutralising the blue in the shadows).
+  float a = smoothstep( 0.03, 0.40, d ) * smoothstep( 0.018, 0.115, dir.y )
+          * mix( 1.0, 0.72, uEnvMode );
   return vec4( col, clamp( a, 0.0, 1.0 ) );
 }
 
@@ -395,10 +509,14 @@ void main() {
 
   // ---- cloud decks -------------------------------------------------------
   vec4 ci  = cirrusLayer( dir, cameraPosition, skyCol );
+  // high altocumulus: thin, so barely any self-shadowing and it stays pale
   vec4 cu2 = cloudLayer( dir, cameraPosition, skyCol, 5400.0, 0.00019,
-                         vec2( 0.0010, 0.0004 ), uCoverage + 0.13, 0.20, 1.25, 3.2e-5, 0 );
+                         vec2( 0.0010, 0.0004 ), uCoverage + 0.17, 0.20, 1.15,
+                         3.2e-5, 0, 0.12, 1.15 );
+  // the main cumulus deck: thick, seen from underneath, so it self-shadows hard
   vec4 cu  = cloudLayer( dir, cameraPosition, skyCol, 2350.0, 0.00052,
-                         vec2( 0.0030, 0.0011 ), uCoverage, 0.30, 1.00, 7.0e-5, 1 );
+                         vec2( 0.0030, 0.0011 ), uCoverage, 0.30, 1.00,
+                         7.0e-5, 1, 0.38, 1.0 );
 
   col = mix( col, ci.rgb,  ci.a  * uCloudDensity );
   col = mix( col, cu2.rgb, cu2.a * uCloudDensity * 0.65 );
@@ -410,18 +528,21 @@ void main() {
   float discOn = uSunDisc * horizonFade;
 
   // tight aureole on top of the broad Mie lobe from the scattering model
-  col += uSunTint * pow( max( ct, 0.0 ), 6000.0 ) * 3.0 * discOn;
-  col += uSunTint * pow( max( ct, 0.0 ), 700.0 ) * 0.35 * discOn;
+  col += uSunDiscTint * pow( max( ct, 0.0 ), 6000.0 ) * 2.2 * discOn;
+  col += uSunDiscTint * pow( max( ct, 0.0 ), 700.0 ) * 0.30 * discOn;
 
   float ang = acos( clamp( ct, -1.0, 1.0 ) );
-  float R = 0.0092;                       // ~0.53 deg radius
+  const float R = 0.00465;                // true solar radius, 0.266 deg
   float x = ang / R;
-  if ( x < 1.15 && discOn > 0.0 ) {
+  if ( x < 1.30 && discOn > 0.0 ) {
     float xc = min( x, 1.0 );
     float mu = sqrt( max( 0.0, 1.0 - xc * xc ) );
-    float limb = 0.24 + 0.76 * pow( mu, 0.42 );   // solar limb darkening
-    limb *= 1.0 - smoothstep( 0.90, 1.06, x );
-    col += uSunTint * limb * 90.0 * discOn;
+    float limb = 0.30 + 0.70 * pow( mu, 0.5 );    // solar limb darkening
+    limb *= 1.0 - smoothstep( 0.92, 1.12, x );    // ~1 px of atmospheric blur
+    // uDiscGain lands the disc a little over white so the limb gradient and
+    // the low-sun reddening both survive the display transform instead of
+    // being flattened into a clipped white circle.
+    col += uSunDiscTint * limb * uDiscGain * discOn;
   }
 
   col *= uExposure;
@@ -474,6 +595,8 @@ export function createSky(scene, renderer) {
     uMieG: { value: MIE_G },
     uExposure: { value: SKY_CALIBRATION },
     uSunTint: { value: new THREE.Vector3(1, 0.95, 0.88) },
+    uSunDiscTint: { value: new THREE.Vector3(1, 0.95, 0.88) },
+    uDiscGain: { value: SUN_DISC_GAIN },
     uHorizonTint: { value: new THREE.Vector3(1.05, 1.0, 0.97) },
     uHorizonTintCool: { value: new THREE.Vector3(1.0, 1.0, 1.02) },
     uSunAz: { value: new THREE.Vector2(0, 1) },
@@ -490,6 +613,7 @@ export function createSky(scene, renderer) {
     uCirrus: { value: 0.22 },
     uCloudSun: { value: new THREE.Vector3(1, 1, 1) },
     uCloudAmb: { value: new THREE.Vector3(0.2, 0.25, 0.34) },
+    uCloudBase: { value: new THREE.Vector3(0.34, 0.29, 0.46) },
   };
 
   const skyMat = new THREE.ShaderMaterial({
@@ -539,12 +663,21 @@ export function createSky(scene, renderer) {
   scene.add(sun);
   scene.add(sun.target);
 
-  // Tiny fill so anything that ignores scene.environment is never pure black.
-  // The real ambient is the IBL.
-  const fill = new THREE.HemisphereLight(0xbcd6ff, 0xe6eef7, 0.12);
+  // Vestigial fill so anything that ignores scene.environment is never pure
+  // black. With a working PMREM this light is double-counting: at any strength
+  // worth seeing it is unshadowed ambient, and unshadowed ambient is precisely
+  // what was eating the key-to-fill ratio. Keep it at token strength.
+  const fill = new THREE.HemisphereLight(0xbcd6ff, 0xe6eef7, FILL_INTENSITY);
   scene.add(fill);
 
   // ---- fog ---------------------------------------------------------------
+  // NOTE ON COLOUR SPACE: terrain.js runs its own aerial-perspective term and
+  // seeds it with `scene.fog.color.convertSRGBToLinear()`, i.e. it expects the
+  // fog colour to be display-encoded. three stores Color in linear working
+  // space, so we deliberately store the *encoded* haze here and let terrain
+  // decode it back — otherwise the terrain, which is where aerial perspective
+  // matters most, fogs toward a colour ~2.5x too dark. Our own fog ShaderChunk
+  // does not use `fogColor`; it takes the true linear inscatter from fogAP.
   const fog = new THREE.FogExp2(0xbcd2ea, 0.00055);
   scene.fog = fog;
 
@@ -558,6 +691,7 @@ export function createSky(scene, renderer) {
   const _right = new THREE.Vector3();
   const _up = new THREE.Vector3();
   const _tmp = new THREE.Vector3();
+  const _fogCol = new THREE.Color();
 
   const LATITUDE = 46.5 * Math.PI / 180;    // Alps
   const DECLINATION = 14.0 * Math.PI / 180; // late spring
@@ -566,7 +700,7 @@ export function createSky(scene, renderer) {
   // camera and flattening every roller.
   const ASPECT = -82 * Math.PI / 180;
 
-  let tod = 0.375;                 // strong late-morning bluebird by default
+  let tod = 0.335;                 // mid-morning bluebird, sun ~31 deg
   let elevation = 0;
   let clock = 0;
   let envDirty = true;
@@ -578,7 +712,11 @@ export function createSky(scene, renderer) {
     cloudDensity: 1.0,
     cirrus: 0.22,
     windSpeed: 1.0,
-    fogDensity: 0.00062,
+    fogDensity: 0.00062,     // our own chunk (trees, skier, props)
+    // terrain.js divides by its own 0.62 fudge and integrates against a 1500 m
+    // scale height, so the ridges need a heavier number than everything else
+    // to lose the same amount of contrast. Tuned against the 3 km probe.
+    aerialDensity: 0.00120,
     fogHeight: 1150,
     fogRef: 0,
     fogStart: 40,
@@ -622,15 +760,17 @@ export function createSky(scene, renderer) {
     ];
     const w = smoothstep01(-0.55, 0.90, caz);
     const htx = mix(htc.x, htw.x, w), hty = mix(htc.y, htw.y, w), htz = mix(htc.z, htw.z, w);
-    const band = Math.exp(-Math.max(h, 0) * 10) * 0.55;
+    const band = Math.exp(-Math.max(h, 0) * 11) * 0.55;
     const l = luminance(c);
     c[0] = mix(c[0], l * htx, band);
     c[1] = mix(c[1], l * hty, band);
     c[2] = mix(c[2], l * htz, band);
+    // mirrors the dome's visible-sky branch (uEnvMode == 0); every caller of
+    // skyAt() is above the horizon, so in practice below == 0 here
     const below = smoothstep01(0, -0.13, h);
-    c[0] = mix(c[0], gc.x, below);
-    c[1] = mix(c[1], gc.y, below);
-    c[2] = mix(c[2], gc.z, below);
+    c[0] = mix(c[0], gc.x * 2.4, below);
+    c[1] = mix(c[1], gc.y * 2.4, below);
+    c[2] = mix(c[2], gc.z * 2.4, below);
     const na = uniforms.uNightAmount.value;
     if (na > 0.002) {
       const nz = uniforms.uNightZenith.value, nh = uniforms.uNightHorizon.value;
@@ -700,9 +840,32 @@ export function createSky(scene, renderer) {
     const golden = smoothstep01(0.42, 0.05, Math.sin(elev)) * above;
     const night = 1 - above;
 
+    // ---- exposure ---------------------------------------------------------
+    // Derived first, because a camera stop is a property of the *scene*, not of
+    // the display transform: postfx renders through a render target, where
+    // renderer.toneMappingExposure is a no-op. So the meter is folded into the
+    // key, the IBL and the dome instead, which is equivalent and works no
+    // matter who does the final tonemap.
+    // Meter on the irradiance that actually lands on flat snow — the sun's own
+    // transmittance times cos(zenith) — and compensate for only *half* of it
+    // (the sqrt), the way a photographer opens up a couple of stops at dusk
+    // without pretending it is noon. INC_REF is that quantity at the default
+    // late-morning sun, so exposure there is exactly 1.0 and sunlit snow lands
+    // on 1.0 linear.
+    const key = (lum / 0.8955) * above;
+    const inc = key * Math.max(Math.sin(elev), 0);
+    const INC_REF = 0.634;
+    // The upper clamp matters: open up more than ~1.6 stops-worth at dusk and
+    // the sky around the sun goes over white, taking the disc with it.
+    const expo = clamp(Math.sqrt(INC_REF / Math.max(inc, 1e-4)), 0.8, 1.55) * params.exposureScale;
+
     sun.color.setRGB(sunCol[0], sunCol[1], sunCol[2], THREE.LinearSRGBColorSpace);
-    sun.intensity = SUN_PEAK * (lum / 0.8955) * above;
+    sun.intensity = SUN_PEAK * key * expo;
     uniforms.uSunTint.value.set(sunCol[0], sunCol[1], sunCol[2]);
+    // The disc gets the raw transmittance, NOT the peak-normalised tint —
+    // normalising is what stopped it ever rendering orange at golden hour.
+    uniforms.uSunDiscTint.value.set(Fex[0], Fex[1], Fex[2]);
+    uniforms.uExposure.value = SKY_CALIBRATION * expo;
 
     // ---- grade tints ------------------------------------------------------
     uniforms.uZenithTint.value.set(
@@ -728,68 +891,107 @@ export function createSky(scene, renderer) {
 
     // ---- read the sky back out to drive everything else -------------------
     // All of these are above the horizon, so uGroundColor (written below) does
-    // not participate and the ordering is safe.
-    const horizonNeutral = skyAt(1.5, Math.PI * 0.5);
-    const horizonSun = skyAt(1.5, 0);
+    // not participate and the ordering is safe. skyAt() is calibrated but NOT
+    // exposed, so anything that ends up as scene radiance is scaled by `expo`
+    // here, while anything handed to the dome shader (which applies uExposure
+    // itself) is not.
+    const horizonNeutral = skyAt(3.5, Math.PI * 0.5);
+    const horizonSun = skyAt(3.5, 0);
     const low = skyAt(12, Math.PI * 0.5);
     const mid = skyAt(38, Math.PI * 0.75);
-    const high = skyAt(75, Math.PI);
+    const antisolar = skyAt(42, Math.PI);
 
-    // Valley haze / snow bounce below the horizon: horizon sky, slightly warmed
-    // and lifted, because it is really snow-and-cloud-sea reflecting the sky.
-    const gb = 0.52 / SKY_CALIBRATION;   // gradeJS re-applies the calibration
+    // Valley haze / snow bounce below the horizon. It used to be lifted to 4x
+    // the sky and warmed at golden hour; PMREM's irradiance mip then smeared
+    // that warm lower hemisphere straight into every up-facing surface, which
+    // is what made shadows achromatic. It is now a third of that and untinted,
+    // and the cast shadows go blue.
+    // The lower hemisphere is also pulled toward the upper sky as the sun drops:
+    // at golden hour the valley below you is already in shadow, so what it
+    // bounces back is blue skylight, not the orange band on the horizon.
+    const gb = 0.175 / SKY_CALIBRATION;   // gradeJS re-applies the calibration
+    const gk = 0.30 + 0.52 * golden;
     uniforms.uGroundColor.value.set(
-      horizonNeutral[0] * gb * (1 + golden * 0.35),
-      horizonNeutral[1] * gb * (1 + golden * 0.12),
-      horizonNeutral[2] * gb * 0.98);
+      mix(horizonNeutral[0], mid[0], gk) * gb * 0.94,
+      mix(horizonNeutral[1], mid[1], gk) * gb * 0.98,
+      mix(horizonNeutral[2], mid[2], gk) * gb * 1.06);
 
     // Skylight seen by cloud flanks. NOTE: the shader multiplies everything by
-    // SKY_CALIBRATION at the end, so cloud radiances are stored pre-calibration.
+    // SKY_CALIBRATION * expo at the end, so cloud radiances are stored
+    // pre-calibration and pre-exposure.
     const inv = 1 / SKY_CALIBRATION;
-    const ambR = (horizonNeutral[0] + low[0] + mid[0] + high[0]) * 0.25 * inv;
-    const ambG = (horizonNeutral[1] + low[1] + mid[1] + high[1]) * 0.25 * inv;
-    const ambB = (horizonNeutral[2] + low[2] + mid[2] + high[2]) * 0.25 * inv;
-    uniforms.uCloudAmb.value.set(ambR * 0.62, ambG * 0.66, ambB * 0.76);
+    // Take the cloud ambient from the ANTI-SOLAR upper sky. A flat average over
+    // the dome includes the horizon glow and the bright solar half, which is
+    // the light a cloud base sees least of.
+    uniforms.uCloudAmb.value.set(
+      mix(antisolar[0], mid[0], 0.35) * 0.95 * inv,
+      mix(antisolar[1], mid[1], 0.35) * 1.00 * inv,
+      mix(antisolar[2], mid[2], 0.35) * 1.22 * inv);
+    uniforms.uCloudBase.value.set(
+      mix(0.54, 0.48, golden), mix(0.50, 0.42, golden), mix(0.64, 0.62, golden));
 
     // Sun radiance on cloud tops: less extinction up at 3 km, albedo ~0.9.
     const hiFex = sunTransmittance(Math.max(elev, 0.015) + 0.07);
     const hiPeak = Math.max(hiFex[0], hiFex[1], hiFex[2], 1e-5);
-    const cloudLit = SUN_PEAK * (luminance(hiFex) / 0.8955) * above * (1.18 / Math.PI) * inv;
+    const cloudLit = SUN_PEAK * key * (0.86 / Math.PI) * inv;
     uniforms.uCloudSun.value.set(
       (hiFex[0] / hiPeak) * cloudLit,
       (hiFex[1] / hiPeak) * cloudLit,
       (hiFex[2] / hiPeak) * cloudLit);
 
     // ---- hemisphere fill --------------------------------------------------
-    fill.color.setRGB(low[0] * 2.2, low[1] * 2.2, low[2] * 2.4, THREE.LinearSRGBColorSpace);
-    fill.groundColor.setRGB(
-      horizonNeutral[0] * 2.0, horizonNeutral[1] * 2.0, horizonNeutral[2] * 2.0,
+    fill.color.setRGB(low[0] * 2.2 * expo, low[1] * 2.2 * expo, low[2] * 2.4 * expo,
       THREE.LinearSRGBColorSpace);
-    fill.intensity = 0.05 + 0.03 * day;
+    fill.groundColor.setRGB(
+      horizonNeutral[0] * 1.4 * expo, horizonNeutral[1] * 1.4 * expo,
+      horizonNeutral[2] * 1.4 * expo, THREE.LinearSRGBColorSpace);
+    fill.intensity = FILL_INTENSITY;
 
-    // Snow bounces a huge amount of skylight, but a fully unoccluded hemisphere
-    // flattens the render. Pull the IBL back so sun:shadow reads ~5:1.
-    scene.environmentIntensity = 0.72;
+    // Snow bounces a lot of skylight, but a fully unoccluded hemisphere flattens
+    // the render into a milk bath. See the note at the top of the file: this is
+    // the number that buys back the tonal separation.
+    scene.environmentIntensity = ENV_INTENSITY;
 
-    // ---- fog --------------------------------------------------------------
-    // Haze colour == the sky just above the horizon, 90 deg off the sun, pulled
-    // a little way up the dome. A ridge that fogs out lands on the value of the
-    // sky behind it, but the slight bias toward 12 deg keeps distant snow
-    // reading cooler than near snow instead of merely paler.
-    const haze = [
-      mix(horizonNeutral[0], low[0], 0.42),
-      mix(horizonNeutral[1], low[1], 0.42),
-      mix(horizonNeutral[2], low[2], 0.42),
+    // ---- fog / aerial perspective -----------------------------------------
+    // Three probes of the same graded dome the sky draws: horizon away from the
+    // sun, horizon toward it, and the sky 25 deg up. The fog chunk interpolates
+    // between them along the view ray, so a fogged object lands on the colour
+    // of the sky it is standing in front of. HAZE_GAIN < 1 because the light
+    // that survives to the eye from a few km of clean 2000 m air is a fraction
+    // of the full optical-depth horizon radiance; without it the haze is as
+    // bright as sunlit snow and fogging snow is a no-op.
+    const HAZE_GAIN = 0.56 * expo;
+    const tilt = [0.88, 0.97, 1.16];         // aerial perspective is blue
+    const hazeCool = [
+      mix(horizonNeutral[0], low[0], 0.30) * HAZE_GAIN * tilt[0],
+      mix(horizonNeutral[1], low[1], 0.30) * HAZE_GAIN * tilt[1],
+      mix(horizonNeutral[2], low[2], 0.30) * HAZE_GAIN * tilt[2],
     ];
-    fog.color.setRGB(haze[0], haze[1], haze[2], THREE.LinearSRGBColorSpace);
-    fog.density = params.fogDensity;
+    const hazeWarm = [
+      mix(horizonSun[0], mid[0], 0.20) * HAZE_GAIN * 1.0,
+      mix(horizonSun[1], mid[1], 0.20) * HAZE_GAIN * 1.0,
+      mix(horizonSun[2], mid[2], 0.20) * HAZE_GAIN * 1.06,
+    ];
+    const hazeUp = [
+      mix(mid[0], antisolar[0], 0.5) * HAZE_GAIN * 1.05,
+      mix(mid[1], antisolar[1], 0.5) * HAZE_GAIN * 1.05,
+      mix(mid[2], antisolar[2], 0.5) * HAZE_GAIN * 1.15,
+    ];
+
+    // terrain.js reads this one (display-encoded — see the fog note above) and
+    // runs its own direction-independent aerial term off it, so it gets the
+    // neutral/cool haze, which is what a ridge is usually seen against.
+    _fogCol.setRGB(hazeCool[0], hazeCool[1], hazeCool[2], THREE.LinearSRGBColorSpace);
+    _fogCol.convertLinearToSRGB();
+    fog.color.copy(_fogCol);
+    fog.density = params.aerialDensity;
 
     // The extra glow you get looking through haze toward the sun.
     const glowScale = 0.55 + 0.9 * golden;
     const sunHaze = [
-      Math.max(0, horizonSun[0] - haze[0]) * glowScale,
-      Math.max(0, horizonSun[1] - haze[1]) * glowScale,
-      Math.max(0, horizonSun[2] - haze[2]) * glowScale,
+      Math.max(0, hazeWarm[0] - hazeCool[0]) * glowScale,
+      Math.max(0, hazeWarm[1] - hazeCool[1]) * glowScale,
+      Math.max(0, hazeWarm[2] - hazeCool[2]) * glowScale,
     ];
 
     FOG_AP[0] = params.fogDensity;
@@ -808,11 +1010,23 @@ export function createSky(scene, renderer) {
     FOG_AP[13] = sunHaze[1];
     FOG_AP[14] = sunHaze[2];
     FOG_AP[15] = 0.975;                // never fully erase distant geometry
+    FOG_AP[16] = hazeCool[0];
+    FOG_AP[17] = hazeCool[1];
+    FOG_AP[18] = hazeCool[2];
+    FOG_AP[19] = sunDir.x / azLen;     // sun azimuth, for the warm/cool blend
+    FOG_AP[20] = hazeWarm[0];
+    FOG_AP[21] = hazeWarm[1];
+    FOG_AP[22] = hazeWarm[2];
+    FOG_AP[23] = sunDir.z / azLen;
+    FOG_AP[24] = hazeUp[0];
+    FOG_AP[25] = hazeUp[1];
+    FOG_AP[26] = hazeUp[2];
+    FOG_AP[27] = 0;
 
-    // ---- exposure ---------------------------------------------------------
-    // Meter off the direct sun so golden hour opens up like a real camera.
-    const meter = 0.30 + 0.70 * (lum / 0.8955) * above;
-    renderer.toneMappingExposure = clamp(1.0 / meter, 1.0, 3.2) * params.exposureScale;
+    // The exposure is already baked into the lights and the dome, so the
+    // renderer's own tonemap must not apply it a second time. (It only runs at
+    // all if the lead bypasses postfx.)
+    renderer.toneMappingExposure = 1.0;
 
     envDirty = true;
   }
