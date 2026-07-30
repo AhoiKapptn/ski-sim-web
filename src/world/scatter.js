@@ -1882,9 +1882,18 @@ const SPECIES = [
     col: [0.90, 0.98, 0.84], barkCol: [0.64, 0.58, 0.54],
   },
   { // 5 dead standing snag — broken top, bare limbs, silvered bark
-    name: 'snag', h: 13, trunkR: 0.19, tiers: 7, bare: 0.34, spread: 0.150,
-    crown: 0.55, droop: 0.20, rise: 0.30, tip: 0.0, frondW: 0.20, snow: 0.4,
-    sprig: 3, bark: 3, sub: 1, dead: true,
+    // A snag has to be legible as a DELIBERATE snag, not as a living tree that
+    // failed to render, and the difference is almost entirely proportion. The
+    // old one was a spruce-sized reach (spread 0.150) of long soft twig planes
+    // on a spruce-thin bole, which at any distance is just a thin tree. A real
+    // standing dead conifer is a stout short stump of a bole — bark gone grey,
+    // top snapped off — carrying broken STUBS: a metre or two of limb, no fine
+    // outer branching, and a clean bole for the lower half where the small
+    // stuff has already fallen. Hence: fatter trunk, half the reach, no forks,
+    // a higher first stub, and a break lower down the stem.
+    name: 'snag', h: 13, trunkR: 0.26, tiers: 7, bare: 0.46, spread: 0.082,
+    crown: 0.55, droop: 0.20, rise: 0.30, tip: 0.0, frondW: 0.30, snow: 0.4,
+    sprig: 3, bark: 3, sub: 0, dead: true,
     // The snow-bounce fill lifts everything by roughly 0.03 linear, and on a
     // near snag — which is a big mass of bare twigs with no dark needle in it —
     // that turned the whole crown into a pale beige cloud. Pull the dead-twig
@@ -1934,7 +1943,10 @@ function buildConifer(rnd, si, lod, opt = {}) {
   const seg = lod === 0 ? 9 : 5;
   const leanX = (rnd() - 0.5) * 0.045 * H + (flag ? Math.cos(wind) * 0.22 * H : 0);
   const leanZ = (rnd() - 0.5) * 0.045 * H + (flag ? Math.sin(wind) * 0.22 * H : 0);
-  const brokeAt = dead ? 0.60 + rnd() * 0.28 : 1;
+  // A snag's snapped top is the single clearest signal that it is meant to be
+  // dead. Keep the break well inside the stem so the silhouette is obviously
+  // truncated rather than merely thin at the tip.
+  const brokeAt = dead ? 0.52 + rnd() * 0.24 : 1;
   const pts = [], radii = [];
   // two rings below grade so the stem flares into a root plate instead of
   // meeting the snow as a dowel pushed into a hole
@@ -1982,13 +1994,28 @@ function buildConifer(rnd, si, lod, opt = {}) {
   };
 
   // ---- branch whorls -------------------------------------------------------
-  // LOD1 whorl count. At 0.55 a spruce carried 12 tiers of 3 branches of 4
-  // cards over 34-150 m — about a seventh of LOD0's foliage — and the result
-  // was a bare brown mast standing out of a wispy crown all the way across the
-  // band the player spends most of the run looking at. 0.72 is the point where
-  // the leader is covered again; see the branch and card counts below, which
-  // move with it.
-  const nTiers = Math.max(4, Math.round(S.tiers * (lod === 0 ? 1 : 0.64)));
+  // MEASURED REGRESSION (the flagpole). Two independent terms conspired:
+  //
+  //  1. The whorl count was a per-SPECIES constant while `H` is a per-variant
+  //     and per-instance random. `hScale` 1.22 x the 0.86-1.16 individual roll
+  //     puts a spruce at 36 m carrying the whorl count generated for a 24 m
+  //     one, i.e. 1.7 m of bare bole between tiers instead of 1.1 m, and the
+  //     tall variants are exactly the ones that stand clear of the canopy
+  //     against the sky. Side-silhouette raster over all 30 conifer variants:
+  //     spruce k2 (the 36 m one) had 16 of its 36 crown bands with no foliage
+  //     over the trunk column at all. Whorl SPACING is what a conifer holds
+  //     roughly constant, not whorl count, so the count now tracks H.
+  //
+  //  2. The LOD1 reduction. At 0.64 tiers x 3 branches x 4 cards and no
+  //     sub-branches, LOD1 carried 6.7k triangles against LOD0's 71k — 9% of
+  //     the foliage — and B_G1 starts at 34 m, where a mature spruce is still
+  //     800 px tall. That is the "handful of detached cards floating around a
+  //     pole" read: the tiers are all present, they simply have nothing on
+  //     them. The counts below (tiers, branches per whorl, cards per branch and
+  //     card size) all move together; the target is a LOD1 that carries about a
+  //     third of LOD0's foliage area, not a tenth.
+  const hK = clamp(H / S.h, 0.55, 1.85);           // this stem against the norm
+  const nTiers = Math.max(5, Math.round(S.tiers * hK * (lod === 0 ? 1 : 0.82)));
   const dirH = new THREE.Vector3();
   const side = new THREE.Vector3();
   // P belongs to the branch curve, Q to the sub-branch curve, R2 to the shaded
@@ -2075,9 +2102,17 @@ function buildConifer(rnd, si, lod, opt = {}) {
       // Needles do not get shorter as a branch gets shorter. Without a floor
       // the short upper whorls carry sub-centimetre cards and the top of the
       // crown opens up into a bare stick.
+      //
+      // The floor used to be an absolute 5 cm, which is a needle spray on a
+      // sapling and a speck of dust on a 36 m spruce: the upper third of a tall
+      // stem came out as isolated 15 cm flakes strung along the leader with sky
+      // between them. A spray of spruce needles is 20-40 cm whatever it is
+      // growing on, and on a big tree it is at the top of that range, so the
+      // floor scales with the stem.
       // 1/SPRIG_SCALE: the tile art now stops short of the tile border, so the
       // quad has to be that much bigger for the *foliage* to keep its size.
-      const size = Math.max(w * (o.size || 1) * (0.42 + 0.42 * rnd()), 0.05 * (o.size || 1))
+      const minCard = (0.055 + 0.0105 * H) * (o.size || 1);
+      const size = Math.max(w * (o.size || 1) * (0.42 + 0.42 * rnd()), minCard)
         / SPRIG_SCALE;
       const len = size * (1.8 + 1.1 * rnd());
       const ti = snowy ? (rnd() < 0.5 ? 0 : 1)
@@ -2123,21 +2158,37 @@ function buildConifer(rnd, si, lod, opt = {}) {
     // whorl spacing is not metronomic: a perfectly even ladder of tiers is the
     // strongest "procedural cone" tell there is
     const uj = clamp(u + (vnoise2(ti * 5.9, si * 2.3) - 0.5) * (0.7 / nTiers), 0.02, 1);
-    const t = S.bare + (1 - S.bare) * (1 - uj) * brokeAt;
+    // Internodes shorten toward the apex on a real conifer, and they have to
+    // here for a different reason: branch reach falls off much faster than
+    // whorl spacing does, so a ladder that is evenly spaced in HEIGHT loses its
+    // tier-to-tier overlap in the top quarter and the leader shows through.
+    //
+    // `brokeAt` scales the whole normalised position, not just the live part.
+    // It used to read `S.bare + (1 - S.bare) * v * brokeAt`, whose maximum is
+    // `S.bare + (1 - S.bare) * brokeAt` — which for a snag at bare 0.34 and a
+    // break at 0.60 is 0.74 of H, while the trunk itself stops at 0.60 of H.
+    // Every snag therefore carried its top two or three whorls of twigs 1-2 m
+    // ABOVE the snapped-off stem, floating in clear air. That is the literal
+    // "detached cards with sky between them around a bare pole" artifact, and
+    // it was structural: it happened to every dead stem at every LOD.
+    const t = (S.bare + (1 - S.bare) * Math.pow(1 - uj, 0.86)) * brokeAt;
     const anchor = trunkAt(t).clone();
 
     // The profile floor matters: without it the top three or four whorls came
     // out shorter than the cull threshold and were dropped, which left the
-    // leader standing as a bare stick out of the crown.
-    const prof = (0.085 + 0.915 * Math.pow(u, S.crown))
-      * (0.46 + 0.54 * smoothstep(0, 0.16, u))
+    // leader standing as a bare stick out of the crown. 0.085 x the 0.46 taper
+    // below was still only 4% of the maximum reach at the apex — a 36 m spruce
+    // put 42 cm whorls around 8 m of leader. 0.125/0.58 is 1.7x that and still
+    // reads as a spire: the silhouette is set by `crown`, not by the floor.
+    const prof = (0.125 + 0.875 * Math.pow(u, S.crown))
+      * (0.58 + 0.42 * smoothstep(0, 0.13, u))
       * (1 - (0.26 + 0.26 * AGE) * smoothstep(0.74, 1.0, u));
     const L = S.spread * SPREADK * H * (2.0 * prof) * (0.80 + 0.40 * rnd());
     if (L < 0.05) continue;
 
     const nb = lod === 0
       ? Math.max(4, Math.round(3.2 + 2.6 * u))
-      : Math.max(3, Math.round(2.5 + 1.5 * u));
+      : Math.max(4, Math.round(3.0 + 2.2 * u));
     const a0 = ti * 2.39996 + rnd() * 0.7;
 
     for (let bi = 0; bi < nb; bi++) {
@@ -2171,7 +2222,12 @@ function buildConifer(rnd, si, lod, opt = {}) {
         (0.26 + 0.78 * Math.pow(Math.sin(Math.PI * (0.11 + 0.89 * s)), 0.75));
 
       // ---- woody stem ------------------------------------------------------
-      if (lod === 0 && BL > 1.3) {
+      // On a living tree the limb is buried in its own foliage, so LOD1 drops
+      // it. On a snag the limb IS the silhouette: without it the reduced band
+      // renders a snag as loose twig cards with nothing holding them, which is
+      // the "debris caught on a pole" read this pass exists to remove.
+      const stemMin = lod === 0 ? 1.3 : (dead ? 0.6 : Infinity);
+      if (BL > stemMin) {
         const NS = 2;
         const sp = [], sr = [];
         for (let k = 0; k <= NS; k++) {
@@ -2188,16 +2244,27 @@ function buildConifer(rnd, si, lod, opt = {}) {
 
       const nCards = lod === 0
         ? Math.round(8 + 7 * Math.min(1, BL / 2.2))
-        : Math.round(3.6 + 2.9 * Math.min(1, BL / 2.2));
-      sprigs(at, wid, 0.12, 1.0, nCards, { sprig: S.sprig, size: 1.0, shade: false });
-      // a shaded card tucked underneath, so the crown has an inside
-      if (lod === 0 && !dead) {
+        : Math.round(5.4 + 4.6 * Math.min(1, BL / 2.2));
+      // LOD1 pays for its missing sub-branches with bigger cards: area per
+      // triangle is what closes a crown at 34-150 m, and a 1.32x card is a
+      // 1.74x area for the same four vertices.
+      const cardK = lod === 0 ? 1.0 : 1.34;
+      sprigs(at, wid, 0.12, 1.0, nCards, { sprig: S.sprig, size: cardK, shade: false });
+      // A shaded card tucked under the limb, so the crown has an inside. It is
+      // kept at LOD1 (one instead of two): dropping it there was tried and
+      // measured — the trunk came back through the middle of the crown in the
+      // hero framing, because this card is what fills the shadowed gap between
+      // the top of one whorl's droop and the bottom of the next.
+      if (!dead) {
         sprigs((s) => R2.copy(at(s)).setY(R2.y - wid(s) * 0.50), wid, 0.28, 0.88,
-          2, { sprig: S.sprig, size: 0.9, shade: true, snowK: 0.05 });
+          lod === 0 ? 2 : 1, { sprig: S.sprig, size: 0.9 * cardK, shade: true, snowK: 0.05 });
       }
 
       // ---- sub-branches ----------------------------------------------------
-      const nSub = lod === 0 ? S.sub : 0;
+      // LOD1 keeps ONE fork per limb. Without it a whorl is a row of separate
+      // sprays with sky between them rather than a plate, which is most of what
+      // made the 34-150 m band read as debris on a stick.
+      const nSub = lod === 0 ? S.sub : Math.min(1, S.sub);
       for (let sbi = 0; sbi < nSub; sbi++) {
         const ss = 0.30 + 0.42 * (sbi / Math.max(1, nSub)) + rnd() * 0.16;
         if (ss > 0.92) continue;
@@ -2215,8 +2282,9 @@ function buildConifer(rnd, si, lod, opt = {}) {
           .setY(base.y + SBL * (sRise * s - sDroop * s * s + tipUp * 1.4 * s * s * s * s));
         const sWid = (s) => SBL * S.frondW * 1.15 *
           (0.30 + 0.74 * Math.pow(Math.sin(Math.PI * (0.13 + 0.87 * s)), 0.75));
-        sprigs(sAt, sWid, 0.05, 1.0, Math.round(4 + 3 * Math.min(1, SBL / 1.4)),
-          { sprig: S.sprig, size: 0.9, shade: false });
+        sprigs(sAt, sWid, 0.05, 1.0,
+          Math.round((lod === 0 ? 4 : 3) + 3 * Math.min(1, SBL / 1.4)),
+          { sprig: S.sprig, size: 0.9 * cardK, shade: false });
       }
 
       // ---- snow load along the crest ---------------------------------------
@@ -2333,14 +2401,15 @@ function buildConifer(rnd, si, lod, opt = {}) {
     const top = trunkAt(1).clone();
     const hTip = Math.max(0.35, H * 0.055);
     const rTip = Math.max(0.06, S.spread * H * 0.11);
-    const nL = lod === 0 ? 5 : 3;
+    const nL = lod === 0 ? 5 : 4;
     for (let k = 0; k < nL; k++) {
       const th = (k / nL) * Math.PI * 2 + rnd();
       const dx = Math.cos(th), dz = Math.sin(th);
       const at = (s) => P.set(top.x + dx * rTip * 2.0 * s, top.y - hTip * 0.5 + hTip * 1.5 * s,
         top.z + dz * rTip * 2.0 * s);
       const wid = () => rTip * 1.5;
-      sprigs(at, wid, 0.1, 0.95, lod === 0 ? 3 : 2, { sprig: S.sprig, size: 0.9, snowK: 1.5 });
+      sprigs(at, wid, 0.1, 0.95, 3,
+        { sprig: S.sprig, size: lod === 0 ? 0.9 : 1.2, snowK: 1.5 });
     }
     // Cap on the leader.
     //
@@ -3706,7 +3775,10 @@ export function createScatter(scene, terrain) {
     else if (r < 0.20 + 0.25 * (1 - high)) si = 2;
     else if (r < 0.55) si = 1;
     else si = 0;
-    if (si !== 4 && rn() < 0.05 + 0.05 * high) si = 5;      // snags
+    // Snags: rare, and rarer still below the treeline. At 5-10% of every stand
+    // there were several in every framing, and a population that large stops
+    // reading as "the odd dead tree" and starts reading as a rendering fault.
+    if (si !== 4 && rn() < 0.018 + 0.022 * high) si = 5;    // snags
     else if (rn() < 0.24 + 0.14 * high) si = 3;             // saplings
     const g = BY_SPECIES[si];
     return g[(rn() * g.length) | 0];
