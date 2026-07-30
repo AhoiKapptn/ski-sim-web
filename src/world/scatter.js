@@ -2819,6 +2819,14 @@ class Pool {
     this.rand = rand;
     const mesh = new THREE.InstancedMesh(g, mat, cap);
     mesh.count = 0;
+    // An empty pool is not free. three has no early-out for count === 0: it
+    // still binds the program, uploads the per-object uniforms and issues a
+    // zero-instance draw, once for the main pass and once for EACH of the two
+    // shadow cascades. There are ~70 pools here (17 species/variant pairs at
+    // two geometry LODs alone) and in any one framing 15-20 of them are empty —
+    // no LOD0 conifer within 34 m, no logs, no krummholz below the treeline —
+    // so that is ~50 no-op draw submissions per frame. Gate it on the count.
+    mesh.visible = false;
     mesh.frustumCulled = false;
     mesh.castShadow = !!opts.castShadow;
     mesh.receiveShadow = opts.receiveShadow !== false;
@@ -2842,6 +2850,7 @@ class Pool {
     const h = { p: this, s };
     this.handles[s] = h;
     this.mesh.count = s + 1;
+    this.mesh.visible = true;
     this.dirty = true;
     return h;
   }
@@ -2859,6 +2868,7 @@ class Pool {
       this.handles[s].s = s;
     }
     this.mesh.count = last;
+    this.mesh.visible = last > 0;
     this.dirty = true;
   }
 
@@ -4793,6 +4803,7 @@ export function createScatter(scene, terrain) {
       used++;
     }
     chairPool.mesh.count = used;
+    chairPool.mesh.visible = used > 0;
     chairPool.mesh.instanceMatrix.needsUpdate = true;
   }
 

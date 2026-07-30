@@ -974,7 +974,7 @@ float snSpecTint = 1.0;
   // on its own and is the reason the rest of this section can afford to exist.
   float pisteAmt = smoothstep( 0.52, 0.16, steep ) * ( 1.0 - snRockMask )
                  * snFade( 1900.0, 1200.0, snViewDist );
-  float trackA = 0.0, corduA = 0.0, corduT = 0.0;
+  float trackA = 0.0, corduA = 0.0, corduT = 0.0, corduG = 0.0;
   if ( pisteAmt > 2e-3 ) {
   const vec2 eA = vec2(  0.242, -0.970 ), eB = vec2( -0.276, -0.961 );
   const vec2 xA = vec2(  0.970,  0.242 ), xB = vec2(  0.961, -0.276 );
@@ -1023,68 +1023,148 @@ float snSpecTint = 1.0;
 
   // --- grooming corduroy ------------------------------------------------------
   // The tiller on the back of a piste basher leaves a comb of parallel ridges
-  // roughly 7 cm apart running with the machine's line of travel, in passes about
-  // 4.4 m wide. Side by side with any photograph of a groomed piste it is the
-  // single most identifying mark on the surface, and the frame had none of it.
+  // running with the machine's line of travel, in passes about 4 m wide. Side by
+  // side with any photograph of a groomed piste it is the single most identifying
+  // mark on the surface. The previous version of this block had it, and had it
+  // wrong: across the whole mid field the piste read as a regular cross-hatched
+  // lattice rather than fine parallel ridging.
+  //
+  // There was never a second crossing frequency in the code — the comb has always
+  // been one cosine along one fixed axis. The plaid was *aliasing*. Three separate
+  // mistakes stacked:
+  //
+  //  1. The pitch was 7.2 cm and the band gate let it run down to 3.6 px per
+  //     period. A comb is not a noise band: all of its energy sits at exactly one
+  //     frequency, so at 3.6 px/period it beats against the pixel grid and the
+  //     beat fringes run at a completely different angle to the ridges. That
+  //     cross-running fringe *is* the herringbone.
+  //  2. smoothstep( 0.10, 0.72, cc ) squares the cosine up into very nearly a
+  //     square wave. That is right in the near field, but it puts real energy at
+  //     3x and 5x the comb frequency, so even where the fundamental was resolved
+  //     the harmonics were not, and they folded.
+  //  3. The occlusion weight was 0.62 / 0.40 — near full-scale modulation of
+  //     snMicroAO — so every bit of that folded energy arrived at full contrast.
+  //
+  // So: pitch out to 12.5 cm (a real tiller comb is 10-15 cm, and it buys 1.7x
+  // the pixels per period for free), amplitude gated at 5.5-12 px/period, and —
+  // the parts that actually matter — the trough *sharpening* and both nonlinear
+  // channels gated separately and later, at 9-19 px/period, so the profile has
+  // degenerated to a pure sinusoid long before the fundamental itself is in any
+  // danger. Contrast is then spent where it survives the tone curve, but at a
+  // third of the old weight.
+  //
+  // The gate numbers are measured, not guessed. ppp was rendered to screen as a
+  // false-colour map and each candidate was checked at 4x magnification in the
+  // exact screen band where the comb fades: at 3.6 px/period the plaid is plainly
+  // still there, at 4.7 it is faint but legible, at 5.5 it is gone. That is much
+  // more headroom over Nyquist than a noise band needs, and it is the price of
+  // the energy being concentrated at a single frequency.
   //
   // It runs along the *same fixed corridor axis* as the primary traffic set and
   // is bent by the same shear, so like the tracks it arcs but can never close
-  // into a whorl. It is gated on the footprint measured across the ridges: a 7 cm
-  // groove pointed away from the camera is perfectly resolved on the screen axis
-  // that matters, and gating it on snPx would retire it three metres in front of
-  // the skier.
+  // into a whorl. It is gated on the footprint measured across the ridges: a
+  // groove pointed away from the camera is well resolved on the screen axis that
+  // matters, and gating it on snPx would retire it three metres in front of the
+  // skier.
   {
-    // Machines groom the piste, not the mountain: shallow enough to drive, snow
-    // rather than rock, and not out in the untracked bowls.
-    float gm = smoothstep( 0.46, 0.16, steep ) * ( 1.0 - snRockMask )
-             * clamp( 1.35 - tp * 0.7, 0.0, 1.0 );
-    float cw = SN_BAND_DIR( 0.072, cA, 3.6, 7.5 ) * snFade( 340.0, 40.0, snViewDist );
+    // Machines groom the *piste*, not the mountain. The old mask was only
+    // "shallow enough to drive", which is true of every bowl, bench and shoulder
+    // in the map, so corduroy was being laid on ground no basher has ever seen.
+    // This is the corridor centreline from terrain.js — two sines, duplicated
+    // rather than plumbed through because it is cheaper than a varying and the
+    // constants are part of the map, not of the terrain module's interface.
+    // Full grooming within ~150 m of the fall line, gone by 330 m; off-piste snow
+    // gets none of this at all.
+    float ccx  = 78.0 * sin( P.z * 0.00092 ) + 34.0 * sin( P.z * 0.00231 + 1.3 );
+    float corr = smoothstep( 330.0, 150.0, abs( P.x - ccx ) );
+    // Coverage: grooming is laid in a session and is scuffed off unevenly. The
+    // low-frequency term is which parts of the corridor got a pass at all, the
+    // ~14 m term is where the day's traffic has scrubbed it out. Without a
+    // coverage field this reads as a printed texture however good the profile is.
+    float gm = smoothstep( 0.42, 0.14, steep ) * ( 1.0 - snRockMask ) * corr
+             * clamp( 1.30 - tp * 0.75, 0.0, 1.0 );
+    // Metres per pixel measured across the ridges, and from it the one number
+    // this whole block is governed by.
+    float pxC = SN_PX_DIR( cA );
+    float LAM = 0.125;                       // ridge pitch, 12.5 cm
+    float ppp = LAM / pxC;                   // pixels per ridge period
+    // Amplitude gate: nothing at all below 5.5 px per ridge, full weight from 12.
+    // By then the profile is guaranteed to be a plain sinusoid (see shrp below),
+    // so what is being retired is a single clean frequency and it fades out
+    // smoothly over a wide screen band rather than ending at a line. snFade is
+    // only a backstop for grazing views where the footprint stays small much
+    // further out than it has any business doing.
+    float cw = smoothstep( 5.5, 12.0, ppp ) * snFade( 260.0, 60.0, snViewDist );
     float g  = gm * cw * sw.y;
     if ( g > 2e-3 ) {
-      // Pass lanes, 4.4 m wide, each laid on a slightly different night with its
-      // own phase. The step in phase at a lane edge is the overlap seam a groomer
-      // leaves, and it is one of the things that stops corduroy reading as a
-      // printed texture.
-      float lane = floor( vA * ( 1.0 / 4.4 ) );
-      vec3  lh   = hash33( vec3( lane, 71.0, 13.0 ) );
-      float ph   = ( vA * ( 1.0 / 0.072 ) + lh.x ) * 6.2831;
-      float c    = cos( ph ), s = sin( ph );
-      // Ridge height, ~4 mm. Its world gradient is exact: d(ph)/dP is
-      // 2pi/0.072 * ( xA + dA * eA ).
-      float amp  = 0.0042 * g * ( 0.75 + 0.5 * lh.y );
-      vec2  gph  = ( xA + dA * eA ) * ( 6.2831 / 0.072 );
-      vec2  gw   = -amp * s * gph;
+      // The machine's line wanders. Offsetting the *cross* coordinate by a smooth
+      // function of the along coordinate is a pure shear — invertible and
+      // orientation-preserving — so the ridges bend with the operator's line but
+      // can never close into a whorl or pinch the pitch to zero. One octave; this
+      // only has to break the ruler-straightness.
+      float wob = snFbm( vec2( uA * 0.019, 4.7 ), 2, 0.5 ).x * 1.15;
+      float vG  = vA + wob;
+      // Pass lanes, ~4.1 m wide, each laid on a different line with its own
+      // phase. The step in phase at a lane edge is the overlap seam a groomer
+      // leaves, and it is one of the things that stops corduroy reading as tiled.
+      vec3  lh  = hash33( vec3( floor( vG * ( 1.0 / 4.1 ) ), 71.0, 13.0 ) );
+      float ph  = ( vG * ( 1.0 / LAM ) + lh.x ) * 6.2831;
+      float c   = cos( ph ), s = sin( ph );
+      // Skied-out corduroy is gone corduroy; and a couple of tenths of the
+      // corridor is scuffed to nothing on any afternoon.
+      float scuff = clamp( snFbm( P.xz * 0.072 + vec2( 5.5, -2.2 ), 2, 0.55 ).x * 2.6 + 1.00, 0.0, 1.0 );
+      float wear  = scuff * ( 1.0 - clamp( trackA * 0.9, 0.0, 0.55 ) ) * ( 0.78 + 0.34 * lh.z );
+      float gA    = g * wear;
+      // shrp is the harmonic budget, and it has to be computed before anything
+      // *nonlinear* uses the comb. Occlusion is a linear read of the profile, so
+      // it is safe anywhere the fundamental is resolved. Specular is not: a
+      // GGX lobe is an exponential in the normal, so a 13 degree sinusoidal
+      // tilt comes back with strong energy at 2x, 3x and 4x the comb frequency
+      // however clean the tilt itself was. That was the entire residual plaid
+      // after the profile was band-limited — a *specular* moire, not an albedo
+      // one, and it lived exactly in the band where the comb was fading out.
+      // Both of the nonlinear channels (the geometric normal, and the tiller
+      // polish that goes through snIce into roughness and sparkle) are therefore
+      // retired first, well above the fundamental's own limit; the occlusion
+      // carries the last stretch on its own.
+      float shrp = smoothstep( 9.0, 19.0, ppp );
+      // Ridge height ~4.6 mm on a 12.5 cm pitch. Its world gradient is exact to
+      // within the shear derivative of wob, which is 2% of the cross-ridge term
+      // and is dropped: d(ph)/dP is 2pi/LAM * ( xA + dA * eA ).
+      float amp = 0.0046 * gA * shrp * ( 0.75 + 0.5 * lh.y );
+      vec2  gw  = ( -amp * s ) * ( ( xA + dA * eA ) * ( 6.2831 / LAM ) );
       grad += vec3( gw.x, 0.0, gw.y ) * sw.y;
-      // The lever that actually moves pixels. Sunlit snow sits on the shoulder of
-      // the tone curve, where a few degrees of normal tilt is worth well under
-      // one code value; the groove floors have to arrive as occlusion, which is
-      // multiplicative and survives the shoulder. Crests get the reciprocal — the
-      // tiller polishes them, so they are both brighter and glossier.
-      // Shaped, not a raw cosine: a tiller leaves a broad rounded crest and a
-      // narrow shaded trough, and the contrast between them in a photograph is
-      // several stops, not the couple of code values a sinusoid buys once it has
-      // gone through the shoulder of the tone curve.
-      float cc = 0.5 - 0.5 * c;
-      corduA = smoothstep( 0.10, 0.72, cc ) * g;      // 1 in the trough
-      corduT = smoothstep( 0.10, 0.62, 1.0 - cc ) * g; // 1 on the crest
-      // Skied-out corduroy is gone corduroy.
-      float wear = 1.0 - clamp( trackA * 1.5, 0.0, 0.85 );
-      corduA *= wear; corduT *= wear;
+      // Sunlit snow sits on the shoulder of the tone curve, where a few degrees
+      // of normal tilt is worth well under one code value, so the groove floors
+      // also have to arrive as occlusion, which is multiplicative and survives
+      // the shoulder. Crests get the reciprocal: the tiller polishes them.
+      //
+      // A tiller leaves a broad rounded crest and a narrow shaded trough — a
+      // near-square wave — and that is what you see from two metres away. From
+      // twenty it has to be a plain cosine, because the odd harmonics of a square
+      // wave sit at 3x and 5x the comb frequency and there is nowhere near the
+      // resolution for them, so shrp buys the shaping back only where it is paid
+      // for. Below it the profile is a single sinusoid, which cannot fold.
+      float cc   = 0.5 - 0.5 * c;                                  // 0 crest .. 1 trough
+      corduA = mix( cc,       smoothstep( 0.14, 0.76, cc ),       shrp ) * gA;
+      corduT = mix( 1.0 - cc, smoothstep( 0.16, 0.68, 1.0 - cc ), shrp ) * gA;
+      corduG = corduT * shrp;                       // gloss: nonlinear, near field only
     }
-    // The 4.4 m *pass* is sixty times coarser than the comb inside it and stays
-    // resolvable to a few hundred metres, where the comb has long since had to be
-    // gated away. On a real piste that is what you actually read from any
-    // distance: not the individual ridges but the alternating bands where one
-    // pass of the machine met the next, and the seam between them.
-    float lw = SN_BAND_DIR( 4.4, cA, 3.0, 7.0 ) * snFade( 900.0, 120.0, snViewDist );
+    // The 4.1 m *pass* is thirty times coarser than the comb inside it and stays
+    // resolvable well past the range where the comb has had to be gated away. On
+    // a real piste that is what you actually read at distance: not the individual
+    // ridges but the alternating bands where one pass of the machine met the
+    // next, and the seam between them. It is what carries the mid field now that
+    // the comb correctly stops there.
+    float lw = SN_BAND_DIR( 4.1, cA, 3.0, 7.0 ) * snFade( 700.0, 100.0, snViewDist );
     float lg = gm * lw * sw.y;
     if ( lg > 2e-3 ) {
-      float lu = vA * ( 1.0 / 4.4 );
+      float lu = vA * ( 1.0 / 4.1 );
       float li = floor( lu ), lf = lu - li;
-      float seam = 1.0 - smoothstep( 0.0, 0.14, min( lf, 1.0 - lf ) * 2.0 );
+      float seam = 1.0 - smoothstep( 0.0, 0.16, min( lf, 1.0 - lf ) * 2.0 );
       float wear = 1.0 - clamp( trackA * 1.2, 0.0, 0.8 );
-      corduA += seam * 0.55 * lg * wear;
-      corduT += ( hash33( vec3( li, 5.0, 29.0 ) ).x - 0.5 ) * 0.8 * lg * wear * ( 1.0 - seam );
+      corduA += seam * 0.46 * lg * wear;
+      corduT += ( hash33( vec3( li, 5.0, 29.0 ) ).x - 0.5 ) * 0.42 * lg * wear * ( 1.0 - seam );
     }
   }
   }
@@ -1109,9 +1189,15 @@ float snSpecTint = 1.0;
                + 0.16 * clamp( -relief * 1.6, 0.0, 1.0 )
                + 0.52 * clamp( -gGrain * 1.30, 0.0, 1.0 )
                + 0.26 * trackA
-               + 0.62 * corduA;
+               + 0.42 * corduA;
+  // Was 0.62 / 0.40, which is very nearly full-scale modulation of snMicroAO
+  // from a single periodic term, and is why the corduroy drew the eye across the
+  // whole frame instead of sitting under everything else on the surface. A real
+  // corduroy trough in a photograph is a couple of stops on a surface that is
+  // already sitting on the shoulder of the curve, and the near field still gets
+  // that because the profile is sharpest exactly there.
   float aoLift = 0.40 * clamp( gGrain * 1.30, 0.0, 1.0 )
-               + 0.40 * corduT;
+               + 0.26 * corduT;
   snMicroAO = clamp( 1.0 + aoLift - aoDark, 0.26, 1.32 );
   relief += fine;
 
@@ -1127,7 +1213,12 @@ float snSpecTint = 1.0;
   // it is why fresh corduroy flashes at you as you traverse it — and running it
   // through snIce gets the roughness, the sparkle boost and the faintly bluer
   // albedo all at once.
-  snIce = clamp( snIce + corduT * 0.30 - corduA * 0.10, 0.0, 1.0 );
+  // snIce drives roughness, the sparkle boost and a faintly bluer albedo all at
+  // once, and the sparkle is a stochastic per-pixel glint. Modulating a
+  // stochastic term with a near-Nyquist comb is how you manufacture shimmer, so
+  // this contribution is a third of what it was; the gloss flash is still there
+  // in the near field, where the comb is resolved several times over.
+  snIce = clamp( snIce + corduG * 0.20 - corduA * 0.07, 0.0, 1.0 );
   snPowder = clamp( -curv * 1.9 + lee * 0.5 + flow * 0.45, 0.0, 1.0 );
 
   // Surface-gradient normal perturbation (correct on steeps, no UV stretch).

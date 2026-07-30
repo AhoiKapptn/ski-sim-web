@@ -83,3 +83,32 @@ node tools/shoot.mjs --out shots/mine --perf     # fps
 Exit code 0 means it actually rendered (no console errors, no blank frames).
 Then **look at the PNGs with the Read tool** — never claim a visual result you
 have not looked at.
+
+## Measuring frame rate: only interleaved A/B is trustworthy
+
+`--perf` reports the free-running rAF rate, and headless Chrome mode-locks to
+whole divisions of the refresh rate depending on machine load at launch. The
+*same unmodified build* has measured 60, 54 and exactly 30.0 fps within an hour.
+Absolute readings therefore prove nothing, and four consecutive matching numbers
+prove nothing either — that is the compositor holding one mode, not evidence of
+frame cost. A reading of exactly 30.0 is a vsync half-rate lock, never a
+regression.
+
+To compare two versions, **alternate them within one session** and compare pairs:
+run A, B, A, B… and look at the per-pair difference, or switch the two variants
+inside a single page every second or so. Take min-of-N, not mean.
+
+Two ablation traps that have produced confident wrong answers here:
+
+- `harness.step()` in a loop does not measure the real frame. It once reported
+  8.4 ms/frame (≈119 fps) for a build measuring 54 fps, and claimed disabling
+  post-processing made the frame *slower*.
+- `visible = false` ablations lie whenever hiding an object exposes what is
+  behind it. Hiding the near trees made a frame **22 ms slower**, because sky and
+  distant terrain then had to be shaded.
+
+## Never use `git stash` in an agent worktree
+
+`git stash` is a single ref shared by every worktree of the repo. Two agents
+stashing concurrently cross the LIFO stack and each pops the other's work. This
+has already nearly destroyed a module. Commit on the worktree branch instead.

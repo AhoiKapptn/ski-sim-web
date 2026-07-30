@@ -556,6 +556,40 @@ float fbm5( vec2 p ) {
   return s * 1.0322;
 }
 
+// ---- screen-space octave LOD ----------------------------------------------
+// fbm5 with its two finest octaves faded out by weight, RENORMALISED so the
+// mean stays at 0.5 whatever the weights are. That renormalisation is the whole
+// trick: cloudShape thresholds this against a coverage, so an fbm that simply
+// dropped octaves would come back with a mean of 0.4375 instead of 0.5 and the
+// deck's coverage would visibly jump wherever the LOD changed. w4 = w5 = 1
+// reproduces fbm5 exactly (1/0.96875 = 1.0323) and w4 = 0 reproduces fbm3
+// exactly (1/0.875 = 1.1429), so the two ends of the range are the functions
+// this replaced, bit for bit.
+float fbm5w( vec2 p, float w4, float w5 ) {
+  float s = 0.0, a = 0.5, asum = 0.0;
+  for ( int i = 0; i < 3; i ++ ) { s += a * vnoise( p ); asum += a; p = M2 * p * 2.07; a *= 0.5; }
+  if ( w4 > 0.002 ) {
+    s += a * w4 * vnoise( p ); asum += a * w4; p = M2 * p * 2.07; a *= 0.5;
+    if ( w5 > 0.002 ) { s += a * w5 * vnoise( p ); asum += a * w5; }
+  }
+  return s / asum;
+}
+
+// Weight for a feature of wavelength 1/freq, in the same units as fp — the
+// footprint one screen pixel covers in that field's domain. 1 while the
+// feature is several pixels across, 0 once it is sub-pixel. Faded rather than
+// switched, because a hard cut draws a visible arc across the deck where the
+// LOD changes.
+//
+// The cutoff is deliberately at ~1 pixel and not at the Nyquist 2 px. Below one
+// pixel per feature the octave is not detail, it is noise: it cannot be
+// resolved, it aliases, and — the point here — near the horizon a plane-based
+// deck's domain runs at tens of units per pixel, so these are exactly the
+// octaves that cost the most and show the least.
+float oct( float fp, float freq ) {
+  return 1.0 - smoothstep( 0.42, 0.95, fp * freq );
+}
+
 // ---- Preetham in-scattering ------------------------------------------------
 vec3 atmosphere( vec3 dir ) {
   float zenithAngle = acos( max( 0.0, dot( UP, dir ) ) );
@@ -642,6 +676,25 @@ vec3 gradeSky( vec3 col, vec3 dir ) {
 // Coverage-thresholded, domain-warped fbm on a plane at cloud altitude, eroded
 // by a higher octave so silhouettes read cauliflower rather than as blobs.
 //
+// WHAT THE THREE DECKS COST, so the next person does not have to re-derive it.
+// Measured with tools/perf-ab.mjs, which swaps two compiled versions of THIS
+// shader inside one page every 1.5 s and reports the paired median — the only
+// method that survives this machine, where the same unmodified build measures
+// 16.6, 22.6 and 45.4 ms per frame depending on nothing but load and how long
+// the GPU has been busy. Hero framing, 3200x1800 (5.76 MP), 6 cycles each:
+//
+//     all three decks off   -2.30 ms      cumulus off   -1.20 ms
+//     altocumulus off       -0.30 ms      cirrus off    -0.10 ms
+//     cumulus parallax slab -0.30 ms      both sun taps -0.10 ms
+//
+// Two things follow. The clouds are 2.3 ms of 22.6 at 5.76 MP, i.e. ~0.58 ms at
+// 1600x900 — real, but a fifth of what a 60 -> 54 fps drop would need. And the
+// cost is NOT in the octave count: deleting both self-shadow taps, 28 of the
+// deck's 63 noise lookups, saves 0.10 ms, because the coverage threshold has
+// already discarded most pixels before the march. The only lever with any
+// leverage left is not evaluating a deck at all on a given pixel, which is what
+// the yFade cutoff below does.
+//
 // The warp q is passed in rather than recomputed inside cloudShape, so the
 // silhouette and every shadow tap go through one code path and it is impossible
 // for them to drift apart again. The shadow march re-derives q at each tap: the
@@ -667,8 +720,14 @@ vec2 megaWarp( vec2 p, float amp ) {
                  vnoise( p * 0.052 + vec2( 13.1, 44.9 ) ) ) - 0.5 ) * amp;
 }
 
-float cloudShape( vec2 p, vec2 q, float cov, float soft, int quality ) {
-  float n = ( quality > 0 ) ? fbm5( p + 0.9 * q ) : fbm3( p + 0.9 * q );
+// fp is the footprint one screen pixel covers in p's own units. Every octave
+// below is gated on it, so a tap only pays for the detail the frame can
+// actually resolve. Near the zenith nothing is gated and this is the shader
+// that shipped; a degree above the horizon the domain runs tens of units per
+// pixel and all four fine octaves switch off.
+float cloudShape( vec2 p, vec2 q, float cov, float soft, int quality, float fp ) {
+  float n = ( quality > 0 ) ? fbm5w( p + 0.9 * q, oct( fp, 4.3 ), oct( fp, 8.9 ) )
+                            : fbm3( p + 0.9 * q );
   float d = clamp( ( n - cov ) / max( 1.0 - cov, 0.05 ), 0.0, 1.0 );
   if ( quality > 0 ) {
     // Erode the edges, not the body: (1-d) weights the outside of the cloud, so
@@ -688,10 +747,17 @@ float cloudShape( vec2 p, vec2 q, float cov, float soft, int quality ) {
     // 4 km, i.e. a scale the frame can actually resolve — and putting it in was
     // what finally stopped our silhouette reading smoother than a photographed
     // one in the blind pair.
-    float er2 = vnoise( p * 8.3 + 47.0 );
-    float er3 = vnoise( p * 22.0 + 91.0 );
-    d = clamp( d - ( 1.0 - d ) * ( er2 * er2 * 0.62 + er3 * er3 * 0.30 ) * soft,
-               0.0, 1.0 );
+    float w2 = oct( fp, 8.3 ), w3 = oct( fp, 22.0 );
+    if ( w2 > 0.002 ) {
+      float sub = 0.0;
+      float er2 = vnoise( p * 8.3 + 47.0 );
+      sub += er2 * er2 * 0.62 * w2;
+      if ( w3 > 0.002 ) {
+        float er3 = vnoise( p * 22.0 + 91.0 );
+        sub += er3 * er3 * 0.30 * w3;
+      }
+      d = clamp( d - ( 1.0 - d ) * sub * soft, 0.0, 1.0 );
+    }
   } else {
     d = clamp( d * 1.35, 0.0, 1.0 );
   }
@@ -702,12 +768,20 @@ float cloudShape( vec2 p, vec2 q, float cov, float soft, int quality ) {
 // sizeAmp    amplitude of the divergent warp = how wide the cell-size range is
 // covSpread  how hard the deck clumps: 0 tiles evenly, 1 opens real holes
 // aniso      how much the per-region elongation varies
-vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale,
+vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float dpx, float altitude, float scale,
                  vec2 drift, float cov, float thickness, float ambBoost,
                  float apRate, int quality, float odSelf, float lit,
                  float relief, float sizeAmp, float covSpread, float aniso,
                  float yFade ) {
-  if ( dir.y < 0.010 ) return vec4( 0.0 );
+  // The alpha this function returns is multiplied by smoothstep( yFade*0.16,
+  // yFade, dir.y ), so every pixel below yFade*0.16 was already contributing
+  // exactly nothing — and was paying for four full cloudShape evaluations to
+  // find that out. Hoisting the same cutoff to the top is bit-for-bit identical
+  // output. It is not a small band either: the altocumulus deck fades in at 0.44
+  // (i.e. below dir.y = 0.070), and those are the pixels just above the horizon
+  // where the deck's screen-space frequency is highest and the cost per pixel is
+  // therefore worst.
+  if ( dir.y < max( 0.010, yFade * 0.16 ) ) return vec4( 0.0 );
   float t = ( altitude - camPos.y ) / dir.y;
   if ( t <= 0.0 ) return vec4( 0.0 );
 
@@ -728,6 +802,14 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   // what a cloud deck is supposed to do anyway.
   float defor = clamp( pow( 0.42 / max( dir.y, 0.05 ), 0.62 ), 1.0, 3.4 );
   vec2 p0 = camPos.xz * scale + dir.xz * ( t * scale / defor ) + drift * uTime;
+
+  // ---- screen-space footprint ----------------------------------------------
+  // How far p moves for one pixel of screen. Two terms, and the second is the
+  // one that matters: p depends on dir directly (rate t*scale/defor) AND
+  // through t = (alt - y)/dir.y, whose derivative is -t/dir.y. Near the horizon
+  // the second term is 100x the first, which is exactly why a plane deck's fine
+  // octaves are worthless down there — one pixel spans several whole cells.
+  float fp = dpx * t * scale * ( 1.0 / defor + 1.0 / max( dir.y, 0.05 ) );
 
   // ---- weather field -------------------------------------------------------
   // One slowly varying sample with four consequences, so a region of sky has a
@@ -765,7 +847,7 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   float soft = 0.55 + 1.15 * wSoft;
 
   vec2 q = cloudWarp( ps );
-  float dBase = cloudShape( ps, q, covL, soft, quality );
+  float dBase = cloudShape( ps, q, covL, soft, quality, fp );
 
   // ---- vertical development ------------------------------------------------
   // A flat plane is exactly why every cloud in this sky was a lozenge: at
@@ -796,7 +878,7 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
     // The top of a cumulus is narrower than its base — raise the threshold — and
     // it is bitten harder, which is the cauliflower.
     dTop = cloudShape( pt, cloudWarp( pt ), min( covL + 0.14, 0.95 ),
-                       soft * 1.30, quality );
+                       soft * 1.30, quality, fp );
     topness = dTop / max( dTop + dBase, 1e-4 );
   }
   float d = max( dBase, dTop );
@@ -817,8 +899,8 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   // covL / soft / A are reused rather than re-derived: their octaves have
   // wavelengths of 11-23 units and the longest step is ~4, so they barely
   // move — unlike the warp, which does, and which is therefore re-derived.
-  float s1 = cloudShape( p1, cloudWarp( p1 ), covL, soft, quality );
-  float s3 = cloudShape( p3, cloudWarp( p3 ), covL, soft, quality );
+  float s1 = cloudShape( p1, cloudWarp( p1 ), covL, soft, quality, fp );
+  float s3 = cloudShape( p3, cloudWarp( p3 ), covL, soft, quality, fp );
   // THE MARCH IS TWO TAPS, NOT THREE, and the third one did not go missing —
   // it was replaced by a better one. dTop is the density of the slab *directly
   // above this pixel*, already paid for by the silhouette, and mass overhead is
@@ -891,8 +973,11 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   return vec4( col, clamp( a, 0.0, 1.0 ) );
 }
 
-vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol ) {
-  if ( dir.y < 0.02 || uCirrus <= 0.001 ) return vec4( 0.0 );
+vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol, float dpx ) {
+  // 0.05 rather than 0.02, for the same reason as the decks below: the returned
+  // alpha carries smoothstep( 0.05, 0.34, dir.y ), so the 0.02-0.05 band was
+  // paying for the fibre field and throwing the result away.
+  if ( dir.y < 0.05 || uCirrus <= 0.001 ) return vec4( 0.0 );
   float t = ( 9200.0 - camPos.y ) / dir.y;
   if ( t <= 0.0 ) return vec4( 0.0 );
   // Same radial de-foreshortening as the decks below (see cloudLayer), and it
@@ -901,6 +986,9 @@ vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol ) {
   float defor = clamp( pow( 0.42 / max( dir.y, 0.05 ), 0.62 ), 1.0, 3.4 );
   vec2 p = camPos.xz * 0.00020 + dir.xz * ( t * 0.00020 / defor )
          + vec2( 0.0075, 0.0026 ) * uTime;
+  // Same footprint estimate as cloudLayer. At 9.2 km this is the most
+  // compressed plane in the frame, so the fibre octaves go sub-pixel earliest.
+  float fp = dpx * t * 0.00020 * ( 1.0 / defor + 1.0 / max( dir.y, 0.05 ) );
 
   // Cirrus is not a uniform veil either. It arrives in a few broad bands with
   // clear sky between them, and inside a band it is fibrous — hooked filaments
@@ -921,10 +1009,14 @@ vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol ) {
   vec2 pf = mat2( cs, -sn, sn, cs ) * p;
 
   vec2 w = vec2( fbm2( pf * 0.9 ), fbm2( pf * 0.9 + 9.1 ) );
-  float n = fbm5( vec2( pf.x * 0.52, pf.y * 2.6 ) + 1.20 * w );
+  // The fibre domain is anisotropic (0.52 along the filament, 2.6 across), so
+  // the across-fibre axis is what sets the resolvable octave: gate on 2.6 * fp.
+  float n = fbm5w( vec2( pf.x * 0.52, pf.y * 2.6 ) + 1.20 * w,
+                   oct( fp, 11.2 ), oct( fp, 23.2 ) );
   // Fray the filament ends. Cirrus dissolves across the fibre, never along it,
   // so the subtractive term is stretched hard the other way.
-  n -= 0.20 * vnoise( vec2( pf.x * 2.4, pf.y * 12.0 ) + 3.0 );
+  float wFray = oct( fp, 6.0 );
+  if ( wFray > 0.002 ) n -= 0.20 * wFray * vnoise( vec2( pf.x * 2.4, pf.y * 12.0 ) + 3.0 );
   float d = smoothstep( 0.52, 0.93, n ) * band;
   if ( d <= 0.003 ) return vec4( 0.0 );
 
@@ -943,6 +1035,14 @@ vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol ) {
 
 void main() {
   vec3 dir = normalize( vWorldPosition - cameraPosition );
+
+  // Angular size of one pixel, taken from the dome's own interpolated direction
+  // so it is exact for whatever resolution and FOV the frame is rendered at
+  // (including the small PMREM faces used for the env capture, where it
+  // correctly asks for a very coarse cloud field). Computed here, at the top of
+  // main(), because derivatives are only well defined in uniform control flow
+  // and every cloud call below sits behind an early-out.
+  float dpx = length( fwidth( dir ) );
 
   vec3 col = gradeSky( atmosphere( dir ), dir );
   vec3 skyCol = col;
@@ -963,7 +1063,7 @@ void main() {
   // horizon, which is the size *range* a real deck has.
 
   // 3. Cirrus veil, ~9 km. Thin, fibrous, banded, mostly absent.
-  vec4 ci = cirrusLayer( dir, cameraPosition, skyCol );
+  vec4 ci = cirrusLayer( dir, cameraPosition, skyCol, dpx );
 
   // 2. Altocumulus, 5.2 km: cells ~900 m, a THIRD the angular size of the
   //    cumulus below it and nearly three times as high, so the eye reads two
@@ -972,14 +1072,14 @@ void main() {
   //    fine deck at 5 km hatches the low sky into parallel ribbons — measured
   //    with uDeckMask, that hatching was the whole of the remaining "combed"
   //    read after the cumulus deck was fixed.
-  vec4 ac = cloudLayer( dir, cameraPosition, skyCol, 5200.0, 0.00110,
+  vec4 ac = cloudLayer( dir, cameraPosition, skyCol, dpx, 5200.0, 0.00110,
                         vec2( 0.0009, 0.0004 ), uCoverage + 0.24, 0.22, 1.12,
                         3.4e-5, 0, 0.14, 1.12,
                         0.0, 2.8, 1.25, 0.80, 0.44 );
 
   // 1. The cumulus deck, 2.25 km. Thick, seen from underneath, so it
   //    self-shadows hard — and the only one with vertical development.
-  vec4 cu = cloudLayer( dir, cameraPosition, skyCol, 2250.0, 0.00058,
+  vec4 cu = cloudLayer( dir, cameraPosition, skyCol, dpx, 2250.0, 0.00058,
                         vec2( 0.0030, 0.0011 ), uCoverage - 0.02, 0.30, 1.00,
                         1.15e-4, 1, 0.88, 1.0,
                         1.55, 1.55, 1.25, 0.40, 0.26 );
