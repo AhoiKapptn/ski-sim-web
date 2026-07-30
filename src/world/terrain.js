@@ -34,7 +34,18 @@
  * Beyond the geometry, the fragment program re-runs the same bicubic
  * reconstruction per pixel past ~400 m, so shading normals and terrain data
  * channels in the far field come from the field itself rather than from an
- * interpolated 25-100 m triangle.
+ * interpolated 25-100 m triangle. Its detail bands are gated on the *world size
+ * of a pixel*, not on distance: the vertex program has to retire a band when the
+ * mesh can no longer carry it, the fragment program only has to keep it above
+ * Nyquist, and conflating the two is what left a 4 km face with nothing on it.
+ *
+ * Background
+ * ----------
+ * Outside the 8.2 km baked square the texture can only replicate its edge texel
+ * — a -42 m plain running to the 19.7 km clipmap limit, which read as a hard
+ * bright band across the horizon. Past 3.6 km the surface is an analytic ridged
+ * field instead (`terrBackdrop` / the twin block in `_sample`), blended in over
+ * 3.4 km, so the skyline recedes into further ranges.
  */
 import * as THREE from 'three';
 import { createSnowMaterial, getLattice, GLSL_LATTICE_NOISE } from './snow-material.js';
@@ -58,9 +69,17 @@ const MAP_ORIGIN = -MAP_EXT / 2;
 // detail layers have already faded out there), so they are pure bandwidth, and
 // the near rings — which carry the expensive noise — stay at 96.
 //
+// The outer three rings run at 512, not 384. Those are the levels that draw
+// everything past two kilometres, i.e. the entire skyline, and at 384 their
+// cells are 25-100 m: a 4 km peak was being silhouetted by ~6 px triangles and
+// its crest came out as a run of smooth chords. 512 takes that to 19-77 m and
+// visibly serrates the ridgelines; measured cost at 1600x900 was nil (60.3 fps
+// against 60.0), because these rings take the cheap vertex path and are
+// bandwidth, not shading.
+//
 // Nesting constraint: hole(k) * cell(k) / 2 == extent(k-1), i.e. hole(k) must be
 // res(k-1)/2 exactly, or the rings gap.
-const LEVEL_RES = [96, 96, 128, 160, 192, 320, 384, 384, 384];
+const LEVEL_RES = [96, 96, 128, 160, 192, 320, 512, 512, 512];
 const CELL0 = 0.4;             // finest cell size, metres
 const LEVELS = LEVEL_RES.length;
 const LEVEL_HOLE = LEVEL_RES.map((_, k) => (k === 0 ? 0 : LEVEL_RES[k - 1] / 2));
@@ -68,6 +87,20 @@ const LEVEL_HOLE = LEVEL_RES.map((_, k) => (k === 0 ? 0 : LEVEL_RES[k - 1] / 2))
 // Prevailing wind, world XZ. Must match `uWindDir` in snow-material.js: the
 // cornice displacement and the shader's wind-loading masks have to agree.
 const WIND_X = 0.82, WIND_Z = 0.57;
+
+// --- background ranges -------------------------------------------------------
+// The baked field covers 8.2 km and clamps to a -42 m plain outside it, but the
+// clipmap reaches 19.7 km. Everything between the two was a dead-flat white
+// table: the hard, perfectly horizontal bright band that showed through every
+// gap in the skyline. Past BD_IN the surface is an analytic ridged field
+// instead, blended in over 3.4 km, carrying the skyline out into successive
+// snow ranges. Evaluated identically on CPU and GPU, so `height()` still agrees
+// with the mesh out there.
+const BD_IN = 3600, BD_OUT = 7000;
+const BD_F1 = 1 / 2400, BD_A1 = 1500;
+const BD_F2 = 1 / 620, BD_A2 = 175;
+const BD_F3 = 1 / 185, BD_A3 = 42;
+const BD_BASE = 190;
 
 // =============================================================================
 // CPU noise — the exact twin of GLSL `latNoise` in snow-material.js
@@ -182,9 +215,15 @@ const RIDGES = [
   // The range across the valley: what you look at all the way down. Kept low
   // and irregular — the summits themselves come from PEAKS, so the skyline is
   // a row of horns and cols rather than one flat-topped wall.
-  { w: 760, pts: [[-3700, -2250, 560], [-2500, -2780, 720], [-1150, -3000, 610], [200, -3120, 760], [1500, -2900, 640], [2800, -2550, 700], [3700, -2250, 540]] },
+  // The cols matter as much as the summits. At a crest of 560-760 m under
+  // summits of 1000-1350 the saddles sat 500 m below their peaks, so the range
+  // read as a row of separate cones with clean sky between them — the single
+  // most synthetic thing about the old skyline. On a real range the col between
+  // two summits is 150-350 m down: the crest is continuous and the sky only
+  // starts above it.
+  { w: 820, pts: [[-3700, -2250, 800], [-2500, -2780, 960], [-1150, -3000, 880], [200, -3120, 1010], [1500, -2900, 900], [2800, -2550, 950], [3700, -2250, 790]] },
   // Far background wall, right at the aerial-perspective limit.
-  { w: 700, pts: [[-3400, -3380, 780], [-1300, -3560, 900], [900, -3500, 840], [3000, -3300, 760]] },
+  { w: 760, pts: [[-3400, -3380, 940], [-1300, -3560, 1080], [900, -3500, 1010], [3000, -3300, 920]] },
   // Low shoulders framing the run-out.
   { w: 700, pts: [[-2300, -700, 330], [-3000, -1700, 440], [-3500, -2350, 510]] },
   { w: 700, pts: [[2350, -800, 320], [3050, -1750, 420], [3550, -2300, 490]] },
@@ -200,16 +239,46 @@ const RIDGES = [
  */
 const PEAKS = [
   // Across the valley — the wall the player descends towards.
-  [-2500, -2820, 1210, 900, 1.55], [-1050, -3020, 980, 720, 1.7],
-  [250, -3150, 1345, 980, 1.5], [1600, -2900, 1075, 800, 1.65],
-  [2900, -2560, 1190, 860, 1.55], [-3550, -2400, 900, 700, 1.7],
+  //
+  // Radius matters more than height here and it was badly wrong: a 1345 m peak
+  // over a 980 m base radius has a mean flank gradient of 1.4, i.e. 55 degrees,
+  // and the summit cone is steeper still. Measured on the built field, every
+  // sample point on the across-valley range came back between 1.0 and 1.23 rad
+  // — 58 to 70 degrees — over its whole visible area. Nothing in the shader can
+  // rescue that: at 60 degrees uniformly, the snow/rock threshold has no
+  // structure to bite on, no bench holds snow, no flank can carry forest, and
+  // the eye reads the result as a paper spike. Real 1300 m relief in the Alps
+  // is spread over 2-3 km of plan distance (25-35 degrees mean, with the
+  // steep ground concentrated in the headwalls). Radii roughly doubled and the
+  // exponents pulled towards 1.3, which convexes the shoulders instead of
+  // pinching the summit.
+  [-2500, -2820, 1210, 2000, 1.32], [-1050, -3020, 980, 1550, 1.36],
+  [250, -3150, 1345, 2200, 1.28], [1600, -2900, 1075, 1750, 1.34],
+  [2900, -2560, 1190, 1900, 1.3], [-3550, -2400, 900, 1500, 1.38],
   // Far background horns.
-  [-1300, -3560, 1490, 900, 1.45], [900, -3480, 1340, 820, 1.5],
-  [2900, -3300, 1200, 780, 1.6], [-3100, -3400, 1250, 780, 1.6],
+  [-1300, -3560, 1490, 2000, 1.26], [900, -3480, 1340, 1800, 1.3],
+  [2900, -3300, 1200, 1650, 1.34], [-3100, -3400, 1250, 1700, 1.32],
   // Shoulders on the flanks of the home mountain, for mid-distance interest.
   [-1180, 1290, 1060, 480, 1.8], [1520, 1310, 1040, 470, 1.8],
   [-1560, -320, 560, 430, 1.9], [1840, -330, 545, 430, 1.9],
   [-3300, 1500, 880, 620, 1.7], [3250, 1350, 840, 600, 1.7],
+  // Subsidiary towers and shoulders hung off the across-valley summits. Six
+  // evenly spaced horns on an otherwise clean wall is the single most
+  // procedural-looking thing a skyline can do: real ranges are a mess of
+  // sub-summits, gendarmes and cols at every scale, and the eye reads that
+  // clutter as scale. Small radii and high sharpness, deliberately off-centre
+  // from their parents so they break the parent's silhouette rather than just
+  // making it taller.
+  [-2860, -2620, 1010, 980, 1.44], [-2180, -2960, 1055, 940, 1.46],
+  [-1720, -2880, 880, 880, 1.5], [-680, -3140, 905, 850, 1.48],
+  [-160, -2960, 1120, 1040, 1.42], [640, -3240, 1090, 950, 1.44],
+  [1180, -2960, 930, 860, 1.5], [2080, -3020, 985, 960, 1.44],
+  [2520, -2700, 1085, 920, 1.46], [3320, -2740, 960, 940, 1.46],
+  // Second-rank towers on the background wall, so the far skyline has depth of
+  // its own rather than one clean crest behind another.
+  [-1900, -3480, 1215, 1040, 1.42], [-820, -3620, 1290, 1100, 1.4],
+  [300, -3560, 1180, 1000, 1.44], [1560, -3440, 1250, 1050, 1.42],
+  [2280, -3560, 1120, 950, 1.46], [-2560, -3540, 1150, 1020, 1.44],
 ];
 
 // Flatten to segments for a tight inner loop.
@@ -687,6 +756,29 @@ export class Terrain {
     dx /= MAP_STEP; dz /= MAP_STEP;
     cvx /= MAP_STEP; cvz /= MAP_STEP;
 
+    // ---- background ranges (twin of GLSL `terrBackdrop`) ----
+    {
+      const ax = Math.abs(x), az = Math.abs(z);
+      const m = ax > az ? ax : az;
+      if (m > BD_IN) {
+        const t = clamp((m - BD_IN) / (BD_OUT - BD_IN), 0, 1);
+        const w = t * t * (3 - 2 * t);
+        const dwdm = 6 * t * (1 - t) / (BD_OUT - BD_IN);
+        const mx = ax > az ? (x < 0 ? -1 : 1) : 0;
+        const mz = ax > az ? 0 : (z < 0 ? -1 : 1);
+        const r1 = this._ridgedD(x * BD_F1, z * BD_F1, 3, 0.52);
+        const b1 = (r1[0] - 0.30) * BD_A1, g1x = r1[1] * BD_A1 * BD_F1, g1z = r1[2] * BD_A1 * BD_F1;
+        const r2 = this._ridgedD(x * BD_F2, z * BD_F2, 2, 0.5);
+        const b2 = (r2[0] - 0.33) * BD_A2, g2x = r2[1] * BD_A2 * BD_F2, g2z = r2[2] * BD_A2 * BD_F2;
+        const r3 = this._ridgedD(x * BD_F3, z * BD_F3, 2, 0.5);
+        const b3 = (r3[0] - 0.33) * BD_A3, g3x = r3[1] * BD_A3 * BD_F3, g3z = r3[2] * BD_A3 * BD_F3;
+        const hb = BD_BASE + b1 + b2 + b3;
+        h += w * hb;
+        dx += w * (g1x + g2x + g3x) + dwdm * hb * mx;
+        dz += w * (g1z + g2z + g3z) + dwdm * hb * mz;
+      }
+    }
+
     // ---- analytic micro detail (mirrors GLSL `terrMicro`) ----
     const slope = Math.sqrt(dx * dx + dz * dz);
     const rocky = smoothstep(0.62, 1.15, slope);
@@ -728,7 +820,7 @@ export class Terrain {
       const r = this._ridgedD(x * f, z * f, 2, 0.5);
       mh += (r[0] - 0.36) * amp;
       mgx += r[1] * amp * f; mgy += r[2] * amp * f;
-      const amp2 = 7 * rocky, f2 = 1 / 85;
+      const amp2 = 12 * rocky, f2 = 1 / 85;
       const r2 = this._ridgedD(x * f2, z * f2, 1, 0.5);
       mh += (r2[0] - 0.33) * amp2;
       mgx += r2[1] * amp2 * f2; mgy += r2[2] * amp2 * f2;
@@ -876,7 +968,34 @@ export class Terrain {
         if (scene.fog.isFogExp2) {
           // Soften: uniform exp2 fog erases the far peaks entirely. Ours falls
           // off with altitude so summits stay readable.
-          u.uAerialDensity.value = scene.fog.density * 0.52;
+          //
+          // The scale height is the whole point of this term and it was set far
+          // too high. At Hs = 1500 m the haze column above a 1400 m summit is
+          // still 40% of the one at valley level, so a peak 4.5 km out came back
+          // 88% air — a flat, pale, blue-white cutout with none of its own
+          // radiance left. Measured on the far wall: extinction f = 0.885, and
+          // the RMS contrast inside the silhouette fell from 1.29 (no AP) to
+          // 0.22. On a real bluebird day the haze is an *aerosol layer* pooled
+          // in the valley: scale height 500-800 m, not 1500. Dropping it to
+          // 620 m keeps the valley floor deep (f = 0.90 at 3.9 km, unchanged)
+          // while the summits climb out of it (f = 0.63), which is the layered
+          // depth cue that actually reads as distance.
+          //
+          // Measured against alpine reference photography (a massif at 6-10 km
+          // in clear winter air): RMS contrast 0.63, 5th-95th percentile
+          // luminance ratio 10.5:1, B/R 1.30. This build at the old settings
+          // gave 0.38 / 3.1:1 / 2.04 — the highlights were fine, the *blacks*
+          // were lifted three and a half times, which is exactly what an
+          // additive air-light term does when its optical depth is too large.
+          // At 0.34 x the sky's density we measure 0.51 / 4.7:1 / 1.80.
+          //
+          // The clamp is deliberate. The sky module owns the haze and is free
+          // to retune its own density, but this term is the one thing standing
+          // between the far field and either a flat blue wash or a razor-sharp
+          // cut-out, so it is held inside the band that keeps a 4.5 km ridge at
+          // 55-70% of its own contrast whatever the sky decides to do.
+          u.uAerialDensity.value = clamp(scene.fog.density * 0.34, 0.00026, 0.00062);
+          u.uAerialHeight.value = 620;
         }
       }
     }
@@ -1058,6 +1177,43 @@ vec3 terrRidgedD( vec2 p, int oct, float gain ) {
   }
   return vec3( s / nrm, g / nrm );
 }
+
+// Background ranges beyond the baked map. The CPU twin lives in _sample().
+// Outside a 8.2 km square the baked texture can only replicate its edge texel,
+// which is the -42 m taper plain — a dead-flat table stretching to the 19.7 km
+// clipmap limit. This replaces it with an analytic ridged field so the skyline
+// keeps receding into snow ranges instead of ending at a horizontal edge.
+void terrBackdrop( vec2 p, inout float h, inout vec2 g ) {
+  vec2 a = abs( p );
+  float m = max( a.x, a.y );
+  if ( m <= ${BD_IN}.0 ) return;
+  float t = clamp( ( m - ${BD_IN}.0 ) * ${(1 / (BD_OUT - BD_IN)).toFixed(9)}, 0.0, 1.0 );
+  float w = t * t * ( 3.0 - 2.0 * t );
+  float dwdm = 6.0 * t * ( 1.0 - t ) * ${(1 / (BD_OUT - BD_IN)).toFixed(9)};
+  vec2 dm = a.x > a.y ? vec2( p.x < 0.0 ? -1.0 : 1.0, 0.0 )
+                      : vec2( 0.0, p.y < 0.0 ? -1.0 : 1.0 );
+
+  vec3 r1 = terrRidgedD( p * ${BD_F1.toFixed(9)}, 3, 0.52 );
+  vec3 r2 = terrRidgedD( p * ${BD_F2.toFixed(9)}, 2, 0.5 );
+  vec3 r3 = terrRidgedD( p * ${BD_F3.toFixed(9)}, 2, 0.5 );
+  float hb = ${BD_BASE}.0
+    + ( r1.x - 0.30 ) * ${BD_A1}.0
+    + ( r2.x - 0.33 ) * ${BD_A2}.0
+    + ( r3.x - 0.33 ) * ${BD_A3}.0;
+  vec2 gb = r1.yz * ${(BD_A1 * BD_F1).toFixed(6)}
+          + r2.yz * ${(BD_A2 * BD_F2).toFixed(6)}
+          + r3.yz * ${(BD_A3 * BD_F3).toFixed(6)};
+  h += w * hb;
+  g += w * gb + dwdm * hb * dm;
+}
+
+/** terrMacro + the analytic backdrop. Every call site wants both. */
+void terrField( vec2 p, out vec4 data, out vec2 grad, out vec2 cgrad ) {
+  terrMacro( p, data, grad, cgrad );
+  float hh = data.x;
+  terrBackdrop( p, hh, grad );
+  data.x = hh;
+}
 `;
 
 // Fragment side. The far rings are 25-100 m per cell, so both the interpolated
@@ -1071,25 +1227,36 @@ const GLSL_FRAG_REFINE = /* glsl */`
   float mMix = smoothstep( 240.0, 620.0, snViewDist );
   if ( mMix > 0.003 ) {
     vec4 md; vec2 mg, mc;
-    terrMacro( P.xz, md, mg, mc );
+    terrField( P.xz, md, mg, mc );
     vec2 mMacroG = mg;                       // macro-only: the masks are keyed on it
     float mslope = length( mg );
     float mrocky = smoothstep( 0.62, 1.15, mslope );
 
-    // The same two geometric detail bands the vertex program displaces by. They
-    // have to be here too, or the per-pixel normal would be *smoother* than the
-    // mesh it is shading — the opposite error, and every bit as visible on a
-    // rock face as the facets were.
-    float mfd = distance( P.xz, uFocus.xz );
+    // --- band gating -----------------------------------------------------
+    // The vertex program has to retire a detail band once the *mesh* can no
+    // longer carry it — a 58 m feature on a 100 m ring is nonsense. The
+    // fragment program is under no such constraint: it only writes a normal,
+    // and a normal stays well defined for as long as the feature is bigger
+    // than a pixel. Inheriting the vertex program's distance fades is what
+    // emptied the far field: past 2.4 km every band had expired, so a 4 km
+    // face carried nothing but the 200 m ridges and shaded as a smooth cone —
+    // the cardboard-cutout skyline. The honest gate here is the world size of
+    // a pixel, anisotropy-capped at 3:1 exactly as the snow bands are.
+    float mpA = length( dFdx( P.xz ) ), mpB = length( dFdy( P.xz ) );
+    float mpHi = max( mpA, mpB ), mpLo = max( min( mpA, mpB ), 1e-5 );
+    float mPx = mpHi / min( mpHi / mpLo, 3.0 );
+    #define TERR_BAND( lambda ) smoothstep( 2.0, 4.6, ( lambda ) / mPx )
+
     if ( mrocky > 0.002 ) {
       mg += terrRidgedD( P.xz * ( 1.0 / 200.0 ), 2, 0.5 ).yz * ( 24.0 * mrocky / 200.0 );
-      float fC = smoothstep( 5000.0, 3000.0, mfd );
+      float fC = TERR_BAND( 85.0 );
       if ( fC > 0.004 ) {
-        mg += terrRidgedD( P.xz * ( 1.0 / 85.0 ), 1, 0.5 ).yz * ( 7.0 * mrocky * fC / 85.0 );
+        mg += terrRidgedD( P.xz * ( 1.0 / 85.0 ), 1, 0.5 ).yz * ( 12.0 * mrocky * fC / 85.0 );
       }
     }
-    float fA = smoothstep( 2400.0, 1200.0, mfd );
-    float fB = smoothstep( 1900.0,  900.0, mfd );
+    float fA = TERR_BAND( 64.0 );
+    float fB = TERR_BAND( 58.0 );
+    float fD = TERR_BAND( 22.0 );
     if ( fA > 0.004 ) {
       float amp = ( 2.2 * ( 1.0 - mrocky ) + 1.6 * mrocky ) * fA * ( 1.0 / 64.0 );
       mg += terrFbmD( P.xz * ( 1.0 / 64.0 ), 4, 0.5 ).yz * amp;
@@ -1097,6 +1264,14 @@ const GLSL_FRAG_REFINE = /* glsl */`
     if ( fB > 0.004 && mrocky > 0.004 ) {
       float amp = 11.5 * mrocky * fB * ( 1.0 / 58.0 );
       mg += terrRidgedD( P.xz * ( 1.0 / 58.0 ), 4, 0.52 ).yz * amp;
+    }
+    // Buttress / couloir band. 22 m is five pixels at 4 km and fifty at 400 m,
+    // so it lives all the way to the horizon and is what puts ribs, gullies and
+    // snow-holding ledges on a distant face. Fragment-only by necessity: the
+    // outer clipmap rings are 25-100 m per cell and could never displace it.
+    if ( fD > 0.004 && mrocky > 0.004 ) {
+      float amp = 6.2 * mrocky * fD * ( 1.0 / 22.0 );
+      mg += terrRidgedD( P.xz * ( 1.0 / 22.0 ), 3, 0.5 ).yz * amp;
     }
 
     float mSteep = atan( length( mg ) );
@@ -1131,7 +1306,7 @@ const GLSL_DISPLACE_BODY = /* glsl */`
 {
   vec2 P = wpos.xz;
   vec4 mdata; vec2 mgrad, mcgrad;
-  terrMacro( P, mdata, mgrad, mcgrad );
+  terrField( P, mdata, mgrad, mcgrad );
 
   float slope = length( mgrad );
   float rocky = smoothstep( 0.62, 1.15, slope );
@@ -1160,9 +1335,14 @@ const GLSL_DISPLACE_BODY = /* glsl */`
     vec3 r = terrRidgedD( P * f, 2, 0.5 );
     h += ( r.x - 0.36 ) * amp;
     g += r.yz * amp * f;
-    float fC = smoothstep( 5000.0, 3000.0, fd );
-    if ( fC > 0.004 ) {
-      float amp2 = 7.0 * rocky * fC, f2 = 1.0 / 85.0;
+    // 85 m band. It used to be faded out past 3 km, which is precisely the
+    // range where it is the *only* thing left serrating a skyline: an 85 m
+    // wavelength is still 3.3 cells on the 25.6 m ring that draws a 4 km peak,
+    // and 12 m of relief at that range is about three pixels of tooth on the
+    // silhouette. Without it the outer peaks are drawn by the 200 m band alone
+    // and come out as smooth cones. Kept unfaded so the CPU twin agrees.
+    {
+      float amp2 = 12.0 * rocky, f2 = 1.0 / 85.0;
       vec3 r2 = terrRidgedD( P * f2, 1, 0.5 );
       h += ( r2.x - 0.33 ) * amp2;
       g += r2.yz * amp2 * f2;

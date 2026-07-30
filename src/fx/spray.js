@@ -25,7 +25,7 @@ import * as THREE from 'three';
  */
 
 const MAX_PARTICLES = 34000;
-const MAX_SPAWN_PER_FRAME = 900;
+const MAX_SPAWN_PER_FRAME = 1400;
 
 // Deterministic RNG so captures are reproducible frame for frame.
 let _rng = 0x9e3779b9;
@@ -126,6 +126,7 @@ uniform float uTime;
 uniform vec3  uWind;
 uniform vec3  uSunDirWorld;
 uniform float uFadeNear;
+uniform float uPixelScale;   // drawing-buffer height / 2, in pixels
 
 varying vec2  vLocal;
 varying vec2  vUv;
@@ -142,8 +143,12 @@ varying float vShade;
 float lobeField(vec3 q) {
   vec3 lp = q * 1.15;
   float v = sin(lp.x) * sin(lp.y * 1.13 + 1.7) * sin(lp.z * 0.92 + 3.1)
-          + 0.55 * sin(lp.x * 2.7 + 2.2) * sin(lp.y * 2.3) * sin(lp.z * 2.9 + 1.1);
-  return clamp(v * 0.645 * 0.5 + 0.5, 0.0, 1.0);
+          + 0.55 * sin(lp.x * 2.7 + 2.2) * sin(lp.y * 2.3) * sin(lp.z * 2.9 + 1.1)
+          // A third octave at ~1.5 m. Real spray is filamentary at that scale —
+          // wisps and streaks, not one smooth mass — and two octaves at 5 m and
+          // 2.5 m only ever produce a soft blob.
+          + 0.34 * sin(lp.x * 6.1 + 0.7) * sin(lp.y * 5.3 + 4.2) * sin(lp.z * 6.9);
+  return clamp(v * 0.545 * 0.5 + 0.5, 0.0, 1.0);
 }
 
 void main() {
@@ -188,19 +193,38 @@ void main() {
 
   float size  = aA.z * (1.0 + aA.w * t);
   float fin   = smoothstep(0.0, 0.09, u);
-  float fout  = 1.0 - smoothstep(0.46, 1.0, u);
-  float alpha = aB.w * fin * fout * fout;
+  // The tail of the plume is the *old* snow, forty metres behind the skier. A
+  // hard fade-out (this used to be fout squared from 46% of life) deletes it and
+  // leaves a compact puff stuck to the boot; real spray hangs and thins.
+  float fout  = 1.0 - smoothstep(0.55, 1.0, u);
+  float alpha = aB.w * fin * fout * mix(1.0, fout, 0.55);
 
   // Neighbouring particles share a lobe value, so overlapping sprites reinforce
   // instead of averaging out - this is what gives the plume internal form
   // rather than a uniform cotton-wool mass.
   float lobe = lobeField(aP0);
-  alpha *= 0.58 + 0.84 * lobe;
+  alpha *= 0.45 + 1.55 * lobe * lobe;
 
   // Approximate volumetric self-shadow: if the field is dense one step towards
   // the sun, this particle is buried in the plume's own shade.
   float occ = lobeField(aP0 + uSunDirWorld * 1.35);
-  vShade = mix(1.0, 0.34, occ);
+  vShade = mix(1.0, 0.44, occ);
+
+  // Sub-pixel guard. A 1 cm ice crystal at 8 m is a fifth of a pixel wide, but a
+  // quad cannot be smaller than a pixel: the rasteriser rounds it up to a full
+  // one at full opacity, and the result is a field of hard white dots scattered
+  // over the snow that reads as dirt on the lens. Grow anything under the floor
+  // to the floor and take the coverage it should have had out of its alpha.
+  {
+    float viewZ = max(-(modelViewMatrix * vec4(p, 1.0)).z, 0.02);
+    float px = size * projectionMatrix[1][1] * uPixelScale / viewZ;
+    const float MIN_PX = 1.75;
+    if (px < MIN_PX) {
+      float k = max(px / MIN_PX, 0.02);
+      size  /= k;
+      alpha *= k * k;
+    }
+  }
 
   // aD.y < 0 flags a ground-aligned decal: -1 low drifting snow, -2 cast shadow.
   // Lying them flat on the snow is what stops a vertical billboard from diving
@@ -243,7 +267,11 @@ void main() {
   alpha *= smoothstep(uFadeNear * 0.3, uFadeNear, -mv.z);
 
   if (isGroundQuad > 0.5) above = 9.0;   // ground decals must not fade themselves
-  alpha *= smoothstep(-0.02, 0.34, above);
+  // Soft-particle fade against the birth plane. Kept tight: a wide fade band
+  // erases the snow right at the ski, which is what made the rooster tail read
+  // as a detached cloud floating beside the skier instead of a sheet peeling
+  // off the edge.
+  alpha *= smoothstep(-0.06, 0.17, above);
 
   vLocal   = position.xy * 2.0;
   vUv      = uv * 0.5 + vec2(step(0.5, fract(seed * 4.0)) * 0.5,
@@ -317,19 +345,37 @@ void main() {
   // Self-shadowing. Only a gentle cooling of the optically deep core (a strong
   // one turns every sprite into a soap bubble), plus a real vertical gradient:
   // snow low in the plume sits in the shadow of the snow above it.
-  float ao = mix(0.90, 1.0, tex.b);
-  float vs = mix(0.38, 1.00, clamp(vRise * 0.70, 0.0, 1.0));
+  float ao = mix(0.88, 1.0, tex.b);
+  // Measured: with the old floors, spray pixels came out at 177 luma over a 173
+  // backdrop — a 2% difference, i.e. invisible on a white slope. Sunlit spray is
+  // a cloud of ice with an albedo *higher* than the pack it came off and a huge
+  // amount of multiple scattering; it belongs 20-35% above the piste, with the
+  // contrast carried by its own underside shadow and the shadow it casts.
+  float vs = mix(0.50, 1.20, clamp(vRise * 0.70, 0.0, 1.0));
+
+  // Self-shadowing only applies where the plume is optically thick. A thin
+  // fringe has nothing above it to shade it, so it stays white; shading it like
+  // the core is what turns the tail of the plume grey and makes it read as
+  // smoke instead of as suspended snow.
+  float shd = mix(1.0, vShade, clamp(dens * 1.8, 0.0, 1.0));
 
   vec3 col = uAmbient * ao * (0.62 + 0.38 * n.z);
-  col += uSunColor * wrap * ao * vs * vShade;
+  col += uSunColor * wrap * ao * vs * shd;
   // Multiple scattering inside a dense cloud of ice: even the shadow side of
   // snow spray is nowhere near black.
-  col += uSunColor * 0.21 * ao * mix(0.55, 1.0, vs) * mix(0.65, 1.0, vShade);
+  col += uSunColor * 0.34 * ao * mix(0.55, 1.0, vs) * mix(0.70, 1.0, shd);
   col += uGroundBounce * (0.5 - 0.5 * n.y);
   col *= vBright;
 
   // Additive forward scatter: the glow that makes it read as photographic.
   col += uSunColor * hg * uScatter * (0.10 + 0.90 * thin * thin) * vs;
+
+  // Opposition surge. Ice crystals retro-reflect hard, which is why front-lit
+  // spray is *brighter* than the snow it came off rather than the same value —
+  // and being the same value as the snow behind it is exactly how a spray
+  // system becomes invisible on a white slope.
+  float bs = max(dot(V, L), 0.0);
+  col += uSunColor * (0.26 * bs * bs + 0.22 * pow(bs, 6.0)) * ao * vs * shd;
 
   // Individual ice crystals catching the light.
   float tw = sin(uTime * 26.0 + vSeed * 137.0) * 0.5 + 0.5;
@@ -396,6 +442,7 @@ export function createSpray(scene) {
     uAmbient: { value: new THREE.Color(0.16, 0.22, 0.32) },
     uGroundBounce: { value: new THREE.Color(0.13, 0.15, 0.19) },
     uScatter: { value: 0.85 },
+    uPixelScale: { value: 450 },
     uFadeNear: { value: 1.7 },
   };
 
@@ -455,10 +502,11 @@ export function createSpray(scene) {
   const gN = new THREE.Vector3(0, 1, 0);
   const tmp = new THREE.Vector3();
   const sunWorld = new THREE.Vector3(-0.5, 0.72, 0.45).normalize();
+  const drawSize = new THREE.Vector2(1600, 900);
 
   const WHITE = new THREE.Color(1, 1, 1);
   let sun = null, sunSearch = 0;
-  const acc = { rooster: 0, sheet: 0, crystal: 0, air: 0 };
+  const acc = { rooster: 0, sheet: 0, veil: 0, crystal: 0, air: 0 };
   let prevAirborne = false, prevSpeed = 0, prevVy = 0;
   let landCooldown = 0, stopCooldown = 0;
 
@@ -467,10 +515,17 @@ export function createSpray(scene) {
       tmp.copy(sun.position);
       if (sun.target) tmp.sub(sun.target.position);
       if (tmp.lengthSq() > 1e-6) sunWorld.copy(tmp).normalize();
+      // Pulled halfway to neutral. Snow spray is a cloud of clear ice: it
+      // scatters almost achromatically, so it does not take the warm cast the
+      // sun puts on a diffuse surface, and letting it do so is what made the
+      // plume read as cream-coloured dust rather than as snow.
       uniforms.uSunColor.value
         .setRGB(sun.color.r, sun.color.g, sun.color.b)
+        .lerp(WHITE, 0.5)
         .multiplyScalar(0.355 * Math.max(sun.intensity, 0.05));
     }
+    renderer.getDrawingBufferSize(drawSize);
+    uniforms.uPixelScale.value = drawSize.y * 0.5;
     uniforms.uSunDirWorld.value.copy(sunWorld);
     uniforms.uSunDirView.value.copy(sunWorld)
       .transformDirection(camera.matrixWorldInverse).normalize();
@@ -525,16 +580,16 @@ export function createSpray(scene) {
       const vy = (0.55 + rnd() * 1.35) * power * upBias;
       const vz = oz * sp * 0.85 + dirZ * power * 0.8 * rnd() + rndc() * 0.7;
       const life = 1.5 + rnd() * 2.1;
-      const size = (0.12 + rnd() * 0.42) * sizeScale;
+      const size = (0.19 + rnd() * rnd() * 0.68) * sizeScale;
       emit(
         px, py, pz, vx, vy, vz,
         life, size,
         0.85,                                     // grow
         1.25 + rnd() * 0.6,                       // drag
         0.45 + rnd() * 0.60,                      // turbulence
-        0.09 + rnd() * rnd() * 0.30,              // alpha
+        0.16 + rnd() * rnd() * 0.42,              // alpha
         gN.x, gN.y, gN.z, gd,
-        0.016, 0.10, 0.58 + rnd() * 0.44, 0.30
+        0.016, 0.10, 0.94 + rnd() * 0.40, 0.30
       );
       if ((i & 7) === 0) {
         curGroundD = gd;
@@ -610,23 +665,29 @@ export function createSpray(scene) {
       // 1. ROOSTER TAIL - the continuous curtain off the edged ski
       // ---------------------------------------------------------------------
       if (!airborne && load > 0.012) {
-        acc.rooster += 5000 * load * dt;
+        acc.rooster += 5400 * load * dt;
         let n = Math.min(acc.rooster | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
         acc.rooster -= n;
 
-        const vOut = 1.0 + 2.9 * load + 0.050 * spd;
-        const vUp = 1.6 + 3.6 * load + 0.062 * spd;
-        const carry = spd * 0.32;
+        // A World Cup GS turn throws the curtain 2-4 m out and head high. The
+        // numbers below are sized against that, not against a puff of dust.
+        const vOut = 1.30 + 3.5 * load + 0.052 * spd;
+        const vUp = 1.55 + 3.5 * load + 0.050 * spd;
+        // Snow leaves a moving ski with most of the ski's forward momentum and
+        // then decelerates hard. That retained momentum plus high drag is what
+        // lays the plume down as a long wall behind the skier instead of
+        // blooming it into a mushroom beside him.
+        const carry = spd * 0.62;
 
         for (; n > 0; n--) {
           // Along the running edge, boot to tail, weighted toward the tail.
-          const alongT = -1.5 + 1.9 * Math.pow(rnd(), 0.6);
+          const alongT = -2.3 + 2.7 * Math.pow(rnd(), 0.7);
           // The sheet peels off the edge and widens as it leaves the ski.
           const peel = rnd();
           const lateral = sgn * (0.11 + peel * peel * (0.35 + 0.9 * load)) + rndc() * 0.05;
           const px = p.x + fwd.x * alongT + right.x * lateral;
           const py = p.y + fwd.y * alongT + right.y * lateral
-                   + 0.02 + peel * (0.10 + 0.5 * load);
+                   + 0.04 + peel * (0.16 + 0.7 * load);
           const pz = p.z + fwd.z * alongT + right.z * lateral;
 
           // Fan the curtain: mostly outward, some straight up, some low sheet.
@@ -638,32 +699,60 @@ export function createSpray(scene) {
           const vx = right.x * sgn * outK + up.x * upK + velDir.x * backK + rndc() * 0.85;
           const vy = right.y * sgn * outK + up.y * upK + velDir.y * backK + rndc() * 0.50;
           const vz = right.z * sgn * outK + up.z * upK + velDir.z * backK + rndc() * 0.85;
-          const life = 0.70 + rnd() * 1.0 + load * 0.4;
-          const size = 0.024 + big * big * big * 0.44 + load * 0.02;
+          // Short-lived and heavily damped. A rooster tail is a *compact* body
+          // of snow travelling with the skier; long lives and low drag smear the
+          // same particle budget over forty metres of slope, which measured as
+          // 66% of the frame touched and none of it reading as anything.
+          const life = 0.68 + rnd() * 1.00 + load * 0.45;
+          // Snow leaves the edge as chunks and clods, not as dust: the size
+          // distribution has to have a long tail or the curtain is a grey haze.
+          const size = 0.115 + big * big * 0.66 + load * 0.14;
 
           if ((n & 3) === 0) {
             emitShadowBlob(px + vx * 0.22, py + vy * 0.22, pz + vz * 0.22,
                            vx * 0.55, vy * 0.55, vz * 0.55,
-                           life * 1.05, size * 2.2 + 0.16, 0.045 + rnd() * 0.06);
+                           life * 1.05, size * 1.9 + 0.16, 0.115 + rnd() * 0.15);
           }
 
           emit(
             px, py, pz, vx, vy, vz,
             life, size,
-            0.52 + rnd() * 0.42,                               // grow
-            2.6 + rnd() * 1.7,                                 // drag
-            0.26 + rnd() * 0.36,                               // turbulence
-            0.050 + rnd() * rnd() * 0.23,                      // alpha
+            0.90 + rnd() * 0.80,                               // grow
+            3.4 + rnd() * 1.9,                                 // drag
+            0.22 + rnd() * 0.30,                               // turbulence
+            0.50 + rnd() * rnd() * 0.55,                       // alpha
             gN.x, gN.y, gN.z, groundD,
-            0.085 + 0.05 * rnd(),                              // motion stretch
+            0.26 + 0.16 * rnd(),                               // motion stretch
             0.10,
-            0.55 + rnd() * 0.45,                               // brightness
+            1.06 + rnd() * 0.42,                               // brightness
             0.55
           );
+
+          // Clods. A carving edge does not only make dust: it peels lumps of
+          // packed snow that fly nearly ballistically, out ahead of the soft
+          // body of the curtain. They are what give a rooster tail its grain and
+          // its leading edge - without them the plume is cotton wool.
+          if ((n & 7) === 0) {
+            const cs = 1.45 + rnd() * 0.7;
+            emit(
+              px, py, pz, vx * cs, vy * cs * 0.85, vz * cs,
+              0.34 + rnd() * 0.45,
+              0.022 + rnd() * rnd() * 0.055,
+              0.25,                                            // barely grows
+              0.55 + rnd() * 0.55,                             // low drag
+              0.06,
+              0.50 + rnd() * 0.28,                             // dense but not a disc
+              gN.x, gN.y, gN.z, groundD,
+              0.20 + 0.14 * rnd(),                             // streaks
+              0.55,
+              1.10 + rnd() * 0.30,
+              0.95                                             // full gravity
+            );
+          }
         }
 
         // ------ low sheet that stays glued to the surface -------------------
-        acc.sheet += 150 * load * dt;
+        acc.sheet += 190 * load * dt;
         let ns = Math.min(acc.sheet | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
         acc.sheet -= ns;
         for (; ns > 0; ns--) {
@@ -679,7 +768,7 @@ export function createSpray(scene) {
             2.2 + rnd() * 2.4,                                 // lingers
             0.55 + rnd() * 1.5, 0.55,
             3.0 + rnd(), 0.24 + rnd() * 0.26,
-            0.006 + rnd() * 0.013,                             // very sheer
+            0.020 + rnd() * 0.030,                             // sheer
             gN.x, gN.y, gN.z, groundD,
             0.0, -1.0, 1.02, 0.16
           );
@@ -687,34 +776,78 @@ export function createSpray(scene) {
       }
 
       // ---------------------------------------------------------------------
-      // 2. ICE CRYSTALS - fine dust lifted by the running ski at speed
+      // 2. RUNNING VEIL - the loose snow a ski lifts simply by going fast.
+      //
+      // This is the term that was missing, and it is the one that makes a
+      // straight schuss read as 56 km/h instead of as a slow pan: even with the
+      // skis flat, a groomed piste sheds a continuous, sheer curtain of snow
+      // dust off the tails that hangs and drifts for a couple of seconds. It is
+      // deliberately very low alpha and large - many overlapping sheer sprites,
+      // not a few opaque ones, is what keeps it looking like suspended snow
+      // rather than like smoke.
       // ---------------------------------------------------------------------
-      if (!airborne && spd > 5) {
-        acc.crystal += (150 + 950 * speedF * (0.25 + 0.75 * load)) * dt;
-        let n = Math.min(acc.crystal | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
-        acc.crystal -= n;
+      if (!airborne && spd > 4.5) {
+        acc.veil += (220 + 820 * speedF) * (0.45 + 0.55 * Math.min(load, 1)) * dt;
+        let n = Math.min(acc.veil | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
+        acc.veil -= n;
         for (; n > 0; n--) {
-          const alongT = -0.4 - rnd() * 2.8;
-          const lateral = rndc() * (0.35 + 1.2 * load);
+          // Behind the tails, in a low cone. Kept spatially tight: the temporal
+          // AA in the post chain averages away anything thin and dispersed, so a
+          // veil that is spread thinly over the whole slope measures as nothing.
+          // Well behind the tails and low: in a chase view anything emitted at
+          // the boot sits between the camera and the skier and fogs his legs.
+          const alongT = -0.95 - rnd() * 2.3;
+          const lateral = rndc() * (0.28 + 0.45 * load) + sgn * load * 0.28 * rnd();
+          const rise = rnd();
           emit(
             p.x + fwd.x * alongT + right.x * lateral,
-            p.y + fwd.y * alongT + right.y * lateral + 0.05 + rnd() * 0.55,
+            p.y + fwd.y * alongT + right.y * lateral + 0.02 + rise * rise * 0.42,
             p.z + fwd.z * alongT + right.z * lateral,
-            velDir.x * spd * 0.16 + rndc() * 1.5 + right.x * sgn * load * 1.8,
-            0.5 + rnd() * 2.0,
-            velDir.z * spd * 0.16 + rndc() * 1.5 + right.z * sgn * load * 1.8,
-            1.3 + rnd() * 1.5,
-            0.006 + rnd() * 0.016, 0.22,
-            0.8 + rnd() * 0.5, 0.34 + rnd() * 0.4,
-            0.30 + rnd() * 0.45,
+            velDir.x * spd * 0.10 + rndc() * 0.8 + right.x * sgn * load * 1.4,
+            0.45 + rnd() * 1.2 + load * 1.1,
+            velDir.z * spd * 0.10 + rndc() * 0.8 + right.z * sgn * load * 1.4,
+            0.60 + rnd() * 0.80,
+            0.13 + rnd() * rnd() * 0.34,                       // large and soft
+            0.55,                                              // keeps expanding
+            2.4 + rnd() * 1.1,
+            0.24 + rnd() * 0.28,
+            0.042 + rnd() * rnd() * 0.095,                     // sheer
             gN.x, gN.y, gN.z, groundD,
-            0.05, 1.0, 1.15, 0.13
+            0.10, 0.25, 1.02, 0.20
           );
         }
       }
 
       // ---------------------------------------------------------------------
-      // 3. AIRBORNE trail - snow still shedding off the skis in flight
+      // 3. ICE CRYSTALS - individual grains flicked off the edge, catching the
+      //    sun. Small and bright: these are the sparkle, not the volume.
+      // ---------------------------------------------------------------------
+      if (!airborne && spd > 5) {
+        acc.crystal += (90 + 420 * speedF * (0.25 + 0.75 * load)) * dt;
+        let n = Math.min(acc.crystal | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
+        acc.crystal -= n;
+        for (; n > 0; n--) {
+          const alongT = -0.4 - rnd() * 1.8;
+          const lateral = rndc() * (0.30 + 0.9 * load);
+          emit(
+            p.x + fwd.x * alongT + right.x * lateral,
+            p.y + fwd.y * alongT + right.y * lateral + 0.05 + rnd() * 0.65,
+            p.z + fwd.z * alongT + right.z * lateral,
+            velDir.x * spd * 0.16 + rndc() * 1.5 + right.x * sgn * load * 1.8,
+            0.5 + rnd() * 2.0,
+            velDir.z * spd * 0.16 + rndc() * 1.5 + right.z * sgn * load * 1.8,
+            0.55 + rnd() * 0.85,
+            0.009 + rnd() * 0.018, 0.22,
+            1.1 + rnd() * 0.7, 0.34 + rnd() * 0.4,
+            0.10 + rnd() * 0.17,
+            gN.x, gN.y, gN.z, groundD,
+            0.12, 1.0, 1.12, 0.13
+          );
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 4. AIRBORNE trail - snow still shedding off the skis in flight
       // ---------------------------------------------------------------------
       if (airborne && spd > 4) {
         acc.air += 70 * speedF * dt;
@@ -734,18 +867,18 @@ export function createSpray(scene) {
       }
 
       // ---------------------------------------------------------------------
-      // 4. LANDING PLUME
+      // 5. LANDING PLUME
       // ---------------------------------------------------------------------
       if (prevAirborne && !airborne && landCooldown <= 0) {
         const impact = clamp(Math.abs(prevVy) / 12 + spd / 45, 0.18, 1.7);
         landCooldown = 0.22;
-        burst(Math.round(500 + 1500 * impact), p.x, p.y, p.z,
+        burst(Math.round(420 + 1250 * impact), p.x, p.y, p.z,
               0.55 + 1.6 * impact, 2.2 + 6.5 * impact, 1.0,
               0.9 + 0.5 * impact, velDir.x * 0.55, velDir.z * 0.55, groundD);
       }
 
       // ---------------------------------------------------------------------
-      // 5. HOCKEY STOP - hard deceleration on a big edge angle
+      // 6. HOCKEY STOP - hard deceleration on a big edge angle
       // ---------------------------------------------------------------------
       const decel = (prevSpeed - spd) / dt;
       const stopping = !airborne && spd > 3.5 &&

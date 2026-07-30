@@ -33,7 +33,6 @@ import * as THREE from 'three';
  *                                     -> 6.4 : 1, 2.7 stops, 129 display codes
  *     snow in a real cast shadow      0.14 linear, B/R 2.48 -> disp 83,89,108
  *                                        (blue, and it does NOT crush to black)
- *     sunlit ridge at 3 km            0.48 linear, B/R 1.6
  *     cloud base / cloud top          0.08-0.24 of top radiance
  *     sky zenith / horizon            0.20 / 0.40 linear, B/R 4.9 / 1.9
  *     solar disc                      2.5-3.4 linear, reddening at dusk
@@ -43,6 +42,22 @@ import * as THREE from 'three';
  * cast a shadow at all, so 85% of the snow in the hero framing sat inside a
  * 0.2-stop band of received sunlight and 0% was in shade. Sun/shade separation
  * measured 11 code values because there was no shade in the frame to measure.
+ *
+ * AERIAL PERSPECTIVE has its own contract, measured with tools/sky-ap-probe.mjs,
+ * which raymarches terrain.height() through every 8th pixel to get a real
+ * per-pixel distance, then buckets the framebuffer by that distance and splits
+ * the far bucket by n.l into sunlit and shaded faces. The thing it exists to
+ * stop is a distant ridge collapsing to one flat value:
+ *
+ *     2.5-4 km ridge, lit vs shaded   21-28% internal luminance variation
+ *     2.5-6 km ridge                  B/R 1.45  (near sunlit snow: 1.03)
+ *     far ridge vs the sky above it   48-77 display codes DARKER (never inverts)
+ *     terrain haze fraction f         0.38 at 3 km, 0.55 at 5 km
+ *
+ * For scale: at the previous aerialDensity the same measurement read 3.1%, i.e.
+ * the massif was a single flat tone, which is what "cardboard cutout" means
+ * numerically. Reference for the target is a real 2000 m winter panorama
+ * (Bürstegg), where a 5 km ridge measures 24% between its lit and shaded faces.
  *
  * No textures, no assets, no dependencies beyond `three`.
  */
@@ -780,6 +795,15 @@ export function createSky(scene, renderer) {
   const _tmp = new THREE.Vector3();
   const _fogCol = new THREE.Color();
 
+  // Read-only diagnostic: the aerial-perspective colour actually shipped to
+  // terrain.js this frame, what it was before the physical ceiling, and the sky
+  // radiance that ceiling is derived from. tools/sky-ap-probe.mjs reads it so a
+  // claim about the haze can be a number instead of an opinion.
+  const hazeInfo = {
+    cool: [0, 0, 0], coolRaw: [0, 0, 0], skyRidge: [0, 0, 0],
+    coolLum: 0, skyRidgeLum: 0, clamped: 0,
+  };
+
   const LATITUDE = 46.5 * Math.PI / 180;    // Alps
   const DECLINATION = 14.0 * Math.PI / 180; // late spring
   // Which way the piste faces. This rotates the whole solar arc, and it is a
@@ -809,13 +833,43 @@ export function createSky(scene, renderer) {
     cloudDensity: 1.0,
     cirrus: 0.22,
     windSpeed: 1.0,
-    fogDensity: 0.00062,     // our own chunk (trees, skier, props)
-    // terrain.js halves this and integrates against a 1500 m scale height, so
-    // the ridges need a heavier number than everything else to lose the same
-    // amount of contrast. Tuned against the 3 km evaluation in
-    // tools/skylight-probe.mjs: a sunlit ridge 3 km out and 250 m up lands on
-    // 0.48 linear, B/R 1.6 (near sunlit snow: 1.00 linear, B/R 1.00).
-    aerialDensity: 0.00170,
+    fogDensity: 0.00033,     // our own chunk (trees, skier, props)
+    // AERIAL PERSPECTIVE DENSITY. This is the number that decides whether a
+    // distant ridge is a mountain or a cardboard cutout, so it gets the long
+    // note.
+    //
+    // terrain.js multiplies it by 0.52 and integrates it against a 1500 m scale
+    // height, then does a *straight* mix( surface, hazeColour, f ) with
+    // f = 1 - exp( -sigma * t ). There is no ceiling on f in that file and I
+    // cannot add one, so the only lever on how much surface survives at 3-5 km
+    // is sigma itself.
+    //
+    // At the old 0.00170 the fogged fraction was f(3 km) = 0.85, f(4 km) = 0.92.
+    // Only 8-15% of the ridge's own radiance was left, so its sunlit and shaded
+    // faces landed within 5 display codes of each other: measured with
+    // tools/sky-ap-probe.mjs, the internal luminance variation of the 2.5-6 km
+    // ridges was 3.1% (hero) / 3.4% (closeup). That is a flat shape.
+    //
+    // Physically the old number was never defensible either. Clear winter air at
+    // 2000 m runs 40-100 km meteorological visibility, i.e. sigma ~ 3/60000 =
+    // 5e-5 /m, which puts f(4 km) at 0.18. Even the value below is ~5x thicker
+    // than the real atmosphere — it is an art choice, just no longer one that
+    // erases the geometry. Measured from the hero camera: f(3 km) = 0.38,
+    // f(5 km) = 0.55. Nearly two thirds of the ridge's own light survives at
+    // 3 km, and that is what carries the couloirs and the rock bands.
+    //
+    // The blue shift does NOT come from density. It comes from the haze *colour*
+    // below, which is the sky's own radiance and is already B/R 2.2, so it
+    // survives the reduction intact: the 2.5-6 km ridges measure B/R 1.45
+    // against near snow at 1.03.
+    aerialDensity: 0.00048,
+    // Haze radiance (what a fogged surface converges *to*), its blue tilt, and
+    // the physical ceiling as a fraction of the sky radiance in that direction.
+    // Exposed rather than hard-coded so tools/sky-ap-probe.mjs can sweep them
+    // against the measured skyline without a rebuild.
+    hazeGain: 1.25,
+    hazeTilt: [0.80, 0.88, 1.36],
+    hazeCeiling: 1.00,
     fogHeight: 1150,
     fogRef: 0,
     fogStart: 40,
@@ -1015,16 +1069,33 @@ export function createSky(scene, renderer) {
     uniforms.uZenithTint.value.set(
       mix(1.0, 0.88, day), mix(1.0, 0.93, day), mix(1.02, 1.10, day));
 
-    // luminance-preserving: warm and desaturated at midday, blazing at sunset
+    // Horizon band. Near-luminance-preserving: warm and blazing at sunset, and
+    // by day a PALE BLUE — not a white-out.
+    //
+    // The daytime base used to be (0.99, 1.00, 1.03), i.e. neutral, and Preetham
+    // itself only reaches B/R 1.02-1.13 in the first few degrees, so the low sky
+    // rendered at B/R 1.06: achromatic white. Everything standing in front of it
+    // — the far massif, the treeline, the map-edge plain — was therefore a grey
+    // shape on white paper, which is the cut-out read the AP fix is trying to
+    // get rid of. It is no good giving a ridge its structure back if the thing
+    // behind it is a blank sheet.
+    //
+    // Reference (Bürstegg winter panorama, 2000 m, sampled with ffmpeg):
+    //     sky just above the far ridge   L 173, B/R 1.66
+    //     sky ~3 deg higher              L 152, B/R 1.98
+    //     near sunlit snow               L 216, B/R 1.06
+    // A real alpine horizon is pale, but it is pale BLUE, and it is ~40 display
+    // codes below the snow. The golden-hour deltas are unchanged: at golden == 1
+    // both tints land within 0.01 of the values they had before.
     uniforms.uHorizonTint.value.set(
-      0.99 + golden * 1.42,
-      1.00 + golden * 0.08,
-      1.03 - golden * 0.52);
-    // opposite the sun: neutral by day, Belt-of-Venus pink at dusk
+      0.70 + golden * 1.71,
+      0.94 + golden * 0.14,
+      1.50 - golden * 0.99);
+    // opposite the sun: cool blue by day, Belt-of-Venus pink at dusk
     uniforms.uHorizonTintCool.value.set(
-      0.99 + golden * 0.34,
-      1.00 - golden * 0.06,
-      1.04 + golden * 0.12);
+      0.70 + golden * 0.63,
+      0.94 + golden * 0.00,
+      1.50 - golden * 0.34);
     const azLen = Math.hypot(sunDir.x, sunDir.z) || 1;
     uniforms.uSunAz.value.set(sunDir.x / azLen, sunDir.z / azLen);
 
@@ -1116,7 +1187,22 @@ export function createSky(scene, renderer) {
     // (i.e. slightly warmer than the near snow, which is aerial perspective
     // running backwards) because there was not enough haze in front of it and
     // what there was, was too dark to survive the mix.
-    const HAZE_GAIN = 0.80 * expo;
+    // How BRIGHT the haze is decides something separate from how much of it
+    // there is, and getting the two confused is what made the far peaks read as
+    // slate cut-outs. terrain.js does mix( surface, haze, f ): f controls how
+    // much structure survives, the haze radiance controls what value the
+    // survivors converge on. Reference (Bürstegg winter panorama, sampled with
+    // ffmpeg): a 5 km ridge reads lit L 132 / shaded L 100 against near sunlit
+    // snow at L 216 — the shaded face has *lifted* out of black far more than
+    // the lit face has fallen. Aerial perspective compresses the range from both
+    // ends toward a value nearer sunlit snow than mid grey.
+    // At 0.80 gain the haze measured 0.30 linear against sunlit snow at 1.00, so
+    // every distant sunlit face was dragged *down* ~60 display codes and the
+    // massif went slate blue. Raising it past the ceiling below means the haze
+    // simply sits on the physically correct value — the sky radiance in that
+    // direction — at every time of day, which is what a single-scattering
+    // integral converges to as tau grows.
+    const HAZE_GAIN = params.hazeGain * expo;
     // Aerial perspective is blue, and it has to be blue *enough*: what the eye
     // reads as distance is the B/R of the far ridge, not its luminance. Rayleigh
     // in-scatter over a few km is roughly 1/lambda^4, so the blue channel wins
@@ -1127,7 +1213,12 @@ export function createSky(scene, renderer) {
     // reads as "far away" or as "underwater". Pulling G down relative to R
     // while keeping B up gives Rayleigh's slope without the cyan cast that
     // showed up on every distant massif.
-    const tilt = [0.80, 0.86, 1.40];         // aerial perspective is blue
+    // NB at the default hazeGain the ceiling below binds in all three channels
+    // from roughly 10 deg of sun elevation upward, so by day the tilt is inert
+    // and the haze *is* the sky colour (B/R 2.2). It bites at low sun, where the
+    // ungained horizon radiance falls below the ceiling — check hazeInfo.clamped
+    // before attributing anything to it.
+    const tilt = params.hazeTilt;            // aerial perspective is blue
     const hazeCool = [
       mix(horizonNeutral[0], low[0], 0.30) * HAZE_GAIN * tilt[0],
       mix(horizonNeutral[1], low[1], 0.30) * HAZE_GAIN * tilt[1],
@@ -1154,11 +1245,20 @@ export function createSky(scene, renderer) {
     // whatever the near field wants and the far field stays honest by itself.
     const skyRidge = skyAt(9, Math.PI * 0.5);      // sky just above a far ridge
     const skyRidgeSun = skyAt(9, 0);
+    const CEIL = params.hazeCeiling;
+    hazeInfo.clamped = 0;
     for (let i = 0; i < 3; i++) {
-      hazeCool[i] = Math.min(hazeCool[i], skyRidge[i] * expo * 0.94);
-      hazeWarm[i] = Math.min(hazeWarm[i], skyRidgeSun[i] * expo * 0.94);
-      hazeUp[i] = Math.min(hazeUp[i], mid[i] * expo * 0.94);
+      hazeInfo.coolRaw[i] = hazeCool[i];
+      const lim = skyRidge[i] * expo * CEIL;
+      if (hazeCool[i] > lim) hazeInfo.clamped |= 1 << i;
+      hazeCool[i] = Math.min(hazeCool[i], lim);
+      hazeWarm[i] = Math.min(hazeWarm[i], skyRidgeSun[i] * expo * CEIL);
+      hazeUp[i] = Math.min(hazeUp[i], mid[i] * expo * CEIL);
+      hazeInfo.cool[i] = hazeCool[i];
+      hazeInfo.skyRidge[i] = skyRidge[i] * expo;
     }
+    hazeInfo.coolLum = luminance(hazeCool);
+    hazeInfo.skyRidgeLum = luminance(hazeInfo.skyRidge);
 
     // terrain.js reads this one (display-encoded — see the fog note above) and
     // runs its own direction-independent aerial term off it, so it gets the
@@ -1191,7 +1291,14 @@ export function createSky(scene, renderer) {
     FOG_AP[12] = sunHaze[0];
     FOG_AP[13] = sunHaze[1];
     FOG_AP[14] = sunHaze[2];
-    FOG_AP[15] = 0.975;                // never fully erase distant geometry
+    // Maximum inscatter fraction. This is the cheap, direction-free version of
+    // "never let a distant surface reach 100% haze": at 0.975 a far conifer band
+    // kept 2.5% of its own radiance, which is nothing, and the treelines behind
+    // the piste read as one flat blue stripe. 0.88 leaves 12% — enough that the
+    // silhouette still has internal value structure — and because it is a floor
+    // on transmittance rather than a change to sigma it costs nothing in the
+    // near field, where tau is small and the clamp never binds.
+    FOG_AP[15] = 0.88;                 // never fully erase distant geometry
     FOG_AP[16] = hazeCool[0];
     FOG_AP[17] = hazeCool[1];
     FOG_AP[18] = hazeCool[2];
@@ -1271,6 +1378,10 @@ export function createSky(scene, renderer) {
     material: skyMat,
     uniforms,
     params,
+    hazeInfo,
+
+    /** Re-derive everything from the current params (probe / debug UI hook). */
+    refresh() { apply(); },
 
     /** Give a custom ShaderMaterial the shared aerial-perspective uniforms. */
     registerFogMaterial(material) {

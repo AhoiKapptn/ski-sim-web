@@ -123,6 +123,8 @@ uniform vec3  uRockIron;       // oxide staining
 uniform vec3  uRockLichen;     // crustose lichen
 uniform vec3  uBedding;        // bedding-plane normal, world space
 uniform float uRockAmount;
+uniform float uForestAmount;   // distant canopy albedo, 0 disables
+uniform float uTreeLine;       // metres; must track scatter.js TREELINE
 uniform vec3  uAerialColor;
 uniform vec3  uAerialSun;
 uniform vec3  uSunDirW;
@@ -469,6 +471,18 @@ float snSpecTint = 1.0;
   vec3 bn = snFbm( vec2( bed * 2.4, dot( P.xz, vec2( 0.021, -0.014 ) ) ), 3, 0.5 );
   float strata = sin( bed * 6.2831 + bn.x * 3.4 );
   strata = sign( strata ) * pow( abs( strata ), 0.75 );
+  // A bedding plane cutting a conical peak traces a conic section, so a *fine*
+  // bed spacing seen from four kilometres does not read as strata at all — it
+  // reads as nested ellipses, a wood-grain fingerprint wrapped round the summit.
+  // Real beds are legible at that range because the units you can still resolve
+  // are 80-150 m thick, not 30. So the far field gets its own, ~3.6x coarser
+  // set, derived from the *same* bed coordinate — same planes, thicker units,
+  // and (since the fold term scales with it too) a third of the curl. Both are
+  // static in world space, so the crossfade is pure amplitude and the bands
+  // never crawl across the face as the camera closes in.
+  float strataC = sin( bed * 6.2831 * 0.28 + bn.z * 1.7 );
+  strataC = sign( strataC ) * pow( abs( strataC ), 0.85 );
+  strata = mix( strata, strataC, smoothstep( 700.0, 2100.0, snViewDist ) );
   // Thin laminations inside each bed — visible only close in.
   float lamin = sin( bed * 27.0 + bn.y * 2.0 ) * snFade( 700.0, 140.0, snViewDist );
 
@@ -478,7 +492,11 @@ float snSpecTint = 1.0;
   // not a look; fade the bands out by how steeply the plane cuts the surface.
   vec3 dipT = dipN - Ng * dot( dipN, Ng );
   float cut = smoothstep( 0.20, 0.58, length( dipT ) );
-  float bedAmt = ( 0.25 + 0.75 * unit ) * cut * snFade( 4200.0, 900.0, snViewDist );
+  // Strata are the single most legible thing about a distant limestone face —
+  // the horizontal banding is visible from ten kilometres — so the band runs to
+  // the horizon rather than expiring at 4 km, where it left the far peaks with
+  // no internal structure at all.
+  float bedAmt = ( 0.25 + 0.75 * unit ) * cut * snFade( 13000.0, 1600.0, snViewDist );
   strata *= bedAmt;
   lamin  *= bedAmt;
 
@@ -502,8 +520,29 @@ float snSpecTint = 1.0;
   // Budget matters here: every one of these terms lowers the angle at which the
   // mountain stops being white, and if their swings add up the snowline walks
   // down onto the piste. Nominal 41 deg, and no combination can pull it under 30.
-  float talus = 0.735 + rn.x * 0.105 + rn2.x * 0.095 - expo * 0.28;
-  talus += strk.x * 0.058 * smoothstep( 0.55, 1.05, steep );       // fall-line streaking
+  // Accumulation rises with altitude. Above the mean freezing level snow is dry
+  // and wind-packed, it rimes onto rock, and it never melts out, so it plasters
+  // faces that would be bare bedrock 700 m lower. Leaving this out is what made
+  // every summit in the far field come back as one uniform dark mass: the
+  // thermal-erosion pass in terrain.js relaxes the whole massif to within a few
+  // degrees of the repose angle, so a single altitude-blind threshold tips an
+  // entire range the same way — all rock, or all snow, with no structure left
+  // once aerial perspective has flattened the value range.
+  // The freezing level itself wanders by a couple of hundred metres with aspect
+  // and shelter, or the snowline comes out as a contour line drawn round the
+  // mountain.
+  float snowLine = 640.0 + rn2.x * 210.0 + gu.x * 240.0;
+  float alti = smoothstep( snowLine, snowLine + 780.0, P.y );
+  float talus = 0.735 + rn.x * 0.105 + rn2.x * 0.095 - expo * 0.28 + alti * 0.108;
+  // Fall-line streaking. Held back close in (up there you are looking at a
+  // couple of gullies and it would read as stripes) and opened right up in the
+  // far field, because that is the whole structure of a distant face: snow
+  // hangs in flutes and ribbons *down* the fall line, separated by rock ribs.
+  // A distance-blind weight leaves the far snowline isotropic, and isotropic
+  // snow-on-rock at four kilometres is salt-and-pepper mottle - which is
+  // precisely what separated ours from the reference photography.
+  talus += strk.x * ( 0.058 + 0.085 * smoothstep( 900.0, 2800.0, snViewDist ) )
+         * smoothstep( 0.55, 1.05, steep );
   talus += clamp( curvR, -1.0, 1.0 ) * 0.045;                      // snow wedges into hollows/ledges
   talus += clamp( flow * 1.4 - 0.15, 0.0, 1.0 ) * 0.055;           // gullies fill in
   talus += ( lee - wind ) * 0.045;                                 // windward blows clear, lee loads up
@@ -518,7 +557,13 @@ float snSpecTint = 1.0;
   // Snow lying on rock has a *hard* edge — it is a wedge of drift ending against
   // a slab, not an airbrushed gradient — so the blend is tight up close and only
   // widens far out, where a tight one would alias along the snowline.
-  float rEdge = mix( 0.34, 0.72, smoothstep( 300.0, 2000.0, snViewDist ) );
+  // The far end of this ramp used to be 0.72 — a very wide blend, chosen when
+  // the far-field mask input came off an interpolated 25-100 m triangle and a
+  // tight threshold would have crawled along the tessellation. It does not any
+  // more: terrain.js reconstructs the field per pixel and the finest band
+  // feeding steep is gated to stay above four pixels. A wide blend on a
+  // well-resolved input just dissolves the snowline into grey mush.
+  float rEdge = mix( 0.34, 0.50, smoothstep( 300.0, 2000.0, snViewDist ) );
   snRockMask = smoothstep( -rEdge, rEdge, rockRaw + rLedge * 1.5 ) * uRockAmount;
 
   // --------------------------------------------------------------- snow ----
@@ -773,6 +818,47 @@ float snSpecTint = 1.0;
 
   diffuseColor.rgb = mix( snowAlb, rockAlb, snRockMask );
 
+  // --- distant forest ---------------------------------------------------------
+  // Instanced trees stop at 1.24 km (scatter.js R_FAR), so beyond that every
+  // forested flank in the world was rendering as bare snow. That is most of why
+  // the ranges across the valley came back as one pale mass: on a real range the
+  // band below the treeline is near-black conifer, and the dark skirt under a
+  // white summit is what makes the summit read as a summit. Measured against
+  // alpine reference photography, a massif at 5-10 km spans nearly the full
+  // value range — ours spanned about a fifth of it.
+  //
+  // This is canopy *albedo* only: no geometry, no normals, no shadowing. It
+  // starts where the instanced stands end, so the two never overlap.
+  float fFor = smoothstep( 1250.0, 1850.0, snViewDist ) * uForestAmount;
+  if ( fFor > 0.004 ) {
+    // Same treeline the scatter uses, with the same order of aspect wobble: it
+    // rises on the sunny side and drops on the shaded, and it is ragged.
+    float tLine = uTreeLine + gu.x * 165.0 + rn2.x * 85.0 - Ng.z * 85.0;
+    float below = smoothstep( tLine + 50.0, tLine - 200.0, P.y );
+    // Conifers do not grow on bedrock, and avalanche paths keep the gullies
+    // swept: the stands break into fingers and clearings, which is exactly the
+    // texture a distant forest reads by.
+    float canGrow = smoothstep( 1.08, 0.62, steep ) * ( 1.0 - snRockMask * 0.85 );
+    vec3  fnA = snFbm( P.xz * 0.0085, 3, 0.5 );
+    vec3  fnB = snFbm( P.xz * 0.034, 2, 0.5 );
+    float cover = clamp( 0.62 + fnA.x * 1.8 + fnB.x * 0.85, 0.0, 1.0 );
+    float forest = fFor * below * canGrow * cover;
+    if ( forest > 0.003 ) {
+      // Snow-laden crowns in the open, near-black closed canopy in the stands.
+      // These values look implausibly dark written down and are not: a closed
+      // spruce canopy reflects 4-8% and reads almost black against snow, which
+      // is the whole point — it is the only thing in the frame that can hold the
+      // bottom of the histogram out at four kilometres.
+      vec3 canopy = mix( vec3( 0.018, 0.026, 0.022 ),
+                         vec3( 0.105, 0.128, 0.120 ),
+                         clamp( 0.30 + fnB.x * 1.1, 0.0, 1.0 ) );
+      diffuseColor.rgb = mix( diffuseColor.rgb, canopy, forest * 0.94 );
+      snRockAO = min( snRockAO, mix( 1.0, 0.62, forest ) );
+      snIce *= 1.0 - forest * 0.9;
+      snPowder *= 1.0 - forest * 0.9;
+    }
+  }
+
   // Wind slab vs. soft snow patchiness at ~200 m, so a whole face is never one
   // uniform material.
   float slab = wv.x * 0.5 + 0.5;
@@ -973,12 +1059,16 @@ let _cacheKey = 0;
  * @param {object} opts
  * @param {object} [opts.displacement]  GLSL geometry hook (see buildVertexShader)
  * @param {boolean} [opts.rock=true]
+ * @param {boolean} [opts.forest=true]  painted canopy past the tree instancer
+ * @param {number}  [opts.treeLine=662] metres; must match scatter.js TREELINE
  * @param {object} [opts.uniforms]      extra uniforms merged into the program
  */
 export function createSnowMaterial(opts = {}) {
   const {
     displacement = null,
     rock = true,
+    forest = true,
+    treeLine = 662,
     uniforms: extraUniforms = {},
     ...matOpts
   } = opts;
@@ -1008,6 +1098,10 @@ export function createSnowMaterial(opts = {}) {
     // Real strata dip, and the dip is what tells you the massif was folded.
     uBedding: { value: new THREE.Vector3(0.74, 0.30, -0.60).normalize() },
     uRockAmount: { value: rock ? 1.0 : 0.0 },
+    // Painted canopy for the ground the tree instancer cannot reach. TREELINE is
+    // scatter.js's constant; the two have to agree or a stand ends in mid-air.
+    uForestAmount: { value: forest ? 1.0 : 0.0 },
+    uTreeLine: { value: treeLine },
     uAerialColor: { value: new THREE.Color(0.34, 0.47, 0.70) },
     uAerialSun: { value: new THREE.Color(0.86, 0.84, 0.78) },
     uSunDirW: { value: new THREE.Vector3(-0.5, 0.7, 0.45).normalize() },

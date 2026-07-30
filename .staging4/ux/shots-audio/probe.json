@@ -1,0 +1,347 @@
+{
+  "sampleRate": 48000,
+  "duration": 15.4,
+  "globalPeak": 0.604756,
+  "globalDc": 0,
+  "globalRms": 0.057319,
+  "nonFinite": 0,
+  "segments": [
+    {
+      "seg": "rest",
+      "t": [
+        0.06,
+        1.24
+      ],
+      "rms": 0.000303,
+      "rmsDb": -70.38,
+      "peak": 0.001906,
+      "crest": 6.29,
+      "winRms": 0.000555,
+      "dc": 0,
+      "centroidHz": 998,
+      "width": 1.629,
+      "nonFinite": 0
+    },
+    {
+      "seg": "cruise",
+      "t": [
+        1.36,
+        3.24
+      ],
+      "rms": 0.017831,
+      "rmsDb": -34.98,
+      "peak": 0.106193,
+      "crest": 5.96,
+      "winRms": 0.026244,
+      "dc": 0.000028,
+      "centroidHz": 2054,
+      "width": 1.439,
+      "nonFinite": 0
+    },
+    {
+      "seg": "carve",
+      "t": [
+        3.36,
+        5.84
+      ],
+      "rms": 0.043941,
+      "rmsDb": -27.14,
+      "peak": 0.308897,
+      "crest": 7.03,
+      "winRms": 0.071392,
+      "dc": 0.000015,
+      "centroidHz": 4829,
+      "width": 1.324,
+      "nonFinite": 0
+    },
+    {
+      "seg": "fast",
+      "t": [
+        5.96,
+        7.84
+      ],
+      "rms": 0.061904,
+      "rmsDb": -24.17,
+      "peak": 0.354038,
+      "crest": 5.72,
+      "winRms": 0.075657,
+      "dc": -0.000015,
+      "centroidHz": 3621,
+      "width": 1.59,
+      "nonFinite": 0
+    },
+    {
+      "seg": "tuck",
+      "t": [
+        7.96,
+        10.04
+      ],
+      "rms": 0.084796,
+      "rmsDb": -21.43,
+      "peak": 0.471884,
+      "crest": 5.56,
+      "winRms": 0.105392,
+      "dc": 0,
+      "centroidHz": 4369,
+      "width": 1.599,
+      "nonFinite": 0
+    },
+    {
+      "seg": "air",
+      "t": [
+        10.16,
+        11.14
+      ],
+      "rms": 0.071677,
+      "rmsDb": -22.89,
+      "peak": 0.394504,
+      "crest": 5.5,
+      "winRms": 0.095407,
+      "dc": -0.00021,
+      "centroidHz": 4079,
+      "width": 1.537,
+      "nonFinite": 0
+    },
+    {
+      "seg": "landing",
+      "t": [
+        11.26,
+        12.34
+      ],
+      "rms": 0.069204,
+      "rmsDb": -23.2,
+      "peak": 0.504373,
+      "crest": 7.29,
+      "winRms": 0.213812,
+      "dc": -0.000419,
+      "centroidHz": 4238,
+      "width": 1.273,
+      "nonFinite": 0
+    },
+    {
+      "seg": "stop",
+      "t": [
+        12.46,
+        13.94
+      ],
+      "rms": 0.057758,
+      "rmsDb": -24.77,
+      "peak": 0.505026,
+      "crest": 8.74,
+      "winRms": 0.134083,
+      "dc": 0,
+      "centroidHz": 2962,
+      "width": 0.738,
+      "nonFinite": 0
+    },
+    {
+      "seg": "tail",
+      "t": [
+        14.06,
+        15.34
+      ],
+      "rms": 0.000613,
+      "rmsDb": -64.25,
+      "peak": 0.006442,
+      "crest": 10.5,
+      "winRms": 0.001581,
+      "dc": 0.000003,
+      "centroidHz": 1912,
+      "width": 1.411,
+      "nonFinite": 0
+    },
+    {
+      "seg": "landing:before",
+      "t": [
+        11,
+        11.2
+      ],
+      "rms": 0.071432,
+      "rmsDb": -22.92,
+      "peak": 0.371942,
+      "crest": 5.21,
+      "winRms": 0.086431,
+      "dc": 0.000456,
+      "centroidHz": 3823,
+      "width": 1.622,
+      "nonFinite": 0
+    },
+    {
+      "seg": "landing:transient",
+      "t": [
+        11.2,
+        11.32
+      ],
+      "rms": 0.230509,
+      "rmsDb": -12.75,
+      "peak": 0.604756,
+      "crest": 2.62,
+      "winRms": 0.38165,
+      "dc": 0.000675,
+      "centroidHz": 4156,
+      "width": 0.396,
+      "nonFinite": 0
+    },
+    {
+      "seg": "stop:before",
+      "t": [
+        12.2,
+        12.4
+      ],
+      "rms": 0.060167,
+      "rmsDb": -24.41,
+      "peak": 0.272038,
+      "crest": 4.52,
+      "winRms": 0.067192,
+      "dc": -0.000212,
+      "centroidHz": 4194,
+      "width": 1.458,
+      "nonFinite": 0
+    },
+    {
+      "seg": "stop:transient",
+      "t": [
+        12.4,
+        12.6
+      ],
+      "rms": 0.113492,
+      "rmsDb": -18.9,
+      "peak": 0.505026,
+      "crest": 4.45,
+      "winRms": 0.134083,
+      "dc": 0.000448,
+      "centroidHz": 5008,
+      "width": 1.012,
+      "nonFinite": 0
+    }
+  ],
+  "wind": [
+    {
+      "kmh": 0,
+      "rms": 0.000002,
+      "rmsDb": -115.28,
+      "peak": 0.00001,
+      "centroidHz": 1766
+    },
+    {
+      "kmh": 30,
+      "rms": 0.005162,
+      "rmsDb": -45.74,
+      "peak": 0.02712,
+      "centroidHz": 2270
+    },
+    {
+      "kmh": 60,
+      "rms": 0.024518,
+      "rmsDb": -32.21,
+      "peak": 0.14936,
+      "centroidHz": 3616
+    },
+    {
+      "kmh": 75,
+      "rms": 0.041558,
+      "rmsDb": -27.63,
+      "peak": 0.23528,
+      "centroidHz": 4359
+    },
+    {
+      "kmh": 92,
+      "rms": 0.072734,
+      "rmsDb": -22.77,
+      "peak": 0.34351,
+      "centroidHz": 5155
+    }
+  ],
+  "checks": [
+    {
+      "name": "no clipping, with headroom (global peak < 0.95)",
+      "ok": true,
+      "detail": "peak=0.604756"
+    },
+    {
+      "name": "all samples finite",
+      "ok": true,
+      "detail": "nonFinite=0"
+    },
+    {
+      "name": "no DC offset over the full render (|dc| < 1e-3)",
+      "ok": true,
+      "detail": "globalDc=0 (rms 0.057319)"
+    },
+    {
+      "name": "per-segment DC at least 20 dB below signal",
+      "ok": true,
+      "detail": "max dc/rms=0.0064"
+    },
+    {
+      "name": "rest is near silent (< -50 dB)",
+      "ok": true,
+      "detail": "-70.38 dB"
+    },
+    {
+      "name": "level rises monotonically 30 -> 72 -> 90 km/h",
+      "ok": true,
+      "detail": "cruise -34.98 -> fast -24.17 -> tuck -21.43 dB (+13.5 dB across the real range)"
+    },
+    {
+      "name": "centroid rises monotonically 30 -> 72 -> 90 km/h",
+      "ok": true,
+      "detail": "2054 -> 3621 -> 4369 Hz"
+    },
+    {
+      "name": "level rises rest -> cruise -> carve",
+      "ok": true,
+      "detail": "-70.38 -> -34.98 -> -27.14 dB"
+    },
+    {
+      "name": "carving is the bright voice (centroid above cruise and above a skidded stop)",
+      "ok": true,
+      "detail": "carve 4829 vs cruise 2054 vs stop 2962 Hz"
+    },
+    {
+      "name": "airborne cuts the snow bed and leaves wind (level held, no ski shear)",
+      "ok": true,
+      "detail": "air 4079 Hz @ -22.89 dB vs carve 4829 Hz"
+    },
+    {
+      "name": "landing is a clear onset (>= 2.5x the bed it lands into)",
+      "ok": true,
+      "detail": "+14.6 dB (winRms 0.3816 vs bed rms 0.0714), peak 0.605 vs 0.372"
+    },
+    {
+      "name": "hockey stop is a bright onset",
+      "ok": true,
+      "detail": "+7.0 dB @ 5008 Hz"
+    },
+    {
+      "name": "tail decays back to the floor (no runaway)",
+      "ok": true,
+      "detail": "tail -64.25 dB vs carve -27.14 dB"
+    },
+    {
+      "name": "wind is silent at rest (< -80 dB)",
+      "ok": true,
+      "detail": "-115.28 dB"
+    },
+    {
+      "name": "wind level rises monotonically 30 -> 60 -> 75 -> 92 km/h",
+      "ok": true,
+      "detail": "-45.74 -> -32.21 -> -27.63 -> -22.77 dB"
+    },
+    {
+      "name": "wind roars at 75 km/h (>= 18 dB over a 30 km/h cruise)",
+      "ok": true,
+      "detail": "+18.1 dB"
+    },
+    {
+      "name": "wind brightness rises with speed too (centroid 30 -> 92 at least doubles)",
+      "ok": true,
+      "detail": "2270 -> 3616 -> 4359 -> 5155 Hz"
+    },
+    {
+      "name": "stereo field is non-degenerate",
+      "ok": true,
+      "detail": "max width=1.629"
+    }
+  ]
+}

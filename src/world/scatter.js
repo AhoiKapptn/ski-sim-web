@@ -265,234 +265,672 @@ function canvasToTexture(cv, opts = {}) {
   return tex;
 }
 
-/**
- * Tree atlas, 1024^2.
- *   top half      -> a needle sprig with a woody rachis, alpha cut
- *   bottom left   -> bark
- *   bottom right  -> wind-packed snow
- */
-function makeTreeAtlas() {
-  const S = 1024;
-  const cv = makeCanvas(S, S);
-  const g = cv.getContext('2d');
-  const rnd = mulberry32(0xa17e);
+// =============================================================================
+// Tree atlas — 2048^2, a 4 x 4 grid of 512 px tiles.
+//
+//   row 0   sprig 0..3        needle sprays, alpha frayed on every edge
+//   row 1   sprigSnow 0,1     the same sprays buried under fresh load
+//           blanket           crest strip: opaque core, lips fray to nothing
+//           clump             a discrete pile of snow, frayed all round
+//   row 2   bark 0, bark 1    trunk bark (repeats vertically up the bole)
+//           wood              branch bark
+//           litter            fallen needles and twigs (alpha)
+//   row 3   bark 2, bark 3
+//           dead              bare weathered twigs (alpha)
+//           snow              packed snow, opaque
+//
+// Nothing in the foliage is a rectangle. A branch is covered by eight to
+// fourteen small sprig cards rolled about its own axis, and the silhouette of
+// the crown is the union of their frayed alpha — there is no polygon edge in
+// it anywhere, which is what the old two-plane frond could never manage.
+// =============================================================================
+const AT_S = 2048;
+const AT_T = 512;                       // tile size
 
-  // ---- needle cards, two 512^2 tiles across the top half -------------------
-  // Each card is one *section* of a branch, not a whole branch: a rachis
-  // running left-to-right at v = 0.5, secondary shoots angling forward off it,
-  // and short needles along every shoot. Fronds map three cards end to end, so
-  // needles come out at roughly 10 cm on a mature branch instead of a metre.
-  g.clearRect(0, 0, S, S / 2);
-  g.lineCap = 'round';
-  for (let card = 0; card < 2; card++) {
-    const ox = card * 512;
-    const cy = 256;
-    // rachis — continuous across the card edge so tiles join
-    g.strokeStyle = '#43382b';
-    g.lineWidth = 6.5;
-    g.beginPath();
-    g.moveTo(ox, cy);
-    g.lineTo(ox + 512, cy);
-    g.stroke();
-
-    const shoots = [];
-    for (let x = -18; x < 512 + 18; x += 13 + rnd() * 9) {
-      for (const side of [-1, 1]) {
-        if (rnd() < 0.10) continue;
-        const env = 0.55 + 0.45 * Math.sin(Math.PI * clamp(x / 512, 0, 1));
-        shoots.push({
-          x: ox + x,
-          side,
-          len: (96 + rnd() * 118) * env,
-          ang: side * (0.55 + rnd() * 0.52),
-          sweep: 0.55 + rnd() * 0.4,
-        });
-      }
-    }
-
-    for (const sh of shoots) {
-      const ex = sh.x + Math.cos(sh.ang) * sh.len * sh.sweep;
-      const ey = 256 + Math.sin(sh.ang) * sh.len;
-      // the woody shoot
-      g.strokeStyle = '#3a3226';
-      g.lineWidth = 2.2;
-      g.globalAlpha = 0.9;
-      g.beginPath();
-      g.moveTo(sh.x, 256);
-      g.lineTo(ex, ey);
-      g.stroke();
-
-      const nN = 26;
-      for (let i = 0; i < nN; i++) {
-        const t = (i + 0.5) / nN;
-        const px = sh.x + (ex - sh.x) * t;
-        const py = 256 + (ey - 256) * t;
-        const taper = 0.55 + 0.6 * Math.sin(Math.PI * t);
-        for (const s2 of [-1, 1]) {
-          const nl = (13 + rnd() * 15) * taper;
-          const na = sh.ang + s2 * (0.62 + rnd() * 0.55);
-          // A frosted stand reads LIGHT at every distance. Roughly a third of
-          // the needles carry rime, and the bare ones are desaturated olive-
-          // charcoal rather than the saturated mid-green of a summer spruce.
-          const frost = rnd() < 0.34;
-          if (frost) {
-            g.strokeStyle = `hsl(${200 + rnd() * 18}, ${8 + rnd() * 10}%, ${78 + rnd() * 20}%)`;
-            g.globalAlpha = 0.7 + rnd() * 0.3;
-            g.lineWidth = 3.6 + rnd() * 2.4;
-          } else {
-            const hue = 96 + rnd() * 40;
-            const sat = 9 + rnd() * 15;
-            const li = 19 + rnd() * 16;
-            g.strokeStyle = `hsl(${hue}, ${sat}%, ${li}%)`;
-            g.globalAlpha = 1;
-            g.lineWidth = 2.6 + rnd() * 1.9;
-          }
-          g.beginPath();
-          g.moveTo(px, py);
-          g.lineTo(px + Math.cos(na) * nl * 0.8, py + Math.sin(na) * nl);
-          g.stroke();
-        }
-      }
-    }
-    // a scatter of needles straight off the rachis, to close the centre line
-    for (let i = 0; i < 700; i++) {
-      const px = ox + rnd() * 512;
-      const s2 = rnd() < 0.5 ? -1 : 1;
-      const nl = 14 + rnd() * 20;
-      const na = s2 * (0.5 + rnd() * 0.75);
-      g.strokeStyle = `hsl(${96 + rnd() * 40}, ${10 + rnd() * 14}%, ${18 + rnd() * 15}%)`;
-      g.globalAlpha = 1;
-      g.lineWidth = 2.6 + rnd() * 1.6;
-      g.beginPath();
-      g.moveTo(px, 256 + (rnd() - 0.5) * 8);
-      g.lineTo(px + Math.cos(na) * nl * 0.9, 256 + Math.sin(na) * nl);
-      g.stroke();
-    }
-
-    // Snow caught IN the needle mass, not just riding on top of it. Soft
-    // clumps with a rolled bright top and a blue underside, so the foliage
-    // itself carries the load instead of hiding under a separate white slab.
-    for (let i = 0; i < 420; i++) {
-      const px = ox + rnd() * 512;
-      const py = 256 + (rnd() - 0.5) * 190;
-      // small and elongated along the shoot: large round blobs read as polka
-      // dots once the card is a metre across on a near tree
-      const r = 4 + rnd() * 13;
-      const ry = r * (0.26 + rnd() * 0.3);
-      g.globalAlpha = 0.35 + rnd() * 0.5;
-      g.fillStyle = `hsl(${205 + rnd() * 14}, ${5 + rnd() * 9}%, ${72 + rnd() * 8}%)`;
-      g.beginPath();
-      g.ellipse(px, py + ry * 0.5, r, ry, (rnd() - 0.5) * 0.5, 0, 7);
-      g.fill();
-      g.globalAlpha = 0.55 + rnd() * 0.45;
-      g.fillStyle = rnd() < 0.7 ? '#ffffff' : '#e9f0fb';
-      g.beginPath();
-      g.ellipse(px, py - ry * 0.28, r * 0.86, ry * 0.72, (rnd() - 0.5) * 0.5, 0, 7);
-      g.fill();
-    }
-  }
-  g.globalAlpha = 1;
-
-  // ---- bark (0,512)-(512,1024) --------------------------------------------
-  // The trunk maps this tile once over ~2.5 m of circumference and ~22 m of
-  // height, i.e. stretched about 10:1 vertically. So the plates are drawn ten
-  // times shorter than they should look — they come out square on the tree.
-  const bx = 0, by = S / 2, bw = S / 2, bh = S / 2;
-  g.fillStyle = '#6a5947';
-  g.fillRect(bx, by, bw, bh);
-  for (let i = 0; i < 13000; i++) {
-    const x = bx + rnd() * bw;
-    const y = by + rnd() * bh;
-    const h = 2 + rnd() * 9;
-    const w = 2 + rnd() * 9;
-    const v = rnd();
-    const l = v < 0.42 ? 12 + rnd() * 16 : 40 + rnd() * 42;
-    g.fillStyle = `hsl(${18 + rnd() * 26}, ${8 + rnd() * 20}%, ${l}%)`;
-    g.globalAlpha = 0.35 + rnd() * 0.55;
-    g.fillRect(x, y, w, h);
-  }
-  // fissures running with the grain
-  for (let i = 0; i < 900; i++) {
-    const x = bx + rnd() * bw;
-    const y = by + rnd() * bh;
-    // fissures, not ink: near-black at high alpha turned the bole into a
-    // railway sleeper once the tile was stretched 10:1 up the trunk
-    g.strokeStyle = `hsl(${20 + rnd() * 14}, 14%, ${13 + rnd() * 12}%)`;
-    g.globalAlpha = 0.22 + rnd() * 0.34;
-    g.lineWidth = 1 + rnd() * 2.2;
-    g.beginPath();
-    g.moveTo(x, y);
-    g.lineTo(x + (rnd() - 0.5) * 5, y + 5 + rnd() * 22);
-    g.stroke();
-  }
-  // lichen, and a dusting of snow caught in the bark
-  for (let i = 0; i < 700; i++) {
-    const pale = rnd() < 0.5;
-    g.fillStyle = pale
-      ? `hsl(${190 + rnd() * 30}, 14%, ${70 + rnd() * 26}%)`
-      : `hsl(${70 + rnd() * 40}, 16%, ${34 + rnd() * 22}%)`;
-    g.globalAlpha = 0.10 + rnd() * 0.30;
-    g.beginPath();
-    g.ellipse(bx + rnd() * bw, by + rnd() * bh, 2 + rnd() * 9, 1 + rnd() * 4, rnd() * 3, 0, 7);
-    g.fill();
-  }
-  g.globalAlpha = 1;
-
-  // ---- snow (512,512)-(1024,1024) -----------------------------------------
-  const sx = S / 2, sy = S / 2, sw = S / 2, sh = S / 2;
-  g.fillStyle = '#f4f7fd';
-  g.fillRect(sx, sy, sw, sh);
-  for (let i = 0; i < 1500; i++) {
-    const r = 6 + rnd() * 46;
-    g.fillStyle = rnd() < 0.5 ? '#ffffff' : '#dfe7f4';
-    g.globalAlpha = 0.10 + rnd() * 0.24;
-    g.beginPath();
-    g.ellipse(sx + rnd() * sw, sy + rnd() * sh, r, r * (0.4 + rnd() * 0.6), rnd() * 3, 0, 7);
-    g.fill();
-  }
-  // sparkle
-  for (let i = 0; i < 900; i++) {
-    g.fillStyle = '#ffffff';
-    g.globalAlpha = 0.25 + rnd() * 0.6;
-    g.fillRect(sx + rnd() * sw, sy + rnd() * sh, 1.5 + rnd() * 2, 1.5 + rnd() * 2);
-  }
-  g.globalAlpha = 1;
-
-  // Scalloped drip edges. The branch snow ridge maps its two outer columns
-  // into these bands, so the ridge silhouette breaks up per texel instead of
-  // ending on a clean polygon boundary — that is the difference between a
-  // drift and a cardboard shim.
-  g.globalCompositeOperation = 'destination-out';
-  // v = 0.02 sits at canvas y ~1004, v = 0.48 at ~532 (rows are flipped on
-  // upload), so the two ridge lips land in these bands.
-  for (const band of [[1008, -1], [528, 1]]) {
-    const dir = band[1];
-    for (let i = 0; i < 1600; i++) {
-      const x = sx + rnd() * sw;
-      const t = Math.pow(rnd(), 0.7);
-      const y = band[0] + dir * t * 30;
-      g.globalAlpha = 0.35 + 0.65 * t;
-      g.beginPath();
-      g.ellipse(x, y, 4 + rnd() * 13, 3 + rnd() * 9, rnd() * 3, 0, 7);
-      g.fill();
-    }
-  }
-  g.globalCompositeOperation = 'source-over';
-  g.globalAlpha = 1;
-
-  return canvasToTexture(cv, { bleed: 3 });
+/** Tapered needle as a triangle — round caps read as bristles, not needles. */
+function needleTri(g, x, y, ang, len, w) {
+  const dx = Math.cos(ang), dy = Math.sin(ang);
+  const px = -dy * w * 0.5, py = dx * w * 0.5;
+  g.beginPath();
+  g.moveTo(x + px, y + py);
+  g.lineTo(x - px, y - py);
+  g.lineTo(x + dx * len, y + dy * len);
+  g.closePath();
+  g.fill();
 }
 
 /**
- * Paint one snow-laden conifer into a canvas, stroke by stroke.
+ * One sprig tile: a short length of shoot with its needles running left to
+ * right, foliage both sides, tapering to a frayed tip.
  *
- * `cx, baseY` is the foot of the trunk in canvas pixels, `hpx` the height and
- * `hwpx` the half width of the widest whorl. Snow is drawn AFTER the needles at
- * high alpha and generous width, then dilated when the texture is uploaded, so
- * a frosted stand still reads white four mip levels down. That is the whole
- * point of this function: the previous version painted 2-3 px snow strokes over
- * a dense dark needle mass and the mip chain ate them, which is why the distant
- * forest measured rgb(105,120,137) against a reference stand's rgb(166,171,177).
+ * `bundles` gives pines their radiating tufts instead of a flat comb; `gap`
+ * is how often a shoot is simply missing, which is most of the raggedness.
+ */
+function paintSprig(g, rnd, ox, oy, cfg) {
+  const S = AT_T, cy = oy + S * 0.5;
+  g.save();
+  g.beginPath(); g.rect(ox, oy, S, S); g.clip();
+
+  // silhouette envelope: rises off the attachment, wobbles, tapers to the tip
+  const env = (x, side) => {
+    const s = x / S;
+    const along = smoothstep(-0.02, 0.22, s) * (1 - 0.86 * smoothstep(0.55, 1.02, s));
+    const rough = 0.40 + 0.82 * fbm2(x * 0.017 + side * 29.3 + cfg.seed, cfg.seed * 2.9, 3);
+    return clamp(along * rough, 0, 1);
+  };
+  const wav = (x) => cy + 11 * Math.sin((x - ox) * 0.0085 + cfg.seed) * (x - ox) / S;
+
+  // ---- shoot --------------------------------------------------------------
+  g.globalAlpha = 1;
+  g.strokeStyle = '#3b3225';
+  g.lineCap = 'round';
+  g.beginPath();
+  g.moveTo(ox, wav(ox));
+  for (let x = 0; x <= S; x += 24) {
+    g.lineWidth = 7 * (1 - 0.8 * x / S);
+    g.lineTo(ox + x, wav(ox + x));
+    g.stroke();
+    g.beginPath();
+    g.moveTo(ox + x, wav(ox + x));
+  }
+
+  const shoots = [];
+  for (let x = 6; x < S + 12; x += cfg.step * (0.45 + 0.7 * rnd())) {
+    for (const sideS of [-1, 1]) {
+      if (rnd() < cfg.gap) continue;
+      const e = env(x, sideS);
+      if (e < 0.05) continue;
+      const acr = cfg.reach * e * (0.28 + 0.72 * Math.pow(rnd(), 1.1));
+      if (acr < 7) continue;
+      shoots.push({ x: ox + x, side: sideS, acr, sweep: 0.7 + 1.7 * rnd(), d: rnd() });
+    }
+  }
+  shoots.sort((a, b) => a.d - b.d);
+
+  const needleCol = () => {
+    const q = rnd();
+    if (q < cfg.frost) {
+      // rime, not paint: pale sage rather than white. Bright white needles at
+      // any real frequency are what read as speckle from thirty metres.
+      g.globalAlpha = 0.6 + 0.35 * rnd();
+      return `hsl(${140 + rnd() * 50}, ${6 + rnd() * 8}%, ${52 + rnd() * 18}%)`;
+    }
+    if (q < cfg.frost + cfg.dead) {
+      g.globalAlpha = 0.88;
+      return `hsl(${26 + rnd() * 20}, ${14 + rnd() * 16}%, ${22 + rnd() * 14}%)`;
+    }
+    g.globalAlpha = 0.84 + 0.16 * rnd();
+    return `hsl(${cfg.hue + rnd() * cfg.hueSpan}, ${cfg.sat + rnd() * 13}%, ${cfg.li + rnd() * cfg.liSpan}%)`;
+  };
+
+  for (const sh of shoots) {
+    const x0 = sh.x, y0 = wav(sh.x);
+    const ex = x0 + sh.acr * sh.sweep;
+    const ey = y0 + sh.side * sh.acr;
+    const ang = Math.atan2(ey - y0, ex - x0);
+    const L = Math.hypot(ex - x0, ey - y0);
+    g.globalAlpha = 0.9;
+    g.strokeStyle = '#38301f';
+    g.lineWidth = 1.2 + 1.6 * (sh.acr / cfg.reach);
+    g.beginPath(); g.moveTo(x0, y0); g.lineTo(ex, ey); g.stroke();
+
+    if (cfg.bundles) {
+      // pine: bundles of long needles at intervals, radiating like a brush
+      const nB = Math.max(2, Math.round(L / (cfg.nlen * 0.8)));
+      for (let i = 0; i < nB; i++) {
+        const t = (i + 0.4) / nB;
+        const px = x0 + (ex - x0) * t, py = y0 + (ey - y0) * t;
+        const nf = 5 + Math.floor(rnd() * 4);
+        for (let k = 0; k < nf; k++) {
+          const na = ang + (k / nf - 0.5) * 2.0 + (rnd() - 0.5) * 0.35;
+          g.fillStyle = needleCol();
+          needleTri(g, px, py, na, cfg.nlen * (0.6 + 0.75 * rnd()), 2.0 + rnd() * 1.5);
+        }
+      }
+    } else {
+      const nN = Math.max(3, Math.round(L / cfg.nspace));
+      for (let i = 0; i < nN; i++) {
+        const t = (i + 0.3) / nN;
+        const px = x0 + (ex - x0) * t, py = y0 + (ey - y0) * t;
+        const taper = 0.42 + 0.68 * Math.sin(Math.PI * Math.pow(t, 0.7));
+        const ranks = t > 0.7 ? 4 : 3;
+        for (let r2 = 0; r2 < ranks; r2++) {
+          const s2 = r2 >= 2 ? (r2 === 2 ? 0 : 0.4) : (r2 ? 1 : -1);
+          const na = ang + s2 * (0.5 + 0.6 * rnd()) + (rnd() - 0.5) * 0.25;
+          g.fillStyle = needleCol();
+          needleTri(g, px, py, na, cfg.nlen * taper * (0.55 + 0.85 * rnd()), 2.2 + rnd() * 1.6);
+        }
+      }
+    }
+    // terminal bud fan — the frayed outer edge of the spray
+    const nf = 4 + Math.floor(rnd() * 4);
+    for (let i = 0; i < nf; i++) {
+      const na = ang + (i / nf - 0.5) * 1.6 + (rnd() - 0.5) * 0.3;
+      g.fillStyle = needleCol();
+      needleTri(g, ex, ey, na, cfg.nlen * (0.5 + 0.7 * rnd()), 2.0 + rnd() * 1.3);
+    }
+  }
+
+  // ---- fray: isolated tips just past the silhouette, so the alpha cut lands
+  // on broken speckle rather than on a clean contour ------------------------
+  for (let i = 0; i < 2600; i++) {
+    const x = ox + rnd() * S;
+    const sideS = rnd() < 0.5 ? -1 : 1;
+    const e = env(x - ox, sideS);
+    if (e < 0.04) continue;
+    const y = wav(x) + sideS * cfg.reach * e * (0.30 + 0.82 * rnd());
+    const na = rnd() * Math.PI * 2;
+    g.fillStyle = needleCol();
+    g.globalAlpha *= 0.75;
+    needleTri(g, x, y, na, cfg.nlen * (0.3 + 0.6 * rnd()), 1.6 + rnd() * 1.2);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+/**
+ * Fill the region between two rough curves with a top-lit snow gradient.
+ *
+ * This is the whole trick for making load read as *snow* rather than as white
+ * paint: real accumulated snow presents a crisp, granular top edge with a soft
+ * vertical falloff into blue shadow underneath, and a ragged bottom edge where
+ * the foliage it sits on breaks through. Clusters of soft ellipses — the
+ * obvious way to do it — always come out as cumulus cloud.
+ */
+function snowFill(g, xs, top, bot, bright) {
+  let y0 = 1e9, y1 = -1e9;
+  for (let i = 0; i < xs.length; i++) { if (top[i] < y0) y0 = top[i]; if (bot[i] > y1) y1 = bot[i]; }
+  if (y1 - y0 < 2) return;
+  const grd = g.createLinearGradient(0, y0, 0, y1);
+  // Mostly white. The lighting supplies the shading; a texture that is already
+  // mid-grey comes out as a dead grey shard once the sun is on it.
+  grd.addColorStop(0.00, `hsl(206, 30%, ${clamp(99 * bright, 0, 100)}%)`);
+  grd.addColorStop(0.40, `hsl(206, 18%, ${clamp(95 * bright, 0, 100)}%)`);
+  grd.addColorStop(0.76, `hsl(210, 16%, ${clamp(84 * bright, 0, 100)}%)`);
+  grd.addColorStop(1.00, `hsl(216, 20%, ${clamp(64 * bright, 0, 100)}%)`);
+  g.globalAlpha = 1;
+  g.fillStyle = grd;
+  g.beginPath();
+  g.moveTo(xs[0], top[0]);
+  for (let i = 1; i < xs.length; i++) g.lineTo(xs[i], top[i]);
+  for (let i = xs.length - 1; i >= 0; i--) g.lineTo(xs[i], bot[i]);
+  g.closePath();
+  g.fill();
+}
+
+/** Granular sparkle and rolled crown along a snow top edge. */
+function snowCrown(g, rnd, xs, top, hh) {
+  for (let i = 0; i < xs.length; i++) {
+    if (rnd() < 0.55) {
+      g.globalAlpha = 0.30 + rnd() * 0.55;
+      g.fillStyle = '#ffffff';
+      g.beginPath();
+      g.ellipse(xs[i] + (rnd() - 0.5) * 6, top[i] + hh * (0.04 + 0.12 * rnd()),
+        2.5 + rnd() * 7, 1.6 + rnd() * 3.4, (rnd() - 0.5) * 0.7, 0, 7);
+      g.fill();
+    }
+    if (rnd() < 0.22) {
+      g.globalAlpha = 0.5 + rnd() * 0.5;
+      g.fillStyle = '#ffffff';
+      g.fillRect(xs[i], top[i] + rnd() * hh * 0.4, 1.3 + rnd() * 1.8, 1.3 + rnd() * 1.8);
+    }
+  }
+  g.globalAlpha = 1;
+}
+
+/** Wind-packed granularity across a snow body, so it is never a flat ramp. */
+function snowGrain(g, rnd, xs, top, bot, amount) {
+  const n = Math.round(xs.length * 14 * amount);
+  for (let i = 0; i < n; i++) {
+    const k = (rnd() * xs.length) | 0;
+    const t = rnd();
+    const y = top[k] + (bot[k] - top[k]) * t;
+    g.globalAlpha = 0.06 + rnd() * 0.16;
+    g.fillStyle = rnd() < 0.5 ? '#ffffff' : `hsl(${212 + rnd() * 10}, 20%, ${50 + rnd() * 22}%)`;
+    g.beginPath();
+    g.ellipse(xs[k] + (rnd() - 0.5) * 10, y, 3 + rnd() * 14, 2 + rnd() * 6,
+      (rnd() - 0.5) * 0.8, 0, 7);
+    g.fill();
+  }
+  g.globalAlpha = 1;
+}
+
+/**
+ * One mound of load riding a shoot. The crown is a fractal-perturbed arc and
+ * the underside is bitten away in places, so needles come through the snow.
+ */
+function snowLobe(g, rnd, cx, baseY, hw, hh, bright) {
+  const n = Math.max(8, Math.round(hw / 3));
+  const xs = [], top = [], bot = [];
+  const ph = rnd() * 30;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const dx = (t * 2 - 1);
+    const x = cx + dx * hw;
+    // a flat-topped mound, not a semicircle: snow slumps
+    const mound = Math.pow(Math.max(0, 1 - dx * dx), 0.42);
+    const rough = 0.70 + 0.44 * fbm2(t * 13.7 + ph, ph * 0.7, 3);
+    xs.push(x);
+    top.push(baseY - hh * mound * rough);
+    bot.push(baseY + hh * 0.42 * mound * (0.25 + 0.85 * fbm2(t * 5.1 - ph, ph * 1.9, 2)));
+  }
+  snowFill(g, xs, top, bot, bright);
+  snowGrain(g, rnd, xs, top, bot, 0.55);
+  snowCrown(g, rnd, xs, top, hh);
+  // bite the underside so foliage shows through the load
+  g.globalCompositeOperation = 'destination-out';
+  for (let i = 0; i < Math.round(hw * 0.30); i++) {
+    const t = rnd();
+    const x = cx + (t * 2 - 1) * hw;
+    const mound = Math.pow(Math.max(0, 1 - (t * 2 - 1) ** 2), 0.42);
+    g.globalAlpha = 0.5 + 0.5 * rnd();
+    g.beginPath();
+    g.ellipse(x, baseY + hh * 0.34 * mound + rnd() * hh * 0.2,
+      3 + rnd() * 12, 2 + rnd() * 8, (rnd() - 0.5) * 0.8, 0, 7);
+    g.fill();
+  }
+  g.globalCompositeOperation = 'source-over';
+  g.globalAlpha = 1;
+}
+
+/**
+ * A sprig with load on it: the needle spray painted first, then a row of
+ * discrete mounds riding the shoot with needles showing between them. A loaded
+ * tree is mostly these cards, rolled flat so their faces point up — which is
+ * how the crown ends up carrying accumulated snow rather than white speckle.
+ */
+function paintSprigSnow(g, rnd, ox, oy, cfg) {
+  paintSprig(g, rnd, ox, oy, cfg);
+  const S = AT_T, cy = oy + S * 0.5;
+  g.save();
+  g.beginPath(); g.rect(ox + 5, oy + 5, S - 10, S - 10); g.clip();
+
+  const env = (x) => {
+    const s = (x - ox) / S;
+    const along = smoothstep(-0.02, 0.24, s) * (1 - 1.0 * smoothstep(0.48, 1.0, s));
+    return clamp(along * (0.44 + 0.80 * fbm2(s * 4.3 + 7.1, cfg.seed * 5.1, 3)), 0, 1);
+  };
+  const nL = 4 + Math.floor(rnd() * 3);
+  for (let i = 0; i < nL; i++) {
+    const t = (i + 0.2 + rnd() * 0.6) / nL;
+    const x = ox + S * (0.20 + 0.62 * t);
+    const e = env(x);
+    if (e < 0.14) continue;
+    // keep every mound clear of the tile border, or the clip rectangle puts a
+    // straight cut through the load and the card reads as a white shard
+    const hw = Math.min(cfg.reach * e * (0.34 + 0.32 * rnd()),
+      Math.min(x - ox, ox + S - x) - 12);
+    if (hw < 12) continue;
+    const hh = hw * (0.42 + 0.26 * rnd());
+    snowLobe(g, rnd, x, cy + (rnd() - 0.5) * 12, hw, hh, 1.0);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+/**
+ * Crest blanket: a band of load with both edges frayed to nothing, brightest
+ * along the crest at v = 0.5 and falling into blue shadow at the lips. The
+ * branch load strip maps this across its width, so the *texture* decides where
+ * the snow ends and the geometry never shows a straight lip.
+ */
+function paintBlanket(g, rnd, ox, oy) {
+  const S = AT_T, cy = oy + S * 0.5;
+  g.save();
+  g.beginPath(); g.rect(ox, oy, S, S); g.clip();
+  const n = 170;
+  const xs = [], top = [], bot = [];
+  // dies away at both ends of the tile, because the strip maps it once end to
+  // end down a branch: the load has to run out where the branch does
+  const half = (u) => S * 0.30 * clamp(
+    1.45 * fbm2(u * 3.9 + 11.7, 5.3, 3) * (0.30 + 0.98 * fbm2(u * 13.1 - 4.1, 21.9, 2)) - 0.10,
+    0, 1) * smoothstep(0, 0.09, u) * smoothstep(1, 0.90, u);
+  for (let i = 0; i <= n; i++) {
+    const u = i / n;
+    const h = half(u);
+    xs.push(ox + u * S);
+    // high-frequency, low-amplitude perturbation: a granular lip, not a spike
+    top.push(cy - h * (0.86 + 0.26 * fbm2(u * 47.3, 3.7, 2)));
+    bot.push(cy + h * (0.80 + 0.34 * fbm2(u * 39.9 + 5.1, 9.3, 2)));
+  }
+  snowFill(g, xs, top, bot, 1.0);
+  snowGrain(g, rnd, xs, top, bot, 0.7);
+  snowCrown(g, rnd, xs, top, S * 0.06);
+  // break the band outright in a few places
+  g.globalCompositeOperation = 'destination-out';
+  for (let i = 0; i <= n; i++) {
+    if (half(i / n) > S * 0.06) continue;
+    g.globalAlpha = 1;
+    g.fillRect(xs[i] - 3, oy, 8, S);
+  }
+  g.globalCompositeOperation = 'source-over';
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+/** A discrete pile of snow: broken outline, rolled bright top, blue base. */
+function paintClump(g, rnd, ox, oy) {
+  const S = AT_T, cx = ox + S * 0.5, cy = oy + S * 0.5;
+  g.save();
+  g.beginPath(); g.rect(ox + 5, oy + 5, S - 10, S - 10); g.clip();
+  snowLobe(g, rnd, cx, cy + S * 0.13, S * 0.36, S * 0.28, 1.0);
+  snowLobe(g, rnd, cx - S * 0.24, cy + S * 0.17, S * 0.16, S * 0.15, 0.94);
+  snowLobe(g, rnd, cx + S * 0.25, cy + S * 0.16, S * 0.15, S * 0.14, 1.02);
+  snowLobe(g, rnd, cx - S * 0.06, cy - S * 0.06, S * 0.17, S * 0.13, 1.03);
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+/**
+ * Trunk bark, painted into the colour atlas and a matching height canvas at
+ * the same time, so the normal map carries exactly the fissures the albedo
+ * shows. The tile wraps once around a ~1.3 m bole and repeats every ~2 m up
+ * it — about 1.6:1 anisotropy, which `KY` compensates for.
+ */
+function paintBark(gC, gH, ox, oy, kind, rnd) {
+  const S = AT_T;
+  const KY = 0.65;
+  const P = [
+    { h: 24, s: 14, l: 32, fis: 1.0, pw: 0.16, ph: 0.34, lich: 0.5 },   // 0 spruce, scaly
+    { h: 32, s: 9, l: 48, fis: 0.5, pw: 0.30, ph: 0.20, lich: 0.9 },    // 1 fir, smooth pale
+    { h: 18, s: 24, l: 34, fis: 1.5, pw: 0.22, ph: 0.55, lich: 0.3 },   // 2 pine, deep plates
+    { h: 28, s: 5, l: 46, fis: 1.2, pw: 0.20, ph: 0.45, lich: 0.2 },    // 3 silvered snag
+  ][kind];
+
+  gC.save(); gC.beginPath(); gC.rect(ox, oy, S, S); gC.clip();
+  gH.save(); gH.beginPath(); gH.rect(ox, oy, S, S); gH.clip();
+  gC.fillStyle = `hsl(${P.h}, ${P.s}%, ${P.l * 0.8}%)`; gC.fillRect(ox, oy, S, S);
+  gH.fillStyle = '#6a6a6a'; gH.fillRect(ox, oy, S, S);
+
+  // ---- plates -------------------------------------------------------------
+  for (let i = 0; i < 1500; i++) {
+    const x = ox + rnd() * S, y = oy + rnd() * S;
+    const w = (0.3 + rnd()) * P.pw * S * 0.5;
+    const h = (0.3 + rnd()) * P.ph * S * 0.5 * KY;
+    const l = P.l * (0.5 + rnd() * 1.15);
+    gC.globalAlpha = 0.4 + rnd() * 0.5;
+    gC.fillStyle = `hsl(${P.h + (rnd() - 0.5) * 14}, ${P.s * (0.5 + rnd())}%, ${l}%)`;
+    gC.beginPath(); gC.ellipse(x, y, w * 0.5, h * 0.5, (rnd() - 0.5) * 0.2, 0, 7); gC.fill();
+    gH.globalAlpha = 0.3 + rnd() * 0.4;
+    const hv = Math.round(120 + rnd() * 110);
+    gH.fillStyle = `rgb(${hv},${hv},${hv})`;
+    gH.beginPath(); gH.ellipse(x, y, w * 0.42, h * 0.42, 0, 0, 7); gH.fill();
+  }
+
+  // ---- vertical fissures --------------------------------------------------
+  const nF = Math.round(150 * P.fis);
+  for (let i = 0; i < nF; i++) {
+    const x0 = ox + rnd() * S;
+    const y0 = oy - S * 0.2 + rnd() * S * 1.2;
+    // short and broken. Full-height fissures read as vertical worms once the
+    // tile is repeated up a bole; real bark splits into finger-length plates.
+    const len = (0.10 + rnd() * 0.34) * S * KY;
+    const wid = (0.008 + rnd() * 0.026) * S * P.fis;
+    const segs = 8;
+    const pts = [];
+    for (let k = 0; k <= segs; k++) {
+      const t = k / segs;
+      pts.push([x0 + (vnoise2(i * 3.1 + t * 3.3, i * 1.7) - 0.5) * 0.09 * S, y0 + t * len]);
+    }
+    const stroke = (ctx, style, w2, dx) => {
+      ctx.strokeStyle = style; ctx.lineWidth = w2;
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(pts[0][0] + dx, pts[0][1]);
+      for (const p of pts) ctx.lineTo(p[0] + dx, p[1]);
+      ctx.stroke();
+    };
+    gC.globalAlpha = 0.5 + rnd() * 0.4;
+    stroke(gC, `hsl(${P.h}, ${P.s + 4}%, ${P.l * 0.30 + rnd() * 6}%)`, wid, 0);
+    gC.globalAlpha = 0.22 + rnd() * 0.26;
+    stroke(gC, `hsl(${P.h + 6}, ${P.s * 0.7}%, ${P.l * 1.5 + rnd() * 14}%)`, wid * 0.45, wid * 0.85);
+    gH.globalAlpha = 0.85;
+    stroke(gH, `rgb(${Math.round(10 + rnd() * 30)},0,0)`, wid, 0);
+  }
+
+  // ---- cross-cracks between plates ---------------------------------------
+  for (let i = 0; i < Math.round(90 * P.fis); i++) {
+    const x = ox + rnd() * S, y = oy + rnd() * S;
+    const w = (0.03 + rnd() * 0.10) * S;
+    gC.globalAlpha = 0.28 + rnd() * 0.3;
+    gC.strokeStyle = `hsl(${P.h}, ${P.s}%, ${P.l * 0.34}%)`;
+    gC.lineWidth = 1.5 + rnd() * 3;
+    gC.beginPath(); gC.moveTo(x, y);
+    gC.lineTo(x + w, y + (rnd() - 0.5) * 8);
+    gC.stroke();
+    gH.globalAlpha = 0.6;
+    gH.strokeStyle = 'rgb(30,0,0)';
+    gH.lineWidth = 1.5 + rnd() * 3;
+    gH.beginPath(); gH.moveTo(x, y); gH.lineTo(x + w, y + (rnd() - 0.5) * 8); gH.stroke();
+  }
+
+  // ---- fine grain ---------------------------------------------------------
+  for (let i = 0; i < 7000; i++) {
+    const x = ox + rnd() * S, y = oy + rnd() * S;
+    gC.globalAlpha = 0.08 + rnd() * 0.26;
+    gC.fillStyle = rnd() < 0.5
+      ? `hsl(${P.h}, ${P.s}%, ${P.l * 0.45}%)`
+      : `hsl(${P.h + 6}, ${P.s * 0.6}%, ${P.l * 1.6}%)`;
+    gC.fillRect(x, y, 1 + rnd() * 3, (3 + rnd() * 14) * KY);
+  }
+  // ---- lichen and snow caught in the fissures -----------------------------
+  for (let i = 0; i < Math.round(420 * P.lich); i++) {
+    const pale = rnd() < 0.45;
+    gC.fillStyle = pale
+      ? `hsl(${194 + rnd() * 26}, 11%, ${76 + rnd() * 20}%)`
+      : `hsl(${74 + rnd() * 40}, 16%, ${38 + rnd() * 20}%)`;
+    gC.globalAlpha = 0.08 + rnd() * 0.26;
+    gC.beginPath();
+    gC.ellipse(ox + rnd() * S, oy + rnd() * S, 5 + rnd() * 28, (3 + rnd() * 12) * KY, 0, 0, 7);
+    gC.fill();
+  }
+  gC.globalAlpha = 1; gH.globalAlpha = 1;
+  gC.restore(); gH.restore();
+}
+
+/** Branch bark — small scale, longitudinally streaked, opaque. */
+function paintWood(gC, gH, ox, oy, rnd) {
+  const S = AT_T;
+  gC.save(); gC.beginPath(); gC.rect(ox, oy, S, S); gC.clip();
+  gH.save(); gH.beginPath(); gH.rect(ox, oy, S, S); gH.clip();
+  gC.fillStyle = '#4a3f30'; gC.fillRect(ox, oy, S, S);
+  gH.fillStyle = '#707070'; gH.fillRect(ox, oy, S, S);
+  for (let i = 0; i < 5000; i++) {
+    const x = ox + rnd() * S, y = oy + rnd() * S;
+    const l = 12 + rnd() * 26;
+    gC.globalAlpha = 0.2 + rnd() * 0.5;
+    gC.fillStyle = `hsl(${24 + rnd() * 20}, ${10 + rnd() * 16}%, ${14 + rnd() * 36}%)`;
+    gC.fillRect(x, y, l, 1 + rnd() * 3);
+    gH.globalAlpha = 0.3;
+    const hv = Math.round(60 + rnd() * 150);
+    gH.fillStyle = `rgb(${hv},${hv},${hv})`;
+    gH.fillRect(x, y, l, 1 + rnd() * 3);
+  }
+  gC.globalAlpha = 1; gH.globalAlpha = 1;
+  gC.restore(); gH.restore();
+}
+
+/** Bare weathered twigs, alpha. Snags and dead crowns. */
+function paintDead(g, rnd, ox, oy) {
+  const S = AT_T, cy = oy + S * 0.5;
+  g.save(); g.beginPath(); g.rect(ox, oy, S, S); g.clip();
+  g.lineCap = 'round';
+  const draw = (x0, y0, ang, len, w, depth) => {
+    const ex = x0 + Math.cos(ang) * len, ey = y0 + Math.sin(ang) * len;
+    g.globalAlpha = 0.72 + 0.28 * rnd();
+    g.strokeStyle = `hsl(${30 + rnd() * 16}, ${5 + rnd() * 10}%, ${34 + rnd() * 34}%)`;
+    g.lineWidth = w;
+    g.beginPath(); g.moveTo(x0, y0); g.lineTo(ex, ey); g.stroke();
+    if (depth > 0 && w > 1.1) {
+      const nb = 2 + Math.floor(rnd() * 3);
+      for (let i = 0; i < nb; i++) {
+        const t = 0.25 + 0.7 * rnd();
+        draw(x0 + (ex - x0) * t, y0 + (ey - y0) * t,
+          ang + (rnd() < 0.5 ? -1 : 1) * (0.35 + rnd() * 0.75),
+          len * (0.3 + 0.4 * rnd()), w * (0.52 + 0.2 * rnd()), depth - 1);
+      }
+    }
+  };
+  for (let i = 0; i < 16; i++) {
+    const y = cy + (rnd() - 0.5) * S * 0.24;
+    draw(ox + rnd() * S * 0.18, y, (rnd() - 0.5) * 0.6, S * (0.4 + 0.45 * rnd()),
+      4 + rnd() * 3.5, 3);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+/** Fallen needles and twigs on snow, alpha. */
+function paintLitter(g, rnd, ox, oy) {
+  const S = AT_T;
+  g.save(); g.beginPath(); g.rect(ox, oy, S, S); g.clip();
+  g.lineCap = 'round';
+  for (let i = 0; i < 900; i++) {
+    const x = ox + S * 0.5 + (rnd() - 0.5) * S * 0.88;
+    const y = oy + S * 0.5 + (rnd() - 0.5) * S * 0.8;
+    const a = rnd() * Math.PI * 2;
+    const l = 6 + rnd() * 28;
+    g.globalAlpha = 0.35 + rnd() * 0.6;
+    g.strokeStyle = `hsl(${28 + rnd() * 22}, ${16 + rnd() * 18}%, ${16 + rnd() * 22}%)`;
+    g.lineWidth = 1.4 + rnd() * 2.2;
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+  }
+  for (let i = 0; i < 40; i++) {
+    const x = ox + S * 0.5 + (rnd() - 0.5) * S * 0.8;
+    const y = oy + S * 0.5 + (rnd() - 0.5) * S * 0.7;
+    const a = rnd() * Math.PI * 2;
+    const l = 30 + rnd() * 90;
+    g.globalAlpha = 0.7 + rnd() * 0.3;
+    g.strokeStyle = `hsl(${26 + rnd() * 14}, 14%, ${20 + rnd() * 18}%)`;
+    g.lineWidth = 2.5 + rnd() * 3;
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+  }
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+/** Packed snow, opaque. Collars, caps, drifts. */
+function paintSnowTile(g, rnd, ox, oy) {
+  const S = AT_T;
+  g.save(); g.beginPath(); g.rect(ox, oy, S, S); g.clip();
+  g.fillStyle = '#eef2f9'; g.fillRect(ox, oy, S, S);
+  for (let i = 0; i < 700; i++) {
+    const r = 5 + rnd() * 38;
+    g.fillStyle = rnd() < 0.45 ? '#ffffff' : '#d6e0f0';
+    g.globalAlpha = 0.10 + rnd() * 0.22;
+    g.beginPath();
+    g.ellipse(ox + rnd() * S, oy + rnd() * S, r, r * (0.4 + rnd() * 0.6), rnd() * 3, 0, 7);
+    g.fill();
+  }
+  for (let i = 0; i < 600; i++) {
+    g.fillStyle = '#ffffff';
+    g.globalAlpha = 0.2 + rnd() * 0.55;
+    g.fillRect(ox + rnd() * S, oy + rnd() * S, 1.4 + rnd() * 1.8, 1.4 + rnd() * 1.8);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+const TXY = (col, row) => [col * AT_T, row * AT_T];
+
+function makeTreeAtlas() {
+  const cv = makeCanvas(AT_S, AT_S);
+  const g = cv.getContext('2d');
+  const hcv = makeCanvas(AT_S, AT_S);
+  const gh = hcv.getContext('2d');
+  gh.fillStyle = '#808080'; gh.fillRect(0, 0, AT_S, AT_S);
+  const rnd = mulberry32(0xa17e);
+  g.clearRect(0, 0, AT_S, AT_S);
+
+  // ---- row 0: needle sprigs ----------------------------------------------
+  const SPRIG = [
+    { hue: 148, hueSpan: 26, sat: 15, li: 21, liSpan: 14, frost: 0.05, dead: 0.03,
+      reach: 190, step: 15, gap: 0.09, nspace: 9, nlen: 26, seed: 1.7 },        // 0 blue spruce
+    { hue: 126, hueSpan: 28, sat: 13, li: 24, liSpan: 14, frost: 0.04, dead: 0.03,
+      reach: 205, step: 13, gap: 0.06, nspace: 8, nlen: 23, seed: 5.3 },        // 1 fir, dense
+    { hue: 80, hueSpan: 36, sat: 20, li: 26, liSpan: 15, frost: 0.03, dead: 0.07,
+      reach: 200, step: 30, gap: 0.12, nspace: 13, nlen: 48, bundles: 1, seed: 9.1 }, // 2 pine
+    { hue: 138, hueSpan: 24, sat: 10, li: 17, liSpan: 13, frost: 0.04, dead: 0.14,
+      reach: 176, step: 22, gap: 0.26, nspace: 11, nlen: 25, seed: 13.9 },      // 3 ragged, dark
+  ];
+  for (let c = 0; c < 4; c++) paintSprig(g, rnd, ...TXY(c, 0), SPRIG[c]);
+
+  // ---- row 1: snow-laden sprigs, crest blanket, clump ---------------------
+  paintSprigSnow(g, rnd, ...TXY(0, 1), SPRIG[1]);
+  paintSprigSnow(g, rnd, ...TXY(1, 1), SPRIG[0]);
+  paintBlanket(g, rnd, ...TXY(2, 1));
+  paintClump(g, rnd, ...TXY(3, 1));
+
+  // ---- rows 2-3: bark, wood, litter, dead twigs, snow ---------------------
+  paintBark(g, gh, ...TXY(0, 2), 0, rnd);
+  paintBark(g, gh, ...TXY(1, 2), 1, rnd);
+  paintWood(g, gh, ...TXY(2, 2), rnd);
+  paintLitter(g, rnd, ...TXY(3, 2));
+  paintBark(g, gh, ...TXY(0, 3), 2, rnd);
+  paintBark(g, gh, ...TXY(1, 3), 3, rnd);
+  paintDead(g, rnd, ...TXY(2, 3));
+  paintSnowTile(g, rnd, ...TXY(3, 3));
+
+  const tex = canvasToTexture(cv, { bleed: 3 });
+  // fissure relief exists only on the bark and wood tiles
+  const nrm = heightToNormal(hcv, [
+    [0, 2, 2.6], [1, 2, 1.7], [2, 2, 1.4], [0, 3, 2.9], [1, 3, 2.4],
+  ]);
+  return { tex, nrm };
+}
+
+/**
+ * Sobel the painted height tiles into a tangent-space normal map covering the
+ * whole atlas; every other tile stays flat, so sprigs and snow are shaded by
+ * their vertex normals alone.
+ */
+function heightToNormal(hcv, tiles) {
+  const S = hcv.width;
+  const src = hcv.getContext('2d').getImageData(0, 0, S, S).data;
+  const out = new Uint8Array(S * S * 4);
+  for (let i = 0; i < S * S; i++) {
+    out[i * 4] = 128; out[i * 4 + 1] = 128; out[i * 4 + 2] = 255; out[i * 4 + 3] = 255;
+  }
+  for (const [col, row, strength] of tiles) {
+    const bx = col * AT_T, by = row * AT_T;
+    const at = (x, y) => {
+      const xx = x < bx ? bx : x > bx + AT_T - 1 ? bx + AT_T - 1 : x;
+      const yy = y < by ? by : y > by + AT_T - 1 ? by + AT_T - 1 : y;
+      return src[(yy * S + xx) * 4] / 255;
+    };
+    for (let y = by; y < by + AT_T; y++) {
+      for (let x = bx; x < bx + AT_T; x++) {
+        const dx = (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1)
+          - at(x - 1, y - 1) - 2 * at(x - 1, y) - at(x - 1, y + 1)) * strength;
+        const dy = (at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1)
+          - at(x - 1, y - 1) - 2 * at(x, y - 1) - at(x + 1, y - 1)) * strength * 0.75;
+        const l = Math.hypot(dx, dy, 1);
+        const q = ((S - 1 - y) * S + x) * 4;   // rows flipped to match canvasToTexture
+        out[q] = Math.round((-dx / l * 0.5 + 0.5) * 255);
+        out[q + 1] = Math.round((dy / l * 0.5 + 0.5) * 255);
+        out[q + 2] = Math.round((1 / l * 0.5 + 0.5) * 255);
+      }
+    }
+  }
+  const tex = new THREE.DataTexture(out, S, S, THREE.RGBAFormat, THREE.UnsignedByteType);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = 8;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
+ * Paint one snow-laden conifer into a canvas, stroke by stroke. Used for the
+ * single-tree cards past 92 m and for the cluster cards past 172 m.
+ *
+ * The silhouette has to match what the geometry does: whorls that are wider
+ * and more drooped low down, tiers that go missing, tips that fray, and load
+ * that sits in broken patches on the upper face of a tier — NOT a continuous
+ * white rind down every whorl. The previous version painted more snow than
+ * needle and then dilated it, which is why the far treeline measured brighter
+ * than the snowfield behind it and read as a row of pale spikes.
  */
 function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   const T = opt.tiers;
@@ -500,82 +938,92 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   const haze = opt.haze || 0;
   const snowAmt = opt.snow === undefined ? 1 : opt.snow;
   const dens = opt.dens || 1;
+  const gap = opt.gap || 0.10;
+  const hueJ = opt.hue;
 
-  // trunk, pale enough that it does not punch a dark hole in the canopy
-  g.globalAlpha = 1;
   g.lineCap = 'round';
-  g.strokeStyle = `hsl(26, ${13 - haze * 8}%, ${22 + haze * 46}%)`;
-  g.lineWidth = Math.max(1.4, hwpx * 0.085);
+  // trunk: only really seen through the bare lower third
+  g.globalAlpha = 1;
+  g.strokeStyle = `hsl(26, ${12 - haze * 7}%, ${26 + haze * 40}%)`;
+  g.lineWidth = Math.max(1.2, hwpx * 0.075);
   g.beginPath();
   g.moveTo(cx, baseY);
-  g.lineTo(cx, top + hpx * 0.07);
+  g.lineTo(cx, top + hpx * 0.10);
   g.stroke();
 
-  const perTier = Math.max(10, Math.round(46 * dens * Math.min(1.6, hwpx / 46)));
+  const perTier = Math.max(12, Math.round(52 * dens * Math.min(1.7, hwpx / 40)));
 
+  // Tier geometry is resolved first, then drawn in two passes: all the needle
+  // mass, then all the rime. Interleaving them per tier let the next tier's
+  // needles bury the rime of the one below, which is why the load only ever
+  // survived on the outer edge of the silhouette and the core stayed black.
+  const tiers = [];
   for (let i = T - 1; i >= 0; i--) {
     const u = (i + 0.55) / T;                        // 0 top .. 1 bottom
-    const y = top + u * hpx;
-    const hw = hwpx * Math.pow(u, opt.taper || 0.8) * (0.80 + 0.34 * vnoise2(i * 3.1, opt.seed));
-    const drop = (hpx / T) * (opt.droop || 1.6);
+    if (rnd() < gap * u) continue;                   // a tier simply missing
+    // whorls must not sit on a regular ladder, or the card renders as
+    // corrugated iron once it is a hundred pixels tall on screen
+    tiers.push({
+      y: top + u * hpx + (rnd() - 0.5) * (hpx / T) * 0.9,
+      hw: hwpx * Math.pow(u, opt.taper || 0.8)
+        * (0.80 + 0.34 * vnoise2(i * 3.1, opt.seed)) * (0.92 + 0.16 * rnd()),
+      drop: (hpx / T) * (opt.droop || 1.6) * (0.6 + 0.8 * u),
+    });
+  }
 
-    // needle mass — desaturated and mid-toned, never the saturated 9-25%
-    // lightness green the previous atlas used
+  // ---- needle mass --------------------------------------------------------
+  for (const tr of tiers) {
     for (let j = 0; j < perTier; j++) {
-      const s = rnd();
-      const side = rnd() < 0.5 ? -1 : 1;
-      const w = hw * Math.pow(s, 0.55);
-      const yy = y + drop * s * (0.72 + 0.45 * rnd());
-      const li = (29 + rnd() * 15 + (1 - s) * 5) * (1 - haze) + haze * 74;
-      g.strokeStyle = `hsl(${opt.hue + rnd() * 30}, ${(8 + rnd() * 10) * (1 - haze * 0.8)}%, ${li}%)`;
-      g.lineWidth = 1.8 + rnd() * 2.8;
-      g.globalAlpha = 0.8 + rnd() * 0.2;
+      const sd = rnd();
+      const sideS = rnd() < 0.5 ? -1 : 1;
+      const w = tr.hw * Math.pow(sd, 0.5);
+      // Strokes must not share a slope or a baseline, or a whorl renders as a
+      // herringbone and a stack of whorls as corrugated iron.
+      const yy = tr.y + tr.drop * sd * (0.30 + 1.05 * rnd());
+      const li = (22 + rnd() * 15 + (1 - sd) * 5) * (1 - haze) + haze * 70;
+      g.strokeStyle = `hsl(${hueJ + rnd() * 20}, ${(2 + rnd() * 5) * (1 - haze * 0.8)}%, ${li}%)`;
+      g.lineWidth = 1.2 + rnd() * 2.2;
+      g.globalAlpha = 0.72 + 0.28 * rnd();
       g.beginPath();
-      g.moveTo(cx + side * w * 0.25, yy - drop * 0.25);
-      g.lineTo(cx + side * w, yy);
+      g.moveTo(cx + sideS * w * (0.06 + 0.34 * rnd()), yy - tr.drop * (0.1 + 0.5 * rnd()));
+      g.lineTo(cx + sideS * w, yy);
       g.stroke();
-    }
-
-    // snow along the crest of the tier: wide, opaque strokes...
-    const m = Math.round(perTier * 1.25 * snowAmt);
-    for (let j = 0; j < m; j++) {
-      const s = rnd();
-      const side = rnd() < 0.5 ? -1 : 1;
-      const w = hw * Math.pow(s, 0.6) * 0.94;
-      const yy = y + drop * s * 0.52 - drop * 0.16;
-      g.strokeStyle = rnd() < 0.62 ? '#ffffff' : '#e2eaf8';
-      g.lineWidth = 5.0 + rnd() * 4.2;
-      g.globalAlpha = 0.85 + rnd() * 0.15;
-      g.beginPath();
-      g.moveTo(cx + side * w * 0.2, yy - drop * 0.2);
-      g.lineTo(cx + side * w, yy);
-      g.stroke();
-    }
-    // ...plus solid blobs on the crest, which survive mip reduction outright
-    // Blobs must lie ALONG the whorl, not sit on it. Round ones at a regular
-    // radius render as a string of white beads down the trunk axis.
-    const nb = Math.round(9 * snowAmt * Math.min(1.8, hw / 26) + 3);
-    for (let j = 0; j < nb; j++) {
-      const side = rnd() < 0.5 ? -1 : 1;
-      const w = hw * (0.12 + 0.88 * Math.pow(rnd(), 0.5));
-      const rx = hw * (0.16 + 0.20 * rnd());
-      g.globalAlpha = 0.82 + 0.18 * rnd();
-      g.fillStyle = rnd() < 0.7 ? '#ffffff' : '#dfe8f7';
-      g.beginPath();
-      g.ellipse(cx + side * w, y + drop * (0.02 + 0.34 * rnd()),
-        rx, rx * (0.16 + 0.16 * rnd()), side * 0.20, 0, 7);
-      g.fill();
     }
   }
 
-  // snow-capped leader
-  g.globalAlpha = 0.95;
-  g.strokeStyle = '#ffffff';
-  g.lineWidth = Math.max(2.5, hwpx * 0.10);
-  g.beginPath();
-  g.moveTo(cx, top);
-  g.lineTo(cx, top + hpx * 0.075);
-  g.stroke();
+  // ---- rime ---------------------------------------------------------------
+  // Reference stands are *coated*: the load follows every whorl the way the
+  // needles do, sitting a little above them, and the dark foliage survives as
+  // speckle showing through. Two or three long white bars per whorl — which is
+  // what this used to draw — reads as a painted decal.
+  for (const tr of tiers) {
+    const nRime = Math.round(perTier * (0.30 + 0.95 * snowAmt));
+    for (let j = 0; j < nRime; j++) {
+      const sd = rnd();
+      const sideS = rnd() < 0.5 ? -1 : 1;
+      const w = tr.hw * Math.pow(sd, 0.5) * (0.78 + 0.28 * rnd());
+      const yy = tr.y + tr.drop * sd * (0.20 + 1.0 * rnd()) - tr.drop * 0.16;
+      const li = (72 + rnd() * 18) * (1 - haze * 0.22) + haze * 16;
+      g.strokeStyle = `hsl(${210 + rnd() * 14}, ${10 + rnd() * 12}%, ${li}%)`;
+      g.lineWidth = 1.4 + rnd() * 2.6;
+      g.globalAlpha = 0.52 + 0.44 * rnd();
+      g.beginPath();
+      g.moveTo(cx + sideS * w * (0.08 + 0.30 * rnd()), yy - tr.drop * (0.08 + 0.42 * rnd()));
+      g.lineTo(cx + sideS * w, yy);
+      g.stroke();
+    }
+  }
+
+  // snow-capped leader, only on trees actually carrying load
+  if (snowAmt > 0.5) {
+    g.globalAlpha = 0.9;
+    g.strokeStyle = '#eef3fc';
+    g.lineWidth = Math.max(1.6, hwpx * 0.07);
+    g.beginPath();
+    g.moveTo(cx, top + hpx * 0.02);
+    g.lineTo(cx, top + hpx * 0.07);
+    g.stroke();
+  }
   g.globalAlpha = 1;
 }
 
@@ -589,18 +1037,18 @@ function paintConiferMass(g, rnd, cx, baseY, hpx, hwpx, opt) {
   const T = Math.max(5, Math.round(opt.tiers * 0.6));
   const top = baseY - hpx;
   const haze = opt.haze || 0;
-  g.strokeStyle = `hsl(26, 10%, ${26 + haze * 44}%)`;
+  g.strokeStyle = `hsl(26, 10%, ${22 + haze * 42}%)`;
   g.lineWidth = Math.max(1, hwpx * 0.1);
   g.beginPath(); g.moveTo(cx, baseY); g.lineTo(cx, top + hpx * 0.1); g.stroke();
 
   for (let i = T - 1; i >= 0; i--) {
     const u = (i + 0.6) / T;
     const y = top + u * hpx;
-    const hw = hwpx * Math.pow(u, 0.78) * (0.82 + 0.3 * rnd());
+    const hw = hwpx * Math.pow(u, 0.78) * (0.78 + 0.34 * rnd());
     const drop = (hpx / T) * 1.5;
-    const li = 30 * (1 - haze) + haze * 72;
+    const li = 26 * (1 - haze) + haze * 70;
     g.globalAlpha = 1;
-    g.fillStyle = `hsl(${opt.hue + rnd() * 24}, ${9 * (1 - haze * 0.8)}%, ${li}%)`;
+    g.fillStyle = `hsl(${opt.hue + rnd() * 18}, ${5 * (1 - haze * 0.8)}%, ${li}%)`;
     g.beginPath();
     g.moveTo(cx, y - drop * 0.55);
     for (let k = -3; k <= 3; k++) {
@@ -609,42 +1057,60 @@ function paintConiferMass(g, rnd, cx, baseY, hpx, hwpx, opt) {
     }
     g.closePath();
     g.fill();
-    // snow cap on the upper face of the tier
-    g.globalAlpha = 0.92;
-    g.fillStyle = rnd() < 0.65 ? '#ffffff' : '#e4ecfa';
-    g.beginPath();
-    g.moveTo(cx, y - drop * 0.5);
-    for (let k = -3; k <= 3; k++) {
-      const t = k / 3;
-      g.lineTo(cx + t * hw * 0.96, y + drop * (0.42 - t * t * 0.3) * (0.7 + 0.5 * rnd()));
+    // load on the upper face — partial, and only on some tiers
+    if (rnd() < 0.80 * (opt.snow === undefined ? 1 : opt.snow)) {
+      g.globalAlpha = 0.85;
+      g.fillStyle = rnd() < 0.5 ? '#e2e9f5' : '#ccd8ea';
+      const sideS = rnd() < 0.5 ? -1 : 1;
+      g.beginPath();
+      g.moveTo(cx, y - drop * 0.5);
+      for (let k = 0; k <= 3; k++) {
+        const t = sideS * (k / 3);
+        g.lineTo(cx + t * hw * 0.9, y + drop * (0.36 - t * t * 0.26) * (0.6 + 0.5 * rnd()));
+      }
+      g.closePath();
+      g.fill();
     }
-    g.closePath();
-    g.fill();
   }
   g.globalAlpha = 1;
 }
 
 /**
- * Single-tree cards for the 92-210 m band. Four cells, 512 px each; the cell
- * gets a 6 px transparent border so high mips cannot bleed one species into
- * the next.
+ * Single-tree cards for the 92-210 m band. Six cells, 512 px each, one per
+ * species silhouette plus a bare snag; the cell gets a transparent border so
+ * high mips cannot bleed one species into the next.
  */
+const IMP_CELLS = 6;
 function makeSingleImpostorAtlas() {
-  const CW = 512, H = 512, W = CW * 4;
+  const CW = 512, H = 512, W = CW * IMP_CELLS;
   const cv = makeCanvas(W, H);
   const g = cv.getContext('2d');
   g.clearRect(0, 0, W, H);
   const rnd = mulberry32(0x5eed1);
-  for (let k = 0; k < 4; k++) {
-    const cx = k * CW + CW * 0.5;
-    const tall = k < 2;
-    paintConifer(g, rnd, cx, H - 8, H - 22, CW * (tall ? 0.30 : 0.38), {
-      tiers: tall ? 16 : 12, hue: 96 + k * 10, seed: k * 5.7,
-      taper: tall ? 0.85 : 0.72, droop: tall ? 1.5 : 1.75,
-      snow: k === 2 ? 0.78 : 1.0, dens: 1.15,
+  // Reference stands run from lightly frosted dark spruce to fully rimed white
+  // *within one hillside*; one silhouette and one load value across the whole
+  // band is what made the treeline read as a row of identical spikes.
+  //          two spruce         fir          pine        old      snag-ish
+  const CFG = [
+    { tiers: 21, hue: 168, taper: 0.94, droop: 1.75, snow: 1.05, wide: 0.235, gap: 0.05 },
+    { tiers: 18, hue: 160, taper: 0.86, droop: 1.55, snow: 0.34, wide: 0.265, gap: 0.09 },
+    { tiers: 15, hue: 152, taper: 0.76, droop: 1.35, snow: 0.70, wide: 0.310, gap: 0.05 },
+    { tiers: 11, hue: 118, taper: 0.62, droop: 1.10, snow: 0.18, wide: 0.355, gap: 0.22 },
+    { tiers: 13, hue: 164, taper: 0.84, droop: 1.95, snow: 0.55, wide: 0.270, gap: 0.26 },
+    { tiers: 16, hue: 176, taper: 0.90, droop: 1.60, snow: 1.25, wide: 0.250, gap: 0.12 },
+  ];
+  for (let k = 0; k < IMP_CELLS; k++) {
+    const c = CFG[k];
+    // The single-tree band sits at 92-210 m, between geometry that still shows
+    // dark needle and the cluster cards that carry the pale rimed distance. Its
+    // load is scaled back so the LOD crossover at ~100 m is not also a tonal
+    // step from dark green to white.
+    paintConifer(g, rnd, k * CW + CW * 0.5, H - 8, H - 22, CW * c.wide, {
+      tiers: c.tiers, hue: c.hue, seed: k * 5.7, taper: c.taper, droop: c.droop,
+      snow: c.snow * 0.7, dens: 1.25, gap: c.gap,
     });
   }
-  return canvasToTexture(cv, { dilate: 2, bleed: 3 });
+  return canvasToTexture(cv, { bleed: 3 });
 }
 
 /**
@@ -671,38 +1137,40 @@ function makeClusterAtlas(cells, cardW, cardH, baseFrac, seed, haze, big) {
       trees.push({
         x: ox + CW * (0.10 + 0.80 * ((i + 0.5) / n + (rnd() - 0.5) * 0.9 / n)),
         z: rnd(),                                   // depth within the clump
-        h: (0.52 + 0.48 * Math.pow(rnd(), 0.7)),
+        h: (0.42 + 0.58 * Math.pow(rnd(), 0.8)),
         sp: rnd(),
+        snow: 0.06 + 1.25 * Math.pow(rnd(), 1.35),
       });
     }
     trees.sort((a, b) => b.z - a.z);                 // back to front
     for (const t of trees) {
       const back = t.z;
-      const hm = cardH * (1 - baseFrac) * (0.42 + 0.56 * t.h) * (1 - back * 0.16);
-      const hw = hm * (t.sp < 0.4 ? 0.155 : t.sp < 0.8 ? 0.20 : 0.25);
+      const hm = cardH * (1 - baseFrac) * (0.38 + 0.60 * t.h) * (1 - back * 0.16);
+      const hw = hm * (t.sp < 0.4 ? 0.14 : t.sp < 0.8 ? 0.175 : 0.22);
       const by = baseY + (rnd() - 0.5) * cardH * baseFrac * pxy * 0.9;
       const opt = {
-        tiers: t.sp < 0.4 ? 15 : 12, hue: 96 + t.sp * 22, seed: t.x * 0.01,
-        taper: 0.8, droop: 1.6, snow: 1.0, dens: big ? 0.8 : 1.0,
-        haze: haze + back * 0.16,
+        tiers: t.sp < 0.4 ? 16 : 11, hue: 146 + t.sp * 34, seed: t.x * 0.01,
+        taper: 0.8, droop: 1.6, snow: t.snow, dens: big ? 0.8 : 1.1,
+        gap: 0.10 + 0.2 * t.sp,
+        haze: haze + back * 0.14,
       };
       if (big) paintConiferMass(g, rnd, t.x, by, hm * pxy, hw * pxx, opt);
       else paintConifer(g, rnd, t.x, by, hm * pxy, hw * pxx, opt);
     }
     // a drift banked along the foot of the clump, so the card is bedded into
     // snow instead of standing on a cut line
-    g.globalAlpha = 0.9;
+    g.globalAlpha = 0.85;
     for (let i = 0; i < 60; i++) {
       const x = ox + CW * (0.04 + 0.92 * rnd());
       const r = CW * (0.03 + 0.09 * rnd());
-      g.fillStyle = rnd() < 0.6 ? '#ffffff' : '#dfe8f7';
+      g.fillStyle = rnd() < 0.5 ? '#f6f9fe' : '#dbe4f2';
       g.beginPath();
       g.ellipse(x, baseY + H * 0.012, r, r * (0.22 + 0.2 * rnd()), 0, 0, 7);
       g.fill();
     }
     g.globalAlpha = 1;
   }
-  return canvasToTexture(cv, { dilate: big ? 1 : 2, bleed: 3 });
+  return canvasToTexture(cv, { bleed: 3 });
 }
 
 /** Orange safety netting: a diamond weave with a reinforced hem. */
@@ -740,6 +1208,12 @@ function makeNetTexture() {
 class GB {
   constructor() {
     this.p = []; this.n = []; this.u = []; this.c = []; this.f = []; this.r = []; this.i = [];
+    this.t = [];
+    // How strongly this vertex takes the per-instance colour. Foliage takes it
+    // in full (that is what makes one stand run from bluish-green to olive to
+    // near-black); snow and bark take almost none, or every heavily tinted tree
+    // would carry green snow.
+    this.tw = 1;
   }
 
   v(px, py, pz, nx, ny, nz, uu, vv, r, gg, b, fl, rad) {
@@ -749,6 +1223,7 @@ class GB {
     this.c.push(r, gg, b);
     this.f.push(fl || 0);
     this.r.push(rad || 0);
+    this.t.push(this.tw);
     return this.p.length / 3 - 1;
   }
 
@@ -775,6 +1250,7 @@ class GB {
       this.c.push(col[0], col[1], col[2]);
       this.f.push(flex || 0);
       this.r.push(rad || 0);
+      this.t.push(this.tw);
     }
     const idx = geo.index;
     if (idx) for (let i = 0; i < idx.count; i++) this.i.push(base + idx.getX(i));
@@ -791,6 +1267,7 @@ class GB {
     // world-space radius of the cross-section this vertex belongs to; the prop
     // shader uses it to hold thin geometry above a one-pixel screen width
     g.setAttribute('aRad', new THREE.Float32BufferAttribute(this.r, 1));
+    g.setAttribute('aTint', new THREE.Float32BufferAttribute(this.t, 1));
     g.setIndex(this.i);
     g.computeBoundingSphere();
     return g;
@@ -799,10 +1276,24 @@ class GB {
   get tris() { return this.i.length / 3; }
 }
 
-// Atlas UV regions.
-const uvNeedle = (card, s, t) => [card * 0.5 + 0.003 + s * 0.494, 0.503 + t * 0.494];
-const uvBark = (s, t) => [0.02 + s * 0.46, 0.02 + t * 0.46];
-const uvSnow = (s, t) => [0.52 + s * 0.46, 0.02 + t * 0.46];
+// Atlas UV regions — a 4 x 4 grid of 512 px tiles, row 0 at the TOP of the
+// canvas (v near 1) because canvasToTexture flips rows on upload.
+const uvT = (col, row, s, t) => [
+  (col + 0.008 + s * 0.984) * 0.25,
+  (3 - row + 0.008 + t * 0.984) * 0.25,
+];
+const uvNeedle = (i, s, t) => uvT(i & 3, 0, s, t);
+const uvSprigSnow = (i, s, t) => uvT(i & 1, 1, s, t);
+/** Crest blanket: opaque core, alpha frays away at t -> 0 and t -> 1. */
+const uvBlanket = (s, t) => uvT(2, 1, s, t);
+/** A discrete pile of snow, frayed on every side. */
+const uvClump = (s, t) => uvT(3, 1, s, t);
+const uvBarkN = (b, s, t) => uvT(b & 1, 2 + ((b >> 1) & 1), s, t);
+const uvBark = (s, t) => uvBarkN(0, s, t);
+const uvWood = (s, t) => uvT(2, 2, s, t);
+const uvLitter = (s, t) => uvT(3, 2, s, t);
+const uvDead = (s, t) => uvT(2, 3, s, t);
+const uvSnow = (s, t) => uvT(3, 3, s, t);
 
 const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _c = new THREE.Vector3();
 
@@ -827,7 +1318,12 @@ function sweep(gb, pts, radii, seg, col, flexOf, opt) {
       const cx = Math.cos(th), sz = Math.sin(th);
       const nx = _c.x * cx + _b.x * sz, ny = _c.y * cx + _b.y * sz, nz = _c.z * cx + _b.z * sz;
       const r = radii[i] * (opt && opt.wob ? opt.wob(i, k, th) : 1);
-      const uv = uvBark(k / seg, i / (pts.length - 1));
+      // The bark tile repeats up the bole: consecutive rings alternate v = 0
+      // and v = 1, so each band shows the whole tile (mirrored), which keeps
+      // the texel density at ~250 px/m instead of the 44 px/m a single stretch
+      // over 23 m of trunk gave. A mirrored repeat is seamless by construction.
+      const uvfn = (opt && opt.uv) || uvBark;
+      const uv = uvfn(k / seg, opt && opt.vRep ? (i & 1) : i / (pts.length - 1));
       const tn = opt && opt.tint ? opt.tint(i, k, th) : null;
       row.push(gb.v(p.x + nx * r, p.y + ny * r, p.z + nz * r, nx, ny, nz, uv[0], uv[1],
         tn ? tn[0] : col[0], tn ? tn[1] : col[1], tn ? tn[2] : col[2],
@@ -846,64 +1342,113 @@ function sweep(gb, pts, radii, seg, col, flexOf, opt) {
 // =============================================================================
 // Conifers
 // =============================================================================
+/**
+ * `sprig` is the dominant needle tile (0 blue spruce, 1 dense fir, 2 long-
+ * needled pine, 3 ragged near-black); `bark` picks the bark tile. `droop` and
+ * `rise` are the quadratic and linear terms of a branch's path, `tip` the
+ * quartic that curls its last fifth back up toward the light. `snow` is how
+ * much load the crown holds — an open pine sheds, a dense fir does not.
+ */
 const SPECIES = [
-  { // 0 spruce — narrow, tall, regular whorls, deep droop
-    name: 'spruce', h: 23, trunkR: 0.21, tiers: 15, bare: 0.08, spread: 0.155,
-    crown: 0.92, droop: 0.60, rise: 0.30, frondW: 0.30, snow: 0.97,
-    col: [1.00, 1.06, 0.94], barkCol: [0.95, 0.86, 0.78],
+  { // 0 Norway spruce — narrow, tall, regular whorls, deep droop
+    name: 'spruce', h: 24, trunkR: 0.20, tiers: 21, bare: 0.07, spread: 0.150,
+    crown: 0.95, droop: 0.72, rise: 0.30, tip: 0.34, frondW: 0.30, snow: 1.0,
+    sprig: 0, bark: 0, sub: 2,
+    col: [0.94, 1.02, 0.94], barkCol: [0.92, 0.84, 0.76],
   },
-  { // 1 silver fir — broader, blunter, dense
-    name: 'fir', h: 19, trunkR: 0.22, tiers: 14, bare: 0.11, spread: 0.195,
-    crown: 0.70, droop: 0.42, rise: 0.34, frondW: 0.32, snow: 0.99,
-    col: [0.92, 1.04, 0.96], barkCol: [1.02, 0.96, 0.90],
+  { // 1 silver fir — broader, blunter, dense, flat-topped with age
+    name: 'fir', h: 20, trunkR: 0.23, tiers: 18, bare: 0.10, spread: 0.205,
+    crown: 0.68, droop: 0.44, rise: 0.36, tip: 0.22, frondW: 0.34, snow: 1.0,
+    sprig: 1, bark: 1, sub: 2,
+    col: [0.90, 1.00, 0.96], barkCol: [1.00, 0.98, 0.94],
   },
-  { // 2 arolla pine — open, irregular, long limbs, less snow held
-    name: 'pine', h: 15, trunkR: 0.24, tiers: 10, bare: 0.28, spread: 0.245,
-    crown: 0.50, droop: 0.26, rise: 0.42, frondW: 0.30, snow: 0.72,
-    col: [1.10, 1.02, 0.80], barkCol: [1.10, 0.86, 0.68],
+  { // 2 arolla pine — open, ragged, long bare limbs, sheds its load
+    name: 'pine', h: 16, trunkR: 0.26, tiers: 11, bare: 0.32, spread: 0.270,
+    crown: 0.44, droop: 0.22, rise: 0.44, tip: 0.10, frondW: 0.28, snow: 0.70,
+    sprig: 2, bark: 2, sub: 3,
+    col: [1.06, 1.02, 0.80], barkCol: [1.06, 0.88, 0.70],
   },
   { // 3 sapling / understorey spruce
-    name: 'young', h: 5.0, trunkR: 0.075, tiers: 11, bare: 0.04, spread: 0.20,
-    crown: 1.10, droop: 0.32, rise: 0.36, frondW: 0.32, snow: 1.0,
-    col: [0.96, 1.08, 0.90], barkCol: [0.98, 0.90, 0.82],
+    name: 'young', h: 4.6, trunkR: 0.070, tiers: 10, bare: 0.03, spread: 0.215,
+    crown: 1.10, droop: 0.34, rise: 0.36, tip: 0.30, frondW: 0.34, snow: 1.0,
+    sprig: 1, bark: 0, sub: 1,
+    col: [0.94, 1.06, 0.90], barkCol: [0.96, 0.90, 0.82],
   },
   { // 4 krummholz — stunted, wind-flagged, buried in snow
     name: 'krumm', h: 2.6, trunkR: 0.075, tiers: 7, bare: 0.02, spread: 0.44,
-    crown: 0.42, droop: 0.66, rise: 0.10, frondW: 0.34, snow: 1.0,
-    col: [0.92, 0.98, 0.84], barkCol: [0.64, 0.58, 0.54],
+    crown: 0.42, droop: 0.66, rise: 0.10, tip: 0.0, frondW: 0.34, snow: 1.0,
+    sprig: 3, bark: 3, sub: 0,
+    col: [0.90, 0.98, 0.84], barkCol: [0.64, 0.58, 0.54],
+  },
+  { // 5 dead standing snag — broken top, bare limbs, silvered bark
+    name: 'snag', h: 13, trunkR: 0.19, tiers: 7, bare: 0.34, spread: 0.150,
+    crown: 0.55, droop: 0.20, rise: 0.30, tip: 0.0, frondW: 0.20, snow: 0.4,
+    sprig: 3, bark: 3, sub: 1, dead: true,
+    col: [0.74, 0.70, 0.64], barkCol: [1.05, 1.02, 0.98],
   },
 ];
 
 /**
- * One conifer. `lod` 0 = full, 1 = reduced.
+ * One conifer. `lod` 0 = full, 1 = reduced. `opt` skews the silhouette per
+ * variant so a stand never reads as one model rotated.
  * Local origin sits at the base of the trunk, on the ground, +Y up.
+ *
+ * Structure, in the order it is built:
+ *
+ *   trunk   swept tube, root flare below grade, bark tile repeating up the
+ *           bole with a fissure normal map, wind-plastered snow on one flank.
+ *   whorls  tiers of branches. Each branch is a *curve*: it leaves the trunk
+ *           rising, sags under its own weight and its snow load (lower and
+ *           older branches sag much harder), and curls its last fifth back up.
+ *           Every branch carries one to three sub-branches forking forward.
+ *   sprigs  small alpha cards along every stem, each rolled about the stem
+ *           axis, jittered in size and yaw, drawn from four needle tiles plus
+ *           two snow-laden ones. The silhouette of the foliage is the union of
+ *           a dozen frayed alpha shapes; there is no polygon edge in it.
+ *   load    a tented strip of snow along the crest of the heavier branches,
+ *           mapped to a blanket tile whose lips fray to nothing, plus discrete
+ *           clumps where the load has piled up.
  */
-function buildConifer(rnd, si, lod) {
+function buildConifer(rnd, si, lod, opt = {}) {
   const S = SPECIES[si];
   const gb = new GB();
-  const H = S.h * (0.9 + rnd() * 0.2);
+  const dead = !!S.dead;
+  const H = S.h * (opt.hScale || 1) * (0.86 + rnd() * 0.3);
   const wind = rnd() * Math.PI * 2;          // prevailing flag direction
   const flag = si === 4 ? 1 : 0;
+  // How much snow this individual is carrying. Drives branch sag, how many
+  // sprigs come off the snow-laden tiles, and whether a crest strip is built.
+  const LOAD = clamp((opt.load === undefined ? 0.55 + 0.6 * rnd() : opt.load) * S.snow, 0, 1.2);
+  const AGE = opt.age === undefined ? rnd() : opt.age;   // 0 young, 1 old and ragged
+  const SPREADK = opt.spread || 1;
 
   // ---- trunk ---------------------------------------------------------------
-  const rings = lod === 0 ? 7 : 4;
-  const seg = lod === 0 ? 6 : 4;
-  const leanX = (rnd() - 0.5) * 0.035 * H + (flag ? Math.cos(wind) * 0.22 * H : 0);
-  const leanZ = (rnd() - 0.5) * 0.035 * H + (flag ? Math.sin(wind) * 0.22 * H : 0);
+  // Ring count is even so the bark tile's mirrored vertical repeat lands on
+  // ring boundaries; band height comes out around 2 m.
+  const rings = lod === 0 ? Math.max(4, Math.round(H / 2.2 / 2) * 2) : 4;
+  const seg = lod === 0 ? 9 : 5;
+  const leanX = (rnd() - 0.5) * 0.045 * H + (flag ? Math.cos(wind) * 0.22 * H : 0);
+  const leanZ = (rnd() - 0.5) * 0.045 * H + (flag ? Math.sin(wind) * 0.22 * H : 0);
+  const brokeAt = dead ? 0.60 + rnd() * 0.28 : 1;
   const pts = [], radii = [];
   // two rings below grade so the stem flares into a root plate instead of
   // meeting the snow as a dowel pushed into a hole
   pts.push(new THREE.Vector3(0, -1.05, 0)); radii.push(S.trunkR * 2.35);
   pts.push(new THREE.Vector3(0, -0.42, 0)); radii.push(S.trunkR * 1.42);
   for (let i = 0; i <= rings; i++) {
-    const t = i / rings;
+    const t = (i / rings) * brokeAt;
     const bend = t * t;
     pts.push(new THREE.Vector3(leanX * bend, H * t - 0.06, leanZ * bend));
-    radii.push(S.trunkR * Math.pow(1 - t * 0.96, 0.8) + 0.014);
+    radii.push(dead
+      ? S.trunkR * Math.pow(1 - t * 0.66, 0.7) + 0.025
+      : S.trunkR * Math.pow(1 - t * 0.96, 0.8) + 0.014);
   }
   const flareRings = 2;
   const bcol = S.barkCol;
+  gb.tw = 0.18;                       // bark takes a little of the tree's tone
   sweep(gb, pts, radii, seg, bcol, (t) => Math.max(0, t - 0.12) * (t - 0.12) * 1.3, {
+    uv: (s, t) => uvBarkN(S.bark, s, t),
+    vRep: true,
     // radial noise: strongest on the flare rings, fading out up the bole
     wob: (i, k, th) => {
       const t = clamp((i - flareRings) / rings, 0, 1);
@@ -915,15 +1460,16 @@ function buildConifer(rnd, si, lod) {
       const t = clamp((i - flareRings) / rings, 0, 1);
       const face = Math.cos(th - wind);
       const plaster = clamp(face, 0, 1) * (0.55 + 0.45 * vnoise2(th * 2.7, t * 9.1)) *
-        (0.35 + 0.65 * (1 - smoothstep(0.1, 0.75, t)));
-      const j = 0.82 + 0.36 * vnoise2(i * 1.3, k * 2.7);
+        (0.35 + 0.65 * (1 - smoothstep(0.1, 0.75, t))) * (0.45 + 0.7 * LOAD);
+      const j = 0.80 + 0.40 * vnoise2(i * 1.3, k * 2.7);
       return [
-        lerp(bcol[0] * j, 1.14, plaster * 0.8),
-        lerp(bcol[1] * j, 1.16, plaster * 0.8),
-        lerp(bcol[2] * j, 1.22, plaster * 0.8),
+        lerp(bcol[0] * j, 1.02, plaster * 0.8),
+        lerp(bcol[1] * j, 1.05, plaster * 0.8),
+        lerp(bcol[2] * j, 1.12, plaster * 0.8),
       ];
     },
   });
+  gb.tw = 0;
 
   const trunkAt = (t) => {
     const bend = t * t;
@@ -931,245 +1477,380 @@ function buildConifer(rnd, si, lod) {
   };
 
   // ---- branch whorls -------------------------------------------------------
-  const nTiers = Math.max(4, Math.round(S.tiers * (lod === 0 ? 1 : 0.62)));
-  const segsPerBranch = lod === 0 ? 3 : 2;
+  const nTiers = Math.max(4, Math.round(S.tiers * (lod === 0 ? 1 : 0.55)));
   const dirH = new THREE.Vector3();
   const side = new THREE.Vector3();
-  const tang = new THREE.Vector3();
-  const biN = new THREE.Vector3();
+  // P belongs to the branch curve, Q to the sub-branch curve, R2 to the shaded
+  // under-fringe; V0/V1/T/N/Bn belong to sprigs(). They must not overlap — an
+  // at() that shares a scratch vector with its caller silently returns a zero
+  // tangent and the card collapses.
   const P = new THREE.Vector3();
+  const Q = new THREE.Vector3();
+  const R2 = new THREE.Vector3();
+  const V0 = new THREE.Vector3(), V1 = new THREE.Vector3();
+  const T = new THREE.Vector3();
+  const N = new THREE.Vector3();
+  const Bn = new THREE.Vector3();
+
+  const C = S.col;
+  const CD = [C[0] * 0.70, C[1] * 0.72, C[2] * 0.68];    // shaded interior
+
+  /**
+   * Lay sprig cards along a stem. `at(s)` is the stem centreline, `wid(s)` the
+   * local frond half-width. Cards roll about the stem, so the mass has depth
+   * instead of living on two planes; snow-laden cards are rolled flat, because
+   * that is where snow actually settles.
+   */
+  function sprigs(at, wid, s0, s1, n, o) {
+    if (n <= 0) return;
+    for (let i = 0; i < n; i++) {
+      const f = (i + 0.15 + rnd() * 0.7) / n;
+      const s = s0 + (s1 - s0) * f;
+      const w = wid(s);
+      if (w < 0.02) continue;
+      V0.copy(at(s));
+      V1.copy(at(Math.min(1, s + 0.06)));
+      T.copy(V1).sub(V0);
+      if (T.lengthSq() < 1e-8) T.set(1, 0, 0);
+      T.normalize();
+      N.set(0, 1, 0).cross(T);
+      if (N.lengthSq() < 1e-6) N.set(1, 0, 0);
+      N.normalize();
+      Bn.copy(T).cross(N).normalize();          // roughly up
+
+      const snowy = !dead && rnd() < LOAD * 0.85 * (o.snowK === undefined ? 1 : o.snowK);
+      // A loaded card lies flat (roll near a quarter turn puts its face up); a
+      // bare one fans through a full turn but clusters near horizontal, which
+      // is how a conifer frond actually presents.
+      // Roll spreads the cards through the volume, but not so far that half of
+      // them present edge-on: a card seen at a grazing angle renders as a dark
+      // sliver and a crown full of them reads as paint strokes.
+      const roll = snowy
+        ? (rnd() < 0.5 ? 1 : -1) * (1.35 + rnd() * 0.42)
+        : (rnd() - 0.5) * 1.45 + (i % 2 ? 0.42 : -0.42);
+      const cr = Math.cos(roll), sr = Math.sin(roll);
+      const ux = N.x * cr + Bn.x * sr, uy = N.y * cr + Bn.y * sr, uz = N.z * cr + Bn.z * sr;
+      const yaw = (rnd() - 0.5) * 0.9;
+      const cy2 = Math.cos(yaw), sy2 = Math.sin(yaw);
+      const ax = T.x * cy2 + ux * sy2, ay = T.y * cy2 + uy * sy2, az = T.z * cy2 + uz * sy2;
+      let bx = ay * uz - az * uy, by = az * ux - ax * uz, bz = ax * uy - ay * ux;
+      const bl = Math.hypot(bx, by, bz) || 1;
+      bx /= bl; by /= bl; bz /= bl;
+      // face normal biased upward: the mass then shades as a volume
+      let nx = bx * 0.40 + ux * 0.50 + T.x * 0.24;
+      let ny = by * 0.40 + uy * 0.50 + 0.66;
+      let nz = bz * 0.40 + uz * 0.50 + T.z * 0.24;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      nx /= nl; ny /= nl; nz /= nl;
+
+      // Card scale matters more than card count. At the old 0.7-1.35 x frond
+      // half-width a single card was a metre across on a mature spruce and read
+      // as a leaf; two thirds of that, with proportionally more of them, and
+      // the mass reads as needle again.
+      // Needles do not get shorter as a branch gets shorter. Without a floor
+      // the short upper whorls carry sub-centimetre cards and the top of the
+      // crown opens up into a bare stick.
+      const size = Math.max(w * (o.size || 1) * (0.42 + 0.42 * rnd()), 0.05 * (o.size || 1));
+      const len = size * (1.8 + 1.1 * rnd());
+      const ti = snowy ? (rnd() < 0.5 ? 0 : 1)
+        : (rnd() < 0.7 ? o.sprig : (o.sprig + 1 + (rnd() * 3 | 0)) & 3);
+      const tile = snowy ? uvSprigSnow : (dead ? uvDeadTile : uvNeedle);
+      const mu = rnd() < 0.5;                   // mirror half the cards
+      const flx = clamp((V0.y + 0.35) / H, 0, 1) * (0.30 + 0.7 * s);
+      const col = snowy ? [1.0, 1.0, 1.02] : (o.shade ? CD : C);
+      const j = 0.84 + 0.30 * rnd();
+      gb.tw = snowy ? 0.20 : 1;
+      const px = V0.x - ax * len * 0.10, py = V0.y - ay * len * 0.10, pz = V0.z - az * len * 0.10;
+      const q = [];
+      for (const [su, sv] of [[0, 0], [1, 0], [1, 1], [0, 1]]) {
+        const along = (su - 0.06) * len;
+        const across = (sv - 0.5) * size * 2;
+        // the far end of a card droops: no card is perfectly planar
+        const sag = -size * 0.30 * su * su;
+        const uv = tile(ti, mu ? 1 - su : su, sv);
+        q.push(gb.v(
+          px + ax * along + bx * across + ux * sag,
+          py + ay * along + by * across + uy * sag,
+          pz + az * along + bz * across + uz * sag,
+          nx, ny, nz, uv[0], uv[1], col[0] * j, col[1] * j, col[2] * j, flx));
+      }
+      gb.quad(q[0], q[1], q[2], q[3]);
+      gb.tw = 0;
+    }
+  }
 
   for (let ti = 0; ti < nTiers; ti++) {
     const u = (ti + 0.55) / nTiers;                 // 0 = top, 1 = bottom
-    const t = S.bare + (1 - S.bare) * (1 - u);      // height fraction on trunk
+    // whorl spacing is not metronomic: a perfectly even ladder of tiers is the
+    // strongest "procedural cone" tell there is
+    const uj = clamp(u + (vnoise2(ti * 5.9, si * 2.3) - 0.5) * (0.7 / nTiers), 0.02, 1);
+    const t = S.bare + (1 - S.bare) * (1 - uj) * brokeAt;
     const anchor = trunkAt(t).clone();
 
-    const prof = Math.pow(u, S.crown) * (0.42 + 0.58 * smoothstep(0, 0.20, u))
-      * (1 - 0.26 * smoothstep(0.78, 1.0, u));
-    const L = S.spread * H * (2.0 * prof) * (0.82 + 0.36 * rnd());
-    if (L < 0.16) continue;
+    // The profile floor matters: without it the top three or four whorls came
+    // out shorter than the cull threshold and were dropped, which left the
+    // leader standing as a bare stick out of the crown.
+    const prof = (0.085 + 0.915 * Math.pow(u, S.crown))
+      * (0.46 + 0.54 * smoothstep(0, 0.16, u))
+      * (1 - (0.26 + 0.26 * AGE) * smoothstep(0.74, 1.0, u));
+    const L = S.spread * SPREADK * H * (2.0 * prof) * (0.80 + 0.40 * rnd());
+    if (L < 0.05) continue;
 
-    let nb = lod === 0 ? Math.max(4, Math.round(3.2 + 2.4 * u)) : Math.max(3, Math.round(2.4 + 1.4 * u));
+    const nb = lod === 0
+      ? Math.max(4, Math.round(3.2 + 2.6 * u))
+      : Math.max(3, Math.round(2.2 + 1.4 * u));
     const a0 = ti * 2.39996 + rnd() * 0.7;
 
     for (let bi = 0; bi < nb; bi++) {
-      let az = a0 + (bi / nb) * Math.PI * 2 + (rnd() - 0.5) * 0.55;
-      let lenK = 0.78 + 0.44 * rnd();
+      const az = a0 + (bi / nb) * Math.PI * 2 + (rnd() - 0.5) * 0.6;
+      let lenK = 0.74 + 0.52 * rnd();
       if (flag) {
-        // wind-flagged: limbs survive only on the lee side
         const d = Math.cos(az - wind - Math.PI);
         lenK *= 0.25 + 0.95 * clamp(d + 0.35, 0, 1);
         if (lenK < 0.3) continue;
       }
+      // an old tree has lost limbs outright
+      if (AGE > 0.55 && rnd() < 0.22 * (AGE - 0.55) * 2.2) continue;
       const BL = L * lenK;
       dirH.set(Math.cos(az), 0, Math.sin(az));
       side.set(-Math.sin(az), 0, Math.cos(az));
 
-      const droop = S.droop * (0.58 + 0.42 * u) * (0.85 + 0.3 * rnd());
-      const rise = S.rise * (0.8 + 0.4 * rnd());
+      // Sag: heavier low down, heavier with age, heavier under snow. Upper
+      // branches barely sag, which is the whole reason a spruce reads as a
+      // spire and not a cone.
+      const branchLoad = LOAD * (0.5 + 0.5 * rnd());
+      const droop = S.droop * (0.30 + 0.70 * u) * (0.80 + 0.4 * rnd())
+        * (1 + 0.45 * branchLoad + 0.30 * AGE);
+      const rise = S.rise * (0.75 + 0.5 * rnd()) * (1 - 0.35 * u);
+      const tipUp = S.tip * (0.6 + 0.8 * rnd());
+      const curve = (rnd() - 0.5) * 0.28;   // never a straight radius
       const at = (s) => P.copy(anchor)
         .addScaledVector(dirH, BL * s)
-        .setY(anchor.y + BL * (rise * s - droop * s * s));
+        .addScaledVector(side, BL * curve * s * s)
+        .setY(anchor.y + BL * (rise * s - droop * s * s + tipUp * s * s * s * s));
       const wid = (s) => BL * S.frondW *
-        (0.30 + 0.72 * Math.pow(Math.sin(Math.PI * (0.13 + 0.87 * s)), 0.8));
+        (0.26 + 0.78 * Math.pow(Math.sin(Math.PI * (0.11 + 0.89 * s)), 0.75));
 
-      // tangent (for the tilted frond planes)
-      tang.copy(dirH).multiplyScalar(1).setY(rise - 2 * droop * 0.5).normalize();
-      biN.copy(tang).cross(side).normalize();       // roughly up
-
-      const planes = lod === 0 ? [0.42, -0.42] : [0.0];
-      for (const th of planes) {
-        const ct = Math.cos(th), st = Math.sin(th);
-        const ox = side.x * ct + biN.x * st, oy = side.y * ct + biN.y * st, oz = side.z * ct + biN.z * st;
-        // soft foliage normal: mostly up + outward, so the mass shades as a
-        // volume instead of showing the quad planes
-        let nx = -side.x * st + biN.x * ct, ny = -side.y * st + biN.y * ct, nz = -side.z * st + biN.z * ct;
-        nx = nx * 0.52 + dirH.x * 0.42; ny = ny * 0.52 + 0.58; nz = nz * 0.52 + dirH.z * 0.42;
-        const nl = Math.hypot(nx, ny, nz) || 1;
-        nx /= nl; ny /= nl; nz /= nl;
-
-        // one needle card per segment, alternating tiles so a long branch does
-        // not repeat visibly
-        for (let k = 0; k < segsPerBranch; k++) {
-          const s0 = k / segsPerBranch, s1 = (k + 1) / segsPerBranch;
-          const card = (k + bi) & 1;
-          const p0 = at(s0).clone(), w0 = wid(s0);
-          const p1 = at(s1).clone(), w1 = wid(s1);
-          const f0 = clamp((p0.y + 0.35) / H, 0, 1) * (0.35 + 0.65 * s0);
-          const f1 = clamp((p1.y + 0.35) / H, 0, 1) * (0.35 + 0.65 * s1);
-          const q00 = uvNeedle(card, 0, 0.01), q01 = uvNeedle(card, 0, 0.99);
-          const q10 = uvNeedle(card, 1, 0.01), q11 = uvNeedle(card, 1, 0.99);
-          const C = S.col;
-          const a0v = gb.v(p0.x - ox * w0, p0.y - oy * w0, p0.z - oz * w0, nx, ny, nz, q00[0], q00[1], C[0], C[1], C[2], f0);
-          const b0v = gb.v(p0.x + ox * w0, p0.y + oy * w0, p0.z + oz * w0, nx, ny, nz, q01[0], q01[1], C[0], C[1], C[2], f0);
-          const a1v = gb.v(p1.x - ox * w1, p1.y - oy * w1, p1.z - oz * w1, nx, ny, nz, q10[0], q10[1], C[0], C[1], C[2], f1);
-          const b1v = gb.v(p1.x + ox * w1, p1.y + oy * w1, p1.z + oz * w1, nx, ny, nz, q11[0], q11[1], C[0], C[1], C[2], f1);
-          gb.quad(a0v, a1v, b1v, b0v);
+      // ---- woody stem ------------------------------------------------------
+      if (lod === 0 && BL > 1.3) {
+        const NS = 2;
+        const sp = [], sr = [];
+        for (let k = 0; k <= NS; k++) {
+          const s = k / NS;
+          sp.push(at(s).clone());
+          sr.push(Math.max(0.012, BL * 0.032 * (1 - 0.82 * s)));
         }
+        gb.tw = 0.25;
+        sweep(gb, sp, sr, 3, [bcol[0] * 0.78, bcol[1] * 0.76, bcol[2] * 0.72],
+          (s) => clamp((anchor.y + 0.35) / H, 0, 1) * (0.3 + 0.7 * s),
+          { uv: uvWood });
+        gb.tw = 0;
       }
 
-      // ---- snow ridge on top of the branch ---------------------------------
-      // A three-column ridge that follows the branch's sag: left lip, raised
-      // crest, right lip. Every row's half-width is jittered independently, so
-      // the silhouette scallops the way wind-drifted snow does instead of
-      // reading as a flat white plate.
-      // Load is heaviest on the exposed upper whorls and patchier low down,
-      // where the canopy above has already shed onto it.
-      if (rnd() < S.snow * (0.58 + 0.42 * (1 - u))) {
-        const load = 0.74 + 0.36 * rnd();
-        const rowsN = lod === 0 ? 5 : 3;
-        const start = 0.02 + 0.09 * rnd();
+      const nCards = lod === 0
+        ? Math.round(8 + 7 * Math.min(1, BL / 2.2))
+        : Math.round(3 + 2.4 * Math.min(1, BL / 2.2));
+      sprigs(at, wid, 0.12, 1.0, nCards, { sprig: S.sprig, size: 1.0, shade: false });
+      // a shaded card tucked underneath, so the crown has an inside
+      if (lod === 0 && !dead) {
+        sprigs((s) => R2.copy(at(s)).setY(R2.y - wid(s) * 0.50), wid, 0.28, 0.88,
+          2, { sprig: S.sprig, size: 0.9, shade: true, snowK: 0.05 });
+      }
+
+      // ---- sub-branches ----------------------------------------------------
+      const nSub = lod === 0 ? S.sub : 0;
+      for (let sbi = 0; sbi < nSub; sbi++) {
+        const ss = 0.30 + 0.42 * (sbi / Math.max(1, nSub)) + rnd() * 0.16;
+        if (ss > 0.92) continue;
+        const base = at(ss).clone();
+        const fork = (sbi % 2 ? 1 : -1) * (0.42 + rnd() * 0.5);
+        const sd = new THREE.Vector3(
+          dirH.x * Math.cos(fork) - dirH.z * Math.sin(fork), 0,
+          dirH.x * Math.sin(fork) + dirH.z * Math.cos(fork));
+        const SBL = BL * (1 - ss) * (0.55 + 0.5 * rnd());
+        if (SBL < 0.12) continue;
+        const sDroop = droop * (0.8 + 0.5 * rnd());
+        const sRise = rise * (0.6 + 0.7 * rnd());
+        const sAt = (s) => Q.copy(base)
+          .addScaledVector(sd, SBL * s)
+          .setY(base.y + SBL * (sRise * s - sDroop * s * s + tipUp * 1.4 * s * s * s * s));
+        const sWid = (s) => SBL * S.frondW * 1.15 *
+          (0.30 + 0.74 * Math.pow(Math.sin(Math.PI * (0.13 + 0.87 * s)), 0.75));
+        sprigs(sAt, sWid, 0.05, 1.0, Math.round(4 + 3 * Math.min(1, SBL / 1.4)),
+          { sprig: S.sprig, size: 0.9, shade: false });
+      }
+
+      // ---- snow load along the crest ---------------------------------------
+      // A shallow tented strip mapped to the blanket tile: both lips fray to
+      // nothing in the texture, so this never shows a polygon edge. Rows may
+      // collapse entirely — real load sits in clumps with bare needles between.
+      if (!dead && rnd() < branchLoad * (0.55 + 0.45 * (1 - u)) * 2.1) {
+        const rowsN = lod === 0 ? 4 : 2;
+        const start = 0.06 + 0.12 * rnd();
         const rows = [];
         for (let k = 0; k <= rowsN; k++) {
           const s = start + (1 - start) * (k / rowsN);
-          const p = at(s);
-          // stop the rind well short of the branch tip: run it to the tip and
-          // the taper leaves a bright pointed cone hanging past the needles
-          const cap = smoothstep(0.90, 0.58, s) * smoothstep(start - 0.02, start + 0.20, s);
-          // jitter can go negative: rows that collapse leave bare needles
-          // showing through, which is what breaks the ridge into clumps
-          // Rows are allowed to collapse entirely. A continuous ribbon down
-          // every branch is what read as cardboard; real load sits in clumps
-          // with bare needles showing between them.
-          const jit = 1.35 * vnoise2(k * 3.17 + ti * 4.1, bi * 2.9 + si * 7.3) - 0.22;
-          if (jit < 0.16) { rows.push(null); continue; }
-          // The rind must stay well inside the needle silhouette. At 0.62 with
-          // an independently jittered lip it reached 1.3x the frond half-width,
-          // which is precisely how you get white parallelograms sticking out
-          // past the foliage.
-          const w = Math.min(wid(s) * 0.44, wid(s) * 0.34 * jit * cap * load);
-          if (w < 0.004) { rows.push(null); continue; }
-          // left and right lips are jittered independently, so the ridge is a
-          // scalloped drift rather than a symmetric extruded plate
-          const wl = w * (0.62 + 0.5 * vnoise2(k * 5.3 + bi * 1.7, ti * 2.3 + 11.1));
-          const wr = w * (0.62 + 0.5 * vnoise2(k * 5.3 + bi * 1.7 + 31.7, ti * 2.3 - 4.9));
-          const mean = (vnoise2(k * 2.7 + bi * 5.1, ti * 3.3) - 0.5) * wid(s) * 0.22;
-          const lump = (vnoise2(k * 4.3 + ti * 1.9, bi * 6.7 + 3.1) - 0.5) * 0.5 * w;
-          // The rind sits ON the needles, not floating over them: the crest
-          // clears the frond plane by a tenth of the frond half-width and the
-          // two lips drop BELOW it, so needles emerge through the snow instead
-          // of showing daylight underneath a white slab.
-          const lift = wid(s) * 0.10;
+          const p = at(s).clone();
+          const cap = smoothstep(0.94, 0.62, s) * smoothstep(start - 0.02, start + 0.22, s);
+          const jit = 1.45 * vnoise2(k * 3.17 + ti * 4.1 + bi * 2.9, si * 7.3 + bi * 1.3) - 0.20;
+          if (jit < 0.14) { rows.push(null); continue; }
+          const w = Math.min(wid(s) * 1.15, wid(s) * 1.05 * jit * cap * (0.6 + 0.7 * branchLoad));
+          if (w < 0.006) { rows.push(null); continue; }
+          const mean = (vnoise2(k * 2.7 + bi * 5.1, ti * 3.3) - 0.5) * wid(s) * 0.24;
+          // the rind sits proud of the foliage: a real load is 10-20 cm of snow
+          // riding ON the needles, not a decal painted into them
+          const lift = wid(s) * 0.34;
           const cyc = p.y + lift;
-          // Five columns — lip / shoulder / crest / shoulder / lip — so the
-          // crest-to-lip falloff has two interpolation spans rather than the
-          // one-vertex 3.5:1 step that rendered as a hard white ribbon.
-          // The lip is shadowed snow (blue ambient), never needle-dark.
-          // per-row tone jitter, so a run of rows never renders as one flat
-          // value the way a single authored crest colour did
-          const tv = 0.90 + 0.20 * vnoise2(k * 7.7 + bi * 3.3, ti * 5.1 + 19.3);
-          const crest = [1.10 * tv, 1.12 * tv, 1.19 * tv];
-          const shoul = [0.94 * tv, 0.99 * tv, 1.10 * tv];
-          const lipc = [0.70 * tv, 0.76 * tv, 0.92 * tv];
-          const fl = clamp((p.y + 0.35) / H, 0, 1) * (0.35 + 0.65 * s);
+          const tv = 0.92 + 0.16 * vnoise2(k * 7.7 + bi * 3.3, ti * 5.1 + 19.3);
+          const crest = [1.06 * tv, 1.08 * tv, 1.14 * tv];
+          const lipc = [0.60 * tv, 0.68 * tv, 0.88 * tv];
+          const fl = clamp((p.y + 0.35) / H, 0, 1) * (0.30 + 0.7 * s);
           const mx = p.x + side.x * mean, mz = p.z + side.z * mean;
-          // A shallow rolled section, not a deep U. A deep one shows its own
-          // concave underside when the branch is viewed from above and reads
-          // as a curled paper scoop.
+          // monotonic: a wrapped u would make one quad interpolate backwards
+          // through the whole tile and smear it
+          const us = clamp((s - start) / (1 - start), 0, 1);
+          // Four columns give the rind a rounded section: two lips that drop
+          // below the needle plane and a broad crest between them. Three read
+          // as a folded paper tent.
+          const shoul = [0.90 * tv, 0.94 * tv, 1.02 * tv];
           const cols = [
-            [-wl, -0.26, lipc, 0.02, 0.86],
-            [-wl * 0.54, 0.02, shoul, 0.26, 0.48],
-            [0, 0.17, crest, 0.50, 0.0],
-            [wr * 0.54, 0.02, shoul, 0.74, -0.48],
-            [wr, -0.26, lipc, 0.98, -0.86],
+            [-w, -0.52, lipc, 0.01, 0.94],
+            [-w * 0.42, 0.30, shoul, 0.30, 0.36],
+            [w * 0.42, 0.30, shoul, 0.70, -0.36],
+            [w, -0.52, lipc, 0.99, -0.94],
           ];
           const row = [];
+          gb.tw = 0.06;
           for (const cdef of cols) {
             const off = cdef[0];
-            // tile the snow blobs three times down a branch instead of
-            // stretching one tile over the whole length
-            const uv = uvSnow((s * 3.4 + bi * 0.37) % 1, cdef[3]);
+            const uv = uvBlanket(us, cdef[3]);
             const sx2 = cdef[4], ny2 = Math.sqrt(Math.max(0.04, 1 - sx2 * sx2));
             row.push(gb.v(
-              mx + side.x * off, cyc + cdef[1] * Math.abs(off || w) + lump * 0.3, mz + side.z * off,
+              mx + side.x * off, cyc + cdef[1] * Math.abs(off || w), mz + side.z * off,
               -side.x * sx2, ny2, -side.z * sx2,
               uv[0], uv[1], cdef[2][0], cdef[2][1], cdef[2][2], fl));
           }
+          gb.tw = 0;
           rows.push(row);
         }
         for (let k = 0; k < rowsN; k++) {
           const A = rows[k], B = rows[k + 1];
           if (!A || !B) continue;
-          for (let c2 = 0; c2 < 4; c2++) gb.quad(A[c2], A[c2 + 1], B[c2 + 1], B[c2]);
+          for (let c2 = 0; c2 < 3; c2++) gb.quad(A[c2], A[c2 + 1], B[c2 + 1], B[c2]);
+        }
+
+        // a clump where the load has piled thickest, on the heaviest limbs only
+        if (lod === 0 && branchLoad > 0.7) {
+          const nc = Math.round(1.4 * branchLoad * rnd());
+          for (let c2 = 0; c2 < nc; c2++) {
+            const s = 0.16 + 0.62 * rnd();
+            const p = at(s).clone();
+            const r = wid(s) * (0.55 + 0.6 * rnd());
+            if (r < 0.03) continue;
+            const yaw = rnd() * Math.PI;
+            const cx2 = Math.cos(yaw), cz2 = Math.sin(yaw);
+            const fl = clamp((p.y + 0.35) / H, 0, 1) * (0.3 + 0.7 * s);
+            gb.tw = 0.04;
+            const q = [];
+            for (const [su, sv] of [[0, 0], [1, 0], [1, 1], [0, 1]]) {
+              const a2 = (su - 0.5) * r * 2.2, b2 = (sv - 0.5) * r * 1.5;
+              q.push(gb.v(
+                p.x + cx2 * a2 - cz2 * b2 * 0.25,
+                p.y + wid(s) * 0.24 + (0.5 - sv) * r * 0.5,
+                p.z + cz2 * a2 + cx2 * b2 * 0.25,
+                0, 1, 0, ...uvClump(su, sv), 1.02, 1.04, 1.10, fl));
+            }
+            gb.quad(q[0], q[1], q[2], q[3]);
+            gb.tw = 0;
+          }
         }
       }
     }
   }
 
-  // ---- leader: a short needled spire with a snow-loaded tip ---------------
-  {
+  // ---- leader: a needled spire with a snow-capped tip ----------------------
+  if (!dead) {
     const top = trunkAt(1).clone();
-    const n = lod === 0 ? 6 : 4;
-    const rTip = Math.max(0.09, S.spread * H * 0.14);
-    const hTip = Math.max(0.30, H * 0.042);
-    const green = [S.col[0] * 0.30, S.col[1] * 0.34, S.col[2] * 0.28];
-    const rings = [
-      { y: top.y - hTip * 0.55, r: rTip, c: green },
-      { y: top.y + hTip * 0.42, r: rTip * 0.46, c: [0.68, 0.74, 0.78] },
-      { y: top.y + hTip, r: rTip * 0.14, c: [1.18, 1.20, 1.24] },
-    ];
-    const rows = rings.map((rg, ri) => {
-      const out = [];
-      for (let k = 0; k < n; k++) {
-        const th = (k / n) * Math.PI * 2;
-        const nx = Math.cos(th), nz = Math.sin(th);
-        const uv = uvSnow(k / n, 0.2 + ri * 0.3);
-        out.push(gb.v(top.x + nx * rg.r, rg.y, top.z + nz * rg.r,
-          nx * 0.62, 0.78, nz * 0.62, uv[0], uv[1], rg.c[0], rg.c[1], rg.c[2], 0.95));
-      }
-      return out;
-    });
-    for (let ri = 0; ri < rows.length - 1; ri++) {
-      for (let k = 0; k < n; k++) {
-        const k2 = (k + 1) % n;
-        gb.quad(rows[ri][k], rows[ri][k2], rows[ri + 1][k2], rows[ri + 1][k]);
+    const hTip = Math.max(0.35, H * 0.055);
+    const rTip = Math.max(0.06, S.spread * H * 0.11);
+    const nL = lod === 0 ? 5 : 2;
+    for (let k = 0; k < nL; k++) {
+      const th = (k / nL) * Math.PI * 2 + rnd();
+      const dx = Math.cos(th), dz = Math.sin(th);
+      const at = (s) => P.set(top.x + dx * rTip * 2.0 * s, top.y - hTip * 0.5 + hTip * 1.5 * s,
+        top.z + dz * rTip * 2.0 * s);
+      const wid = () => rTip * 1.5;
+      sprigs(at, wid, 0.1, 0.95, lod === 0 ? 3 : 1, { sprig: S.sprig, size: 0.9, snowK: 1.5 });
+    }
+    if (LOAD > 0.4) {
+      const n = lod === 0 ? 6 : 4;
+      const ringsT = [
+        { y: top.y - hTip * 0.15, r: rTip * 1.0, c: [0.90, 0.94, 1.02] },
+        { y: top.y + hTip * 0.62, r: rTip * 0.44, c: [1.06, 1.09, 1.16] },
+        { y: top.y + hTip * 1.10, r: rTip * 0.10, c: [1.10, 1.12, 1.18] },
+      ];
+      const rows = ringsT.map((rg, ri) => {
+        const out = [];
+        for (let k = 0; k < n; k++) {
+          const th = (k / n) * Math.PI * 2;
+          const nx = Math.cos(th), nz = Math.sin(th);
+          const uv = uvSnow(k / n, 0.2 + ri * 0.3);
+          out.push(gb.v(top.x + nx * rg.r, rg.y, top.z + nz * rg.r,
+            nx * 0.62, 0.78, nz * 0.62, uv[0], uv[1], rg.c[0], rg.c[1], rg.c[2], 0.95));
+        }
+        return out;
+      });
+      for (let ri = 0; ri < rows.length - 1; ri++) {
+        for (let k = 0; k < n; k++) {
+          const k2 = (k + 1) % n;
+          gb.quad(rows[ri][k], rows[ri][k2], rows[ri + 1][k2], rows[ri + 1][k]);
+        }
       }
     }
   }
 
   // ---- tree well: snow collar banked against the trunk, then a ring of
-  // dropped needle litter and twigs. The litter ring is what actually reads as
-  // a tree well; without it the stem meets a clean white sheet on a hard line.
+  // dropped needle litter. The litter ring is what actually reads as a tree
+  // well; without it the stem meets a clean white sheet on a hard line.
   {
     const n = lod === 0 ? 10 : 6;
     const R = Math.max(0.6, S.trunkR * 3.1 + H * 0.026);
     const hM = R * 0.34;
-    const ctr = gb.v(0, hM - 0.30, 0, 0, 1, 0, ...uvSnow(0.5, 0.5), 1.18, 1.20, 1.24, 0);
+    const ctr = gb.v(0, hM - 0.30, 0, 0, 1, 0, ...uvSnow(0.5, 0.5), 1.05, 1.07, 1.12, 0);
     const ring = [];
     for (let k = 0; k < n; k++) {
       const th = (k / n) * Math.PI * 2;
-      // banked up on the windward side, scoured out to leeward
       const bank = 0.72 + 0.5 * vnoise2(k * 1.7, si * 3.3) + 0.34 * clamp(Math.cos(th - wind), 0, 1);
       const rr = R * bank;
       const uv = uvSnow(0.5 + 0.4 * Math.cos(th), 0.5 + 0.4 * Math.sin(th));
       ring.push(gb.v(Math.cos(th) * rr, -0.30 - 0.10 * clamp(-Math.cos(th - wind), 0, 1),
         Math.sin(th) * rr,
-        Math.cos(th) * 0.35, 0.94, Math.sin(th) * 0.35, uv[0], uv[1], 1.15, 1.17, 1.21, 0));
+        Math.cos(th) * 0.35, 0.94, Math.sin(th) * 0.35, uv[0], uv[1], 1.02, 1.04, 1.09, 0));
     }
     for (let k = 0; k < n; k++) gb.tri(ctr, ring[(k + 1) % n], ring[k]);
 
     if (lod === 0 && si !== 4) {
-      const nLit = 5;
-      for (let k = 0; k < nLit; k++) {
+      gb.tw = 0.4;
+      for (let k = 0; k < 5; k++) {
         const th = rnd() * Math.PI * 2;
-        const rr = R * (0.9 + 1.4 * rnd());
+        const rr = R * (0.9 + 1.5 * rnd());
         const lx = Math.cos(th) * rr, lz = Math.sin(th) * rr;
         const a = rnd() * Math.PI * 2;
-        const w2 = 0.16 + 0.22 * rnd(), l2 = 0.28 + 0.42 * rnd();
+        const w2 = 0.22 + 0.34 * rnd(), l2 = 0.34 + 0.55 * rnd();
         const dx = Math.cos(a), dz = Math.sin(a);
         const px2 = -dz, pz2 = dx;
-        const card = k & 1;
-        const y2 = -0.24 + 0.03 * rnd();
-        const C2 = [0.42, 0.44, 0.40];
+        const y2 = -0.25 + 0.03 * rnd();
+        const C2 = [0.56, 0.54, 0.48];
         const q = [];
         for (const [su, sv] of [[0, 0], [1, 0], [1, 1], [0, 1]]) {
           const ux = (su - 0.5) * l2, uz = (sv - 0.5) * w2;
-          const uv = uvNeedle(card, 0.12 + su * 0.5, 0.30 + sv * 0.4);
+          const uv = uvLitter(su, sv);
           q.push(gb.v(lx + dx * ux + px2 * uz, y2, lz + dz * ux + pz2 * uz,
             0, 1, 0, uv[0], uv[1], C2[0], C2[1], C2[2], 0));
         }
         gb.quad(q[0], q[1], q[2], q[3]);
       }
+      gb.tw = 0;
     }
   }
 
@@ -1177,6 +1858,9 @@ function buildConifer(rnd, si, lod) {
   g.userData.height = H;
   return g;
 }
+
+/** Sprig tile index is ignored for dead twigs — there is only one. */
+const uvDeadTile = (i, s, t) => uvDead(s, t);
 
 /**
  * Crossed alpha cards carrying painted conifers.
@@ -1188,6 +1872,9 @@ function buildConifer(rnd, si, lod) {
  */
 function buildCard(cell, cells, width, above, below, nq) {
   const gb = new GB();
+  // A card is a whole tree, half of it snow. Taking the per-instance foliage
+  // hue at full weight turned the rime on a warm-tinted instance yellow-green.
+  gb.tw = 0.40;
   const inset = 8 / 512 / cells;
   const u0 = cell / cells + inset, u1 = (cell + 1) / cells - inset;
   const v0 = 0.004, v1 = 0.996;
@@ -1197,11 +1884,18 @@ function buildCard(cell, cells, width, above, below, nq) {
     const dx = Math.cos(th), dz = Math.sin(th);
     const nx = -Math.sin(th), nz = Math.cos(th);
     const c = [1, 1, 1];
-    const a = gb.v(-dx * hw, -below, -dz * hw, nx * 0.45, 0.76, nz * 0.45, u0, v0, ...c, 0);
-    const b = gb.v(dx * hw, -below, dz * hw, nx * 0.45, 0.76, nz * 0.45, u1, v0, ...c, 0);
-    const d = gb.v(dx * hw, above, dz * hw, nx * 0.45, 0.76, nz * 0.45, u1, v1, ...c, 0.55);
-    const e = gb.v(-dx * hw, above, -dz * hw, nx * 0.45, 0.76, nz * 0.45, u0, v1, ...c, 0.55);
+    // A crown's average normal points up. The card used to be drawn once with a
+    // DoubleSide material, and three flips the normal on back faces — so the
+    // three planes of one tree came out lit from above, from the side and from
+    // BELOW, and a stand rendered as a random mix of white and near-black
+    // spikes. Each plane is therefore emitted twice with opposite winding and
+    // the same upward normal, and the material is single-sided.
+    const a = gb.v(-dx * hw, -below, -dz * hw, nx * 0.30, 0.94, nz * 0.30, u0, v0, ...c, 0);
+    const b = gb.v(dx * hw, -below, dz * hw, nx * 0.30, 0.94, nz * 0.30, u1, v0, ...c, 0);
+    const d = gb.v(dx * hw, above, dz * hw, nx * 0.30, 0.94, nz * 0.30, u1, v1, ...c, 0.55);
+    const e = gb.v(-dx * hw, above, -dz * hw, nx * 0.30, 0.94, nz * 0.30, u0, v1, ...c, 0.55);
     gb.quad(a, b, d, e);
+    gb.quad(e, d, b, a);
   }
   return gb.geo();
 }
@@ -1242,9 +1936,11 @@ function buildKrummholz(rnd, lod) {
       const c = gb.v(p1[0] + sx * w1, p1[1] + w1 * 0.35, p1[2] + sz * w1, 0, 1, 0, q11[0], q11[1], ...DARK, 0.8);
       const d = gb.v(p1[0] - sx * w1, p1[1], p1[2] - sz * w1, 0, 1, 0, q10[0], q10[1], ...DARK, 0.8);
       gb.quad(a, b, c, d);
-      const uL = uvSnow(s0, 0.10), uC = uvSnow(s0, 0.5), uR = uvSnow(s0, 0.90);
-      const vL = uvSnow(s1, 0.10), vC = uvSnow(s1, 0.5), vR = uvSnow(s1, 0.90);
-      const CS = [1.20, 1.22, 1.28], CL = [0.78, 0.84, 0.98];
+      // the load rides the blanket tile, whose lips fray to nothing, so the
+      // krummholz drift ends in broken snow rather than on a polygon edge
+      const uL = uvBlanket(s0, 0.02), uC = uvBlanket(s0, 0.5), uR = uvBlanket(s0, 0.98);
+      const vL = uvBlanket(s1, 0.02), vC = uvBlanket(s1, 0.5), vR = uvBlanket(s1, 0.98);
+      const CS = [1.02, 1.04, 1.10], CL = [0.68, 0.74, 0.90];
       const y0 = p0[1] + w0 * 0.20, y1 = p1[1] + w1 * 0.20;
       const r0 = [
         gb.v(p0[0] - sx * w0 * 0.9, y0 - w0 * 0.4, p0[2] - sz * w0 * 0.9, -sx * 0.8, 0.6, -sz * 0.8, uL[0], uL[1], ...CL, 0.5),
@@ -1264,7 +1960,7 @@ function buildKrummholz(rnd, lod) {
   // upwind drift, elongated across the wind and scoured to leeward
   {
     const n = lod === 0 ? 10 : 7;
-    const ctr = gb.v(-wx * 0.55, 0.42, -wz * 0.55, 0, 1, 0, ...uvSnow(0.5, 0.5), 1.18, 1.20, 1.26, 0);
+    const ctr = gb.v(-wx * 0.55, 0.42, -wz * 0.55, 0, 1, 0, ...uvSnow(0.5, 0.5), 1.05, 1.07, 1.13, 0);
     const ring = [];
     for (let k = 0; k < n; k++) {
       const th = (k / n) * Math.PI * 2;
@@ -1273,7 +1969,7 @@ function buildKrummholz(rnd, lod) {
       const rr = 0.62 + 0.5 * vnoise2(k * 2.3, 7.7) + 0.55 * up;
       const uv = uvSnow(0.5 + 0.35 * cx2, 0.5 + 0.35 * cz2);
       ring.push(gb.v(-wx * 0.55 + cx2 * rr, -0.16, -wz * 0.55 + cz2 * rr,
-        cx2 * 0.5, 0.86, cz2 * 0.5, uv[0], uv[1], 1.14, 1.16, 1.22, 0));
+        cx2 * 0.5, 0.86, cz2 * 0.5, uv[0], uv[1], 1.02, 1.04, 1.10, 0));
     }
     for (let k = 0; k < n; k++) gb.tri(ctr, ring[(k + 1) % n], ring[k]);
   }
@@ -1288,10 +1984,10 @@ function buildKrummholz(rnd, lod) {
       const tx = bx + wx * hh * 0.55, tz = bz + wz * hh * 0.55;
       const w2 = 0.022;
       const C2 = [0.34, 0.32, 0.30];
-      const a = gb.v(bx - w2, 0.10, bz, 0, 1, 0, ...uvBark(0.2, 0.2), ...C2, 0);
-      const b = gb.v(bx + w2, 0.10, bz, 0, 1, 0, ...uvBark(0.3, 0.2), ...C2, 0);
-      const c = gb.v(tx + w2 * 0.5, 0.10 + hh, tz, 0, 1, 0, ...uvBark(0.3, 0.5), ...C2, 0.9);
-      const d = gb.v(tx - w2 * 0.5, 0.10 + hh, tz, 0, 1, 0, ...uvBark(0.2, 0.5), ...C2, 0.9);
+      const a = gb.v(bx - w2, 0.10, bz, 0, 1, 0, ...uvDead(0.06, 0.36), ...C2, 0);
+      const b = gb.v(bx + w2, 0.10, bz, 0, 1, 0, ...uvDead(0.06, 0.64), ...C2, 0);
+      const c = gb.v(tx + w2 * 0.5, 0.10 + hh, tz, 0, 1, 0, ...uvDead(0.9, 0.64), ...C2, 0.9);
+      const d = gb.v(tx - w2 * 0.5, 0.10 + hh, tz, 0, 1, 0, ...uvDead(0.9, 0.36), ...C2, 0.9);
       gb.quad(a, b, c, d);
     }
   }
@@ -1718,6 +2414,7 @@ export function createScatter(scene, terrain) {
           #include <common>
           attribute float aFlex;
           attribute float aRand;
+          attribute float aTint;
           uniform float uTime;
           uniform vec3 uCam;
           uniform float uSway;
@@ -1738,11 +2435,45 @@ export function createScatter(scene, terrain) {
           float amp = aFlex * aFlex * uSway;
           transformed.x += ( sin( ph ) + 0.32 * sin( ph * 2.7 + 1.3 ) ) * amp;
           transformed.z += cos( ph * 0.83 + 2.0 ) * amp * 0.8;
+        `)
+        // Per-instance colour is a *foliage* variation — bluish-green through
+        // olive to near-black across a stand. `aTint` gates it, so the snow
+        // load and the bark on a heavily tinted tree stay their own colour
+        // instead of turning green with the needles.
+        .replace('#include <color_vertex>', /* glsl */`
+          #include <color_vertex>
+          #ifdef USE_INSTANCING_COLOR
+            vColor.xyz = mix( vColor.xyz / max( instanceColor.xyz, vec3( 1e-4 ) ),
+                              vColor.xyz, aTint );
+          #endif
         `);
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\n varying float vLodA;')
+        .replace('#include <common>', /* glsl */`
+          #include <common>
+          varying float vLodA;
+          uniform float uTime;
+        `)
         .replace('#include <clipping_planes_fragment>',
-          '#include <clipping_planes_fragment>\n if ( vLodA <= 0.0 ) discard;');
+          '#include <clipping_planes_fragment>\n if ( vLodA <= 0.0 ) discard;')
+        // Stochastic alpha coverage. A plain alpha test turns every needle
+        // fringe into a stair-stepped binary edge, which is precisely the
+        // "flat cutout plane" read. Instead the texture alpha is converted to
+        // an analytic coverage using its own screen-space derivative, then
+        // dithered against an interleaved-gradient hash that rotates every
+        // frame; the TAA resolve integrates it into a soft, correctly
+        // anti-aliased edge at no extra fill cost.
+        .replace('#include <alphatest_fragment>', /* glsl */`
+          #ifdef USE_ALPHATEST
+            float aCov = ( diffuseColor.a - alphaTest ) /
+                         max( fwidth( diffuseColor.a ), 1e-4 ) + 0.5;
+            if ( aCov < 1.0 ) {
+              vec2 ipx = gl_FragCoord.xy + fract( uTime * 3.7 ) * 137.0;
+              float ign = fract( 52.9829189 *
+                          fract( dot( ipx, vec2( 0.06711056, 0.00583715 ) ) ) );
+              if ( aCov < ign ) discard;
+            }
+          #endif
+        `);
     };
     mat.customProgramCacheKey = () => key;
     return mat;
@@ -1787,17 +2518,23 @@ export function createScatter(scene, terrain) {
     return patchFoliage(m, key);
   }
 
-  const treeTex = makeTreeAtlas();
+  const treeAtlas = makeTreeAtlas();
+  const treeTex = treeAtlas.tex;
   const impTex = makeSingleImpostorAtlas();
   // dense -> sparse cells; the density model picks the cell, which is what
   // turns the treeline into tongues and glades instead of an even soft fade
-  const clTex = makeClusterAtlas([11, 9, 6, 3], CL_W, CL_H, CL_SINK / CL_H, 0xc1a5, 0.06, false);
-  const massTex = makeClusterAtlas([46, 40, 24, 10], MASS_W, MASS_H, MASS_SINK / MASS_H, 0x9a55, 0.30, true);
+  const clTex = makeClusterAtlas([17, 13, 8, 4], CL_W, CL_H, CL_SINK / CL_H, 0xc1a5, 0.06, false);
+  const massTex = makeClusterAtlas([62, 50, 30, 13], MASS_W, MASS_H, MASS_SINK / MASS_H, 0x9a55, 0.30, true);
   const netTex = makeNetTexture();
 
+  // alphaTest is only the *centre* of the stochastic coverage band now (see
+  // patchFoliage), so it can sit low: needle tips fade out over the last texel
+  // instead of snapping off at one.
   const protoTree = new THREE.MeshStandardMaterial({
-    map: treeTex, alphaTest: 0.40, side: THREE.DoubleSide, vertexColors: true,
-    roughness: 0.82, metalness: 0.0,
+    map: treeTex, normalMap: treeAtlas.nrm,
+    normalScale: new THREE.Vector2(1.0, 1.0),
+    alphaTest: 0.34, side: THREE.DoubleSide, vertexColors: true,
+    roughness: 0.86, metalness: 0.0,
   });
   const matTree0 = bandMat(protoTree, B_G0, 'sc-fol');
   const matTree1 = bandMat(protoTree, B_G1, 'sc-fol');
@@ -1808,7 +2545,7 @@ export function createScatter(scene, terrain) {
   // attacks first, and cutting them at 0.30 keeps the frost alive several
   // levels further down the chain than 0.42 did.
   const protoImp = new THREE.MeshStandardMaterial({
-    map: impTex, alphaTest: 0.30, side: THREE.DoubleSide, vertexColors: true,
+    map: impTex, alphaTest: 0.30, side: THREE.FrontSide, vertexColors: true,
     roughness: 0.9, metalness: 0.0,
   });
   const matImp = bandMat(protoImp, B_IMP, 'sc-fol');
@@ -1848,16 +2585,34 @@ export function createScatter(scene, terrain) {
 
   // Two silhouettes per species so a stand does not read as clones. Krummholz
   // gets its own builder: it is a prostrate wind-flagged mat, not a small tree.
+  // Three silhouettes per species. The variant skews height, spread, snow load
+  // and age independently, so within one species a stand shows a slim young
+  // spire, a broad heavily-plastered middle-aged tree and a tall gappy old one.
+  // Together with the per-instance hue, scale, lean and rotation applied at
+  // emit time, no two neighbours read as the same asset.
+  const VSKEW = [
+    { hScale: 1.00, spread: 1.00, load: 1.05, age: 0.25 },
+    { hScale: 0.78, spread: 1.18, load: 1.20, age: 0.10 },
+    { hScale: 1.22, spread: 0.86, load: 0.72, age: 0.85 },
+  ];
   const VARIANTS = [];
   for (let si = 0; si < SPECIES.length; si++) {
-    for (let k = 0; k < 2; k++) {
+    const nv = si === 4 ? 2 : 3;
+    for (let k = 0; k < nv; k++) {
       const seed = 0x1000 + si * 97 + k * 13;
       const mk = (lod) => (si === 4
         ? buildKrummholz(mulberry32(seed), lod)
-        : buildConifer(mulberry32(seed), si, lod));
-      VARIANTS.push({ si, k, lod0: mk(0), lod1: mk(1), small: si >= 3 });
+        : buildConifer(mulberry32(seed), si, lod, VSKEW[k]));
+      VARIANTS.push({ si, k, lod0: mk(0), lod1: mk(1), small: si === 3 || si === 4 });
     }
   }
+  // variant indices grouped by species, so the emitter can pick one at random
+  const BY_SPECIES = SPECIES.map(() => []);
+  VARIANTS.forEach((V, i) => BY_SPECIES[V.si].push(i));
+  // Impostor cell per (species, variant). Saplings and krummholz never get one.
+  // Six cells over four card species means neighbouring stems in the 92-210 m
+  // band rarely share a silhouette.
+  const impCell = (si, k) => (si === 0 ? k % 2 : si === 1 ? 2 : si === 2 ? 3 : 4 + (k % 2));
 
   // Single-tree cards must subtend the same solid angle as the geometry they
   // replace, or the swap at 100 m changes apparent tree width on top of
@@ -1896,7 +2651,13 @@ export function createScatter(scene, terrain) {
     const p1 = new Pool(V.lod1, matTree1, small ? 1100 : CAP1, { castShadow: true, name: 'tree1' });
     let p2 = null;
     if (!small) {
-      p2 = new Pool(buildCard(V.si, 4, V.impW, V.impH, 0.35, 3), matImp, CAPI, { name: 'tree2' });
+      // No shadow receive on the cards. The cascade at 100-600 m resolves a
+      // whole stand into one binary decision, so a card either blazes white or
+      // goes to ambient black — which is exactly the "row of pale spikes next
+      // to a row of black spikes" read. The painted card already carries its
+      // own self-shadowing.
+      p2 = new Pool(buildCard(impCell(V.si, V.k), IMP_CELLS, V.impW, V.impH, 0.35, 3),
+        matImp, CAPI, { name: 'tree2', receiveShadow: false });
     }
     pools.tree.push([p0, p1, p2]);
     group.add(p0.mesh, p1.mesh);
@@ -1908,10 +2669,12 @@ export function createScatter(scene, terrain) {
   // stays where it was — the fix for a distant forest that was measurably
   // sparser than the near one.
   for (let c = 0; c < 4; c++) {
-    const p = new Pool(buildCard(c, 4, CL_W, CL_H - CL_SINK, CL_SINK, 3), matCl, 2000, { name: 'clust' });
+    const p = new Pool(buildCard(c, 4, CL_W, CL_H - CL_SINK, CL_SINK, 3), matCl, 2800,
+      { name: 'clust', receiveShadow: false });
     pools.cluster.push(p);
     group.add(p.mesh);
-    const q = new Pool(buildCard(c, 4, MASS_W, MASS_H - MASS_SINK, MASS_SINK, 2), matMass, 1200, { name: 'mass' });
+    const q = new Pool(buildCard(c, 4, MASS_W, MASS_H - MASS_SINK, MASS_SINK, 2), matMass, 1900,
+      { name: 'mass', receiveShadow: false });
     pools.mass.push(q);
     group.add(q.mesh);
   }
@@ -2028,12 +2791,17 @@ export function createScatter(scene, terrain) {
   // rest of the canopy where the stems would be sub-pixel anyway.
   const chunks = new Map();
   const TREE_SPACING = 5.6;
-  const CL_SPACING = 14.5;
-  const MASS_SPACING = 36;
+  // Closed subalpine spruce is a *mass*, not a plantation: side by side with a
+  // reference photograph the old spacing read as well-separated Christmas trees
+  // on white ground. Cluster cards are what carry canopy closure past 170 m.
+  const CL_SPACING = 10.5;
+  const MASS_SPACING = 26;
 
   function pickVariant(rn, pr, h) {
     // Species mix drifts with altitude: pine low and warm, spruce everywhere,
-    // fir on the sheltered mid slopes, krummholz at the top.
+    // fir on the sheltered mid slopes, krummholz at the top. A few per cent of
+    // every stand is a dead standing snag, which is what a real subalpine
+    // forest looks like and what a procedural one never has.
     const high = smoothstep(TREELINE - 150, TREELINE + 40, h);
     const r = rn();
     let si;
@@ -2041,8 +2809,10 @@ export function createScatter(scene, terrain) {
     else if (r < 0.20 + 0.25 * (1 - high)) si = 2;
     else if (r < 0.55) si = 1;
     else si = 0;
-    if (rn() < 0.24 + 0.14 * high) si = si === 4 ? 4 : 3;   // saplings
-    return si * 2 + (rn() < 0.5 ? 0 : 1);
+    if (si !== 4 && rn() < 0.05 + 0.05 * high) si = 5;      // snags
+    else if (rn() < 0.24 + 0.14 * high) si = 3;             // saplings
+    const g = BY_SPECIES[si];
+    return g[(rn() * g.length) | 0];
   }
 
   /** Denser clumps get a fuller card; the sparse cells carry the treeline edge. */
@@ -2065,7 +2835,7 @@ export function createScatter(scene, terrain) {
           const pz = z0 + (b + 0.5 + (rn() - 0.5) * cfg.jit) * (CHUNK / n);
           field.probe(px, pz, probe);
           const d = forestAt(px, pz, probe);
-          if (d < 0.06 || rn() > 0.30 + 0.85 * d) continue;
+          if (d < 0.05 || rn() > 0.52 + 0.90 * d) continue;
           items.push({
             k: cfg.k, v: cardCell(d), x: px, y: terrain.height(px, pz), z: pz,
             r: rn() * Math.PI * 2,
@@ -2147,7 +2917,8 @@ export function createScatter(scene, terrain) {
             if (d > 0.20 && rn() < 0.16) {
               const sz = 0.42 + 0.55 * rn();
               items.push({
-                k: 0, v: 8 + (rn() < 0.5 ? 0 : 1), x: px, y: terrain.height(px, pz), z: pz,
+                k: 0, v: BY_SPECIES[4][(rn() * BY_SPECIES[4].length) | 0],
+                x: px, y: terrain.height(px, pz), z: pz,
                 r: rn() * Math.PI * 2, s: sz, sy: sz * (0.7 + 0.4 * rn()),
                 tint: 0.88 + 0.2 * rn(), q: rn() * 0.996 + 0.002,
               });
@@ -2172,15 +2943,28 @@ export function createScatter(scene, terrain) {
           const vi = pickVariant(rn, probe, probe.h);
           const V = VARIANTS[vi];
           const S = SPECIES[V.si];
-          let sc = 0.58 + 0.58 * Math.pow(rn(), 1.5);
+          // Wide age spread: mostly middle-aged, a long tail of young stems and
+          // a few dominants. Pow 2.2 is what puts real saplings in a stand.
+          let sc = 0.44 + 0.80 * Math.pow(rn(), 2.2);
           if (S.name === 'krumm') sc = 0.7 + 0.8 * rn();
           const shrink = 1 - 0.42 * smoothstep(TREELINE - 190, TREELINE + 20, probe.h);
           sc *= shrink;
           const y = terrain.height(px, pz);
+          // Per-instance foliage colour: `vv` runs near-black to bright, `w`
+          // runs blue-green (shaded north aspect, spruce) to olive (sunlit
+          // pine). Gated by aTint, so only the needles take it.
+          const vv = 0.88 + 0.38 * rn();
+          const w = rn();
           items.push({
             k: 0, v: vi, x: px, y, z: pz,
-            r: rn() * Math.PI * 2, s: sc, sy: sc * (0.9 + 0.26 * rn()),
-            tint: 0.86 + 0.22 * rn(), q: rn() * 0.996 + 0.002,
+            r: rn() * Math.PI * 2, s: sc, sy: sc * (0.88 + 0.30 * rn()),
+            tint: vv * (0.88 + 0.18 * w),
+            tg: vv * (1.00 + 0.02 * w),
+            tb: vv * (1.12 - 0.22 * w),
+            // trees grow to gravity, but not exactly: a couple of degrees of
+            // lean per stem is the difference between a plantation and a wood
+            lx: (rn() - 0.5) * 0.10, lz: (rn() - 0.5) * 0.10,
+            q: rn() * 0.996 + 0.002,
           });
         }
       }
@@ -2226,7 +3010,8 @@ export function createScatter(scene, terrain) {
           if (rn() < 0.55) {
             const sc = 0.85 + 0.7 * rn();
             items.push({
-              k: 0, v: 8 + (rn() < 0.5 ? 0 : 1), x: px, y: terrain.height(px, pz), z: pz,
+              k: 0, v: BY_SPECIES[4][(rn() * BY_SPECIES[4].length) | 0],
+                x: px, y: terrain.height(px, pz), z: pz,
               r: rn() * Math.PI * 2, s: sc, sy: sc * (0.85 + 0.3 * rn()),
               tint: 0.9 + 0.16 * rn(), q: rn() * 0.996 + 0.002,
             });
@@ -2295,9 +3080,15 @@ export function createScatter(scene, terrain) {
       if (!ps.length) continue;
       if (it.k === 1 || it.k === 3) {
         // rocks and deadfall bed into the slope: partly gravity-aligned,
-        // partly surface-aligned. Trees never are — they grow to gravity.
+        // partly surface-aligned. Trees grow to gravity — but each with a
+        // couple of degrees of its own lean.
         _nrm.set(it.nx, 1, it.nz).normalize();
         _nrm.lerp(UP, it.k === 3 ? 0.10 : 0.25).normalize();
+        _q.setFromUnitVectors(UP, _nrm);
+        _q2.setFromAxisAngle(UP, it.r);
+        _q.multiply(_q2);
+      } else if (it.lx !== undefined) {
+        _nrm.set(it.lx, 1, it.lz).normalize();
         _q.setFromUnitVectors(UP, _nrm);
         _q2.setFromAxisAngle(UP, it.r);
         _q.multiply(_q2);
@@ -2309,7 +3100,8 @@ export function createScatter(scene, terrain) {
       // isotropic in plan
       _scl.set(it.wide ? it.s * it.wide : it.s, it.sy, it.s);
       _m.compose(_pos, _q, _scl);
-      _col.setRGB(it.tint, it.tint, it.tint * 1.01);
+      _col.setRGB(it.tint, it.tg === undefined ? it.tint : it.tg,
+        it.tb === undefined ? it.tint * 1.01 : it.tb);
       for (let k = 0; k < ps.length; k++) {
         const h = ps[k].add(_m, _col, it.q);
         if (h) hs.push(h);
@@ -3017,7 +3809,7 @@ export function createScatter(scene, terrain) {
     },
 
     dispose() {
-      for (const t of [treeTex, impTex, clTex, massTex, netTex]) t.dispose();
+      for (const t of [treeTex, treeAtlas.nrm, impTex, clTex, massTex, netTex]) t.dispose();
       for (const m of [protoTree, protoImp, protoRock, protoSnow, matTree0, matTree1,
         matLog0, matLog1, matImp, matCl, matMass, matRock0, matRock1,
         matDrift0, matDrift1, matPaint, matNet]) m.dispose();

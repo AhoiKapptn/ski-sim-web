@@ -1,61 +1,78 @@
 import * as THREE from 'three';
+import { createSnowMaterial } from '../world/snow-material.js';
 
 /**
- * Persistent carve trenches.
+ * Carve trenches.
+ *
+ * The single most important thing in this file is what it is NOT: a dark stripe.
+ * A fresh carve on a groomed piste differs from the snow beside it by a couple of
+ * percent of albedo. Everything you actually see — and you see it from thirty
+ * metres — is *shape*: a shallow trench with steep walls, a compacted floor that
+ * is denser, icier and more specular, two shoulders of loose displaced snow, and
+ * the sky occlusion the trench casts on its own floor. Paint it dark and it reads
+ * as gaffer tape laid on the slope; that is exactly what the previous version
+ * did, and it measured 118 luma against 217 for the snow beside it — a 45% drop
+ * where reality is nearer 3%.
+ *
+ * The fix is structural rather than cosmetic: the ribbon is shaded with
+ * `createSnowMaterial()`, i.e. *the piste's own shader*, so the track starts life
+ * as literally the same material as the snow under it — same albedo, same
+ * subsurface scattering, same sparkle, same aerial perspective. This module then
+ * perturbs only four things inside that shader:
+ *
+ *   snNormalW       rotated by the analytic cross-slope of the trench profile
+ *   snIce/snPowder  compacted floor -> the shader's own wind-slab/ice treatment
+ *   roughnessFactor polished floor, loose shoulders
+ *   snMicroAO       the floor sees less sky than the open slope
+ *
+ * and the ribbon is alpha-blended, with opacity driven by the trench profile, so
+ * the rim cross-fades into untouched snow instead of ending on a silhouette. The
+ * rim itself is broken up with noise and, when skidding, scalloped, so it is
+ * never a clean parallel line.
  *
  * Two things are maintained:
  *
- * 1. A SNOW DEFORMATION MAP - a render target covering a window of slope around
- *    the skier that scrolls with him. It is scrolled by *whole texels* (blit into
- *    a ping-pong target with an integer texel offset, virgin snow scrolled in at
- *    the trailing edge) so nothing ever smears, tiles or wraps. Every ski contact
- *    is stamped into it. It is exported as `tracks.deform` so the snow material
- *    can drive displacement / normal perturbation from it when that module wants
- *    it.
+ * 1. A SNOW DEFORMATION MAP — a render target covering a window of slope around
+ *    the skier that scrolls with him, by *whole texels*, so nothing ever smears
+ *    or wraps. Exported as `tracks.deform` for whoever owns the snow material.
  *
- * 2. A TRENCH RIBBON - real geometry generated along the recorded ski path and
- *    conformed to the terrain, because a deformation map on its own cannot be
- *    fed into a material this module does not own. Each ski leaves an
- *    independent trench with a compacted floor, two walls and shoulders of
- *    displaced snow piled either side. The floor is packed, icier and much
- *    shinier than untouched powder; the shoulders are loose and catch the sun.
- *    The trench cuts narrow and deep when carving, wide and shallow when
- *    skidding.
- *
- * The ribbon is a ring buffer of *independent* segments, so persistence is
- * bounded by geometry rather than time (~2200 segments at 0.3 m is ~650 m of
- * track) and a new segment costs one 44-vertex upload, never a rebuild.
+ * 2. The TRENCH RIBBON described above: a ring buffer of *independent* segments,
+ *    so persistence is bounded by geometry rather than time and a new segment
+ *    costs one vertex upload, never a rebuild.
  */
 
 const MAX_SEG = 2200;      // ring buffer of track segments
-const STEP = 0.30;         // metres of travel per segment
+const STEP = 0.28;         // metres of travel per segment
 const MAX_JUMP = 6.0;      // teleport / respawn guard
-const SURFACE_EPS = 0.010; // lift off the terrain to stop z-fighting
+const SURFACE_EPS = 0.016; // lift off the terrain to stop z-fighting
 
 // Cross-section of one ski trench, in normalised coordinates.
 //
 //   u   across the trench, -1..1, scaled by the half width
 //   hG  GEOMETRIC height, in units of trench depth. Never negative: the terrain
 //       mesh is not ours to displace, so nothing may sit below its surface or it
-//       would simply be depth-culled. All the real geometry is the shoulders of
+//       would simply be depth-culled. The real geometry here is the shoulders of
 //       displaced snow piled either side of the cut.
-//   hV  VIRTUAL height - the profile the snow would have if we *could* cut into
-//       it. Only the shading normals are built from this, which is what makes
-//       the groove read as a trench with walls and a floor instead of a pair of
-//       ridges. Standard decal trick: geometry above, relief in the normals.
-//   c   compaction: 0 = untouched powder, 1 = polished trench floor
+//
+// The *virtual* profile — the cut itself — is evaluated analytically in the
+// fragment shader instead of being interpolated from these points, which is what
+// lets the walls stay crisp at any width and lets the rim wander per-pixel.
 const PROFILE = [
-  [-1.00, 0.00,  0.00, 0.00],
-  [-0.72, 0.04,  0.04, 0.10],
-  [-0.52, 0.30,  0.48, 0.16],
-  [-0.38, 0.13, -0.30, 0.54],
-  [-0.22, 0.02, -0.82, 0.90],
-  [ 0.00, 0.00, -1.00, 1.00],
-  [ 0.22, 0.02, -0.82, 0.90],
-  [ 0.38, 0.13, -0.30, 0.54],
-  [ 0.52, 0.30,  0.48, 0.16],
-  [ 0.72, 0.04,  0.04, 0.10],
-  [ 1.00, 0.00,  0.00, 0.00],
+  [-1.00, 0.000],
+  [-0.86, 0.010],
+  [-0.72, 0.075],
+  [-0.60, 0.145],
+  [-0.46, 0.105],
+  [-0.30, 0.030],
+  [-0.15, 0.004],
+  [ 0.00, 0.000],
+  [ 0.15, 0.004],
+  [ 0.30, 0.030],
+  [ 0.46, 0.105],
+  [ 0.60, 0.145],
+  [ 0.72, 0.075],
+  [ 0.86, 0.010],
+  [ 1.00, 0.000],
 ];
 const P = PROFILE.length;
 const VERTS_PER_SEG = P * 2 * 2;          // two rows (ribs) x two skis
@@ -261,6 +278,102 @@ function createDeformMap() {
 }
 
 // ---------------------------------------------------------------------------
+// The trench, expressed as a perturbation of the piste's own snow shader.
+//
+// Injected after <metalnessmap_fragment>, i.e. after snow-material's own
+// SNOW_SURFACE block has run (it owns <roughnessmap_fragment>) and before
+// SNOW_NORMAL turns `snNormalW` into a view-space normal (it owns
+// <normal_fragment_begin>). Everything it touches is a local the snow shader
+// itself declared, so the track is not a second material sitting next to the
+// piste — it is the piste, with a groove cut in it.
+// ---------------------------------------------------------------------------
+const TRACK_SURFACE = /* glsl */`
+{
+  float pu    = vTrk.x;                    // -1..1 across the trench
+  float compR = vTrk.y;                    // how hard this rib was cut
+  float age   = max( uTrkTime - vTrk.z, 0.0 );
+  float along = vTrk.w;                    // metres travelled, continuous
+  float halfW = max( vTrk2.x, 0.02 );      // half width, metres
+  float depth = vTrk2.y;                   // trench depth, metres
+  float skid  = vTrk2.z;
+  float load  = vTrk2.w;
+
+  // ---- the rim is never a straight line -----------------------------------
+  // Snow crumbles as the edge lifts it, so the boundary between cut and
+  // untouched wanders by a few centimetres and, on a skidded turn, scallops.
+  // snFbm returns a signed value in .x and its gradient in .yz.
+  vec3 nR  = snFbm( vec2( along * 1.15, pu * 0.85 ), 2, 0.5 );
+  vec3 nR2 = snFbm( vec2( along * 5.30, pu * 2.10 ), 2, 0.5 );
+  float wob = nR.x * 0.62 + nR2.x * 0.30;
+  float scallop = sin( along * 3.1 + nR2.x * 3.0 ) * skid * 0.22;
+  float au = clamp( abs( pu ) * ( 1.0 + 0.30 * wob + scallop ) + 0.05 * wob, 0.0, 1.6 );
+
+  // ---- analytic cross-section ---------------------------------------------
+  // floor: a gaussian trough. shoulder: the berm of snow the edge pushed out.
+  float fl   = exp( -au * au * 9.5 );
+  float sh   = exp( -pow( ( au - 0.62 ) / 0.21, 2.0 ) );
+  float dFl  = -19.0 * au * fl;
+  float dSh  = -2.0 * ( au - 0.62 ) / ( 0.21 * 0.21 ) * sh;
+  // d(height)/d(u), then converted to a real gradient across the trench.
+  float dh   = ( -depth * dFl + depth * 0.46 * dSh ) * sign( pu );
+  float xslope = clamp( dh / halfW, -1.45, 1.45 );
+
+  // Chatter: an edge under load vibrates and leaves transverse ridges, and the
+  // base leaves fine longitudinal striations on the polished floor.
+  float chat  = snFbm( vec2( along * 13.0, pu * 0.5 ), 2, 0.5 ).x;
+  float stria = sin( pu * 41.0 ) * 0.5;
+  xslope += chat * 0.85 * load * fl;
+  xslope += stria * 0.11 * fl * ( 0.35 + 0.65 * compR );
+
+  // ---- how much of this pixel is track at all ------------------------------
+  float dist  = length( vSnowWPos - cameraPosition );
+  float fadeD = 1.0 - smoothstep( 150.0, 420.0, dist );   // don't stripe the horizon
+  float fadeA = 1.0 - 0.62 * smoothstep( 22.0, 130.0, age );
+  float body  = clamp( fl * 1.55 + sh * 1.25, 0.0, 1.0 );
+  float pack  = compR * fl * fadeD * fadeA;               // polished floor
+  float loose = compR * sh * fadeD * fadeA;               // displaced shoulder
+  float cover = clamp( body * compR * fadeD * fadeA, 0.0, 1.0 );
+
+  // ---- shading -------------------------------------------------------------
+  // All of the read comes from here: the walls turn away from the sun, the floor
+  // sees less sky, and the packed snow goes denser and more specular. The albedo
+  // moves by 3%, which is what it moves by in life.
+  vec3 acr = normalize( vTrkAcross );
+  snNormalW = normalize( snNormalW - acr * xslope * ( fadeD * fadeA ) );
+
+  // The wall on the far side of the sun shadows the floor for most of the day.
+  // three's shadow map is nowhere near fine enough to resolve a 3 cm trench, so
+  // it is done analytically: how far across the groove the sun can reach.
+  float sunA  = dot( normalize( uSunDirW ), acr );
+  float sunUp = max( normalize( uSunDirW ).y, 0.05 );
+  float reach = clamp( abs( sunA ) * depth / ( sunUp * halfW ), 0.0, 1.4 );
+  float wallShade = clamp( ( sign( sunA ) * pu + 1.0 ) * 0.5, 0.0, 1.0 );
+  wallShade = smoothstep( 0.0, 0.55, wallShade ) * reach * fl;
+
+  // Compacted snow is the shader's own "wind slab / ice" end of the scale:
+  // bluer by a percent or two, tighter specular lobe, less powder.
+  snIce    = clamp( max( snIce, pack * 0.85 ), 0.0, 1.0 );
+  snPowder = clamp( snPowder * ( 1.0 - 0.80 * pack ) + loose * 0.55, 0.0, 1.0 );
+  roughnessFactor = mix( roughnessFactor, 0.28, pack * 0.90 );
+  roughnessFactor = min( roughnessFactor + 0.07 * loose, 0.98 );
+
+  // Sky occlusion inside the groove. snow-material turns a low snMicroAO into a
+  // *blue* pit rather than a grey one, which is exactly what a real trench does.
+  snMicroAO *= 1.0 - 0.34 * pack - 0.21 * wallShade;
+
+  // Density, not paint: denser snow is a couple of percent darker, and the loose
+  // berm a shade brighter because it is full of air.
+  diffuseColor.rgb *= 1.0 - 0.030 * pack;
+  diffuseColor.rgb *= 1.0 + 0.016 * loose;
+
+  // Cross-fade to untouched snow at the rim. The ribbon is alpha-blended over
+  // the piste it is cut into, so there is no silhouette anywhere.
+  diffuseColor.a *= cover;
+  if ( diffuseColor.a < 0.004 ) discard;
+}
+`;
+
+// ---------------------------------------------------------------------------
 
 export function createTracks(scene, terrain) {
   const surfaceY = makeSurfaceSampler(terrain);
@@ -272,17 +385,20 @@ export function createTracks(scene, terrain) {
   const nrm = new Float32Array(vCount * 3);
   const across = new Float32Array(vCount * 3);
   const trk = new Float32Array(vCount * 4);   // profileU, compaction, birth, along
+  const trk2 = new Float32Array(vCount * 4);  // halfWidth, depth, skid, load
 
   const geo = new THREE.BufferGeometry();
   const aPos = new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage);
   const aNrm = new THREE.BufferAttribute(nrm, 3).setUsage(THREE.DynamicDrawUsage);
   const aAcr = new THREE.BufferAttribute(across, 3).setUsage(THREE.DynamicDrawUsage);
   const aTrk = new THREE.BufferAttribute(trk, 4).setUsage(THREE.DynamicDrawUsage);
+  const aTrk2 = new THREE.BufferAttribute(trk2, 4).setUsage(THREE.DynamicDrawUsage);
   geo.setAttribute('position', aPos);
   geo.setAttribute('normal', aNrm);
   geo.setAttribute('aAcross', aAcr);
   geo.setAttribute('aTrack', aTrk);
-  const ATTRS = [aPos, aNrm, aAcr, aTrk];
+  geo.setAttribute('aTrack2', aTrk2);
+  const ATTRS = [aPos, aNrm, aAcr, aTrk, aTrk2];
 
   // Static index buffer. Every segment is an independent pair of quad strips, so
   // recycling a slot in the ring never disturbs its neighbours.
@@ -306,139 +422,69 @@ export function createTracks(scene, terrain) {
   geo.setDrawRange(0, 0);
 
   // --- material ------------------------------------------------------------
-  const uTime = { value: 0 };
-  const uDeform = { value: deform.texture };
-  const uDeformCenter = { value: deform.center };
-  const uDeformSize = { value: DEFORM_WORLD };
-
-  const mat = new THREE.MeshStandardMaterial({
-    color: 0xeef4ff,
-    roughness: 0.82,
-    metalness: 0.0,
+  // The piste's own shader. `rock: false` matters: the trench walls are steep,
+  // and snow-material exposes rock on steep normals — a carve would otherwise
+  // grow a granite floor.
+  const uTrkTime = { value: 0 };
+  const mat = createSnowMaterial({
+    rock: false,
     side: THREE.DoubleSide,
+    transparent: true,
+    depthWrite: false,
     polygonOffset: true,
-    polygonOffsetFactor: -2,
-    polygonOffsetUnits: -4,
+    polygonOffsetFactor: -3,
+    polygonOffsetUnits: -6,
+    uniforms: { uTrkTime },
   });
 
   // A silently missed `.replace()` target is the classic way this kind of chunk
   // injection dies quietly, so assert afterwards that every marker landed.
   const patched = {};
+  const innerCompile = mat.onBeforeCompile;
 
-  mat.onBeforeCompile = (shader) => {
-    shader.uniforms.uTime = uTime;
-    shader.uniforms.uDeform = uDeform;
-    shader.uniforms.uDeformCenter = uDeformCenter;
-    shader.uniforms.uDeformSize = uDeformSize;
+  mat.onBeforeCompile = (shader, renderer) => {
+    innerCompile(shader, renderer);
+    shader.uniforms.uTrkTime = uTrkTime;
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>
         attribute vec4 aTrack;
+        attribute vec4 aTrack2;
         attribute vec3 aAcross;
-        varying vec4 vTrack;
-        varying vec3 vAcross;
-        varying vec3 vWPos;`)
+        varying vec4 vTrk;
+        varying vec4 vTrk2;
+        varying vec3 vTrkAcross;`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
-        vTrack  = aTrack;
-        vAcross = aAcross;
-        vWPos   = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
+        vTrk = aTrack;
+        vTrk2 = aTrack2;
+        vTrkAcross = normalize( mat3( modelMatrix ) * aAcross );`);
 
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>
-        uniform float uTime;
-        uniform sampler2D uDeform;
-        uniform vec2 uDeformCenter;
-        uniform float uDeformSize;
-        varying vec4 vTrack;
-        varying vec3 vAcross;
-        varying vec3 vWPos;
-
-        float tHash(vec2 p) {
-          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
-        }
-        float tNoise(vec2 p) {
-          vec2 i = floor(p), f = fract(p);
-          vec2 u = f * f * (3.0 - 2.0 * f);
-          return mix(mix(tHash(i), tHash(i + vec2(1.0, 0.0)), u.x),
-                     mix(tHash(i + vec2(0.0, 1.0)), tHash(i + vec2(1.0, 1.0)), u.x), u.y);
-        }`)
-
-      .replace('#include <color_fragment>', `
-        float pu    = vTrack.x;
-        float comp  = vTrack.y;
-        float age   = max(uTime - vTrack.z, 0.0);
-        float along = vTrack.w;
-        float au    = abs(pu);
-
-        // Fade the shading treatment out at the rim so the opaque ribbon melts
-        // into the untouched snow instead of showing its own silhouette.
-        float edge = 1.0 - smoothstep(0.74, 1.0, au);
-
-        // Crest of displaced snow: loose, granular, the brightest thing here.
-        float crest = smoothstep(0.34, 0.52, au) * (1.0 - smoothstep(0.52, 0.86, au));
-
-        // Snow chatter: coarse break-up plus the fine transverse ridges an edge
-        // leaves, so the trench never reads as a clean extruded stripe.
-        float grain = tNoise(vec2(along * 2.4, pu * 3.0)) * 0.65
-                    + tNoise(vec2(along * 9.0, pu * 7.0)) * 0.35;
-        float chat  = tNoise(vec2(along * 21.0, pu * 1.5));
-        float broken = 0.62 + 0.62 * grain;
-
-        // A previous pass through the same snow packs it further.
-        vec2 dUv = (vWPos.xz - uDeformCenter) / uDeformSize + 0.5;
-        float inWin = step(0.0, dUv.x) * step(dUv.x, 1.0) * step(0.0, dUv.y) * step(dUv.y, 1.0);
-        float crossPack = texture2D(uDeform, dUv).g * inWin;
-        comp = clamp(comp + crossPack * 0.18 * (1.0 - comp), 0.0, 1.0);
-
-        // Compacted snow: denser, distinctly darker and bluer than powder.
-        vec3 packed = vec3(0.80, 0.825, 0.875);
-        comp *= edge;
-        diffuseColor.rgb *= mix(vec3(1.0), packed, comp * broken);
-        diffuseColor.rgb += vec3(0.055, 0.056, 0.060) * crest * edge * (0.55 + 0.9 * grain);
-        diffuseColor.rgb *= 1.0 - 0.20 * comp * chat;
-        diffuseColor.rgb *= mix(1.0, 0.955, edge);   // disturbed apron
-
-        // Older track slowly fills in with wind-blown snow.
-        float fill = smoothstep(30.0, 150.0, age);
-        comp *= 1.0 - 0.45 * fill;
-
-        // The trench floor sees far less sky than the open slope: this
-        // ambient occlusion is most of what makes a groove read as deep.
-        float trenchAO = clamp(mix(1.0, 0.46, comp) + 0.30 * crest, 0.0, 1.3);`)
-
-      // Runs after the lighting loop, so it can shade the direct term too: a
-      // trench floor is shadowed by its own wall for most of the day, and that
-      // tonal drop is what keeps the track readable from thirty metres away.
-      .replace('#include <aomap_fragment>', `
-        reflectedLight.indirectDiffuse  *= trenchAO;
-        reflectedLight.indirectSpecular *= mix(1.0, trenchAO, 0.6);
-        reflectedLight.directDiffuse    *= mix(1.0, 0.86, comp);`)
-
-      // Polished icy trench floor, loose powder on the shoulders.
-      .replace('#include <roughnessmap_fragment>', `
-        float roughnessFactor = mix(roughness, 0.30, comp * comp);
-        roughnessFactor = mix(roughnessFactor, roughness * 1.06, crest);
-        roughnessFactor = clamp(roughnessFactor + 0.10 * (chat - 0.5) * comp, 0.05, 1.0);`)
-
-      // Micro relief from the chatter marks.
-      .replace('#include <normal_fragment_begin>', `#include <normal_fragment_begin>
-        {
-          float ridge = (tNoise(vec2(along * 17.0, pu * 3.0)) - 0.5)
-                      + 0.65 * (tNoise(vec2(along * 5.0, pu * 9.0)) - 0.5);
-          normal = normalize(normal + normalize(vAcross) * ridge * 0.55 * comp);
-        }`);
+        uniform float uTrkTime;
+        varying vec4 vTrk;
+        varying vec4 vTrk2;
+        varying vec3 vTrkAcross;`)
+      .replace('#include <metalnessmap_fragment>',
+        '#include <metalnessmap_fragment>\n' + TRACK_SURFACE);
 
     for (const [tag, marker] of [
-      ['vAttrs', 'attribute vec4 aTrack'], ['vVary', 'vWPos   = (modelMatrix'],
+      ['vAttrs', 'attribute vec4 aTrack2'], ['vVary', 'vTrkAcross = normalize('],
+      ['vSnow', 'vSnowWPos = ( modelMatrix'],
     ]) patched[tag] = shader.vertexShader.indexOf(marker) >= 0;
     for (const [tag, marker] of [
-      ['fCommon', 'float tNoise('], ['fColor', 'float trenchAO'],
-      ['fAO', 'reflectedLight.indirectDiffuse  *= trenchAO'],
-      ['fRough', 'mix(roughness, 0.21, comp * comp)'],
-      ['fNormal', 'normalize(vAcross) * ridge'],
+      ['fCommon', 'uniform float uTrkTime'], ['fSurface', 'float xslope = clamp'],
+      ['fSnowSurface', 'snRockMask = smoothstep'], ['fSnowNormal', 'nonPerturbedNormal'],
+      ['fSnowScatter', 'Anisotropic wind-packed sheen'],
     ]) patched[tag] = shader.fragmentShader.indexOf(marker) >= 0;
+
+    // Loud, not silent. Every one of these is a `.replace()` into a shader this
+    // module does not own; if snow-material moves an injection point the track
+    // would quietly go back to being an untextured stripe.
+    for (const k in patched) {
+      if (!patched[k]) console.warn(`[tracks] shader injection '${k}' did not land`);
+    }
   };
-  mat.customProgramCacheKey = () => 'alpine-carve-tracks';
 
   const mesh = new THREE.Mesh(geo, mat);
   mesh.frustumCulled = false;
@@ -453,15 +499,13 @@ export function createTracks(scene, terrain) {
   const right = new THREE.Vector3();
   const gN = new THREE.Vector3(0, 1, 0);
   const tmp = new THREE.Vector3();
-  const nrmTmp = new THREE.Vector3();
   const lastPos = new THREE.Vector3();
 
   const makeRib = () => ({
     pos: new Float32Array(2 * P * 3),
     nrm: new Float32Array(2 * P * 3),
     acr: new Float32Array(2 * P * 3),
-    comp: new Float32Array(2 * P),
-    along: 0,
+    along: 0, comp: 0, halfW: 0.1, depth: 0.05, skid: 0, load: 0,
   });
   let ribPrev = makeRib(), ribCur = makeRib();
   let havePrev = false;
@@ -472,7 +516,7 @@ export function createTracks(scene, terrain) {
   let dirtyLo = Infinity, dirtyHi = -1, dirtyWrapped = false;
 
   /** Build both ski cross-sections of one rib. */
-  function buildRib(rib, px, pz, spacing, width, depth, compact) {
+  function buildRib(rib, px, pz, spacing, width, depth) {
     for (let ski = 0; ski < 2; ski++) {
       const side = ski === 0 ? -1 : 1;
       const cx = px + right.x * side * spacing;
@@ -483,17 +527,13 @@ export function createTracks(scene, terrain) {
         const z = cz + right.z * u * width;
         const y = surfaceY(x, z) + PROFILE[i][1] * depth + SURFACE_EPS;
 
-        // Shading normal comes from the virtual (cut) profile, not the geometry.
-        const i0 = Math.max(i - 1, 0), i1 = Math.min(i + 1, P - 1);
-        const dh = (PROFILE[i1][2] - PROFILE[i0][2]) * depth * 1.05;
-        const du = (PROFILE[i1][0] - PROFILE[i0][0]) * width;
-        nrmTmp.copy(gN).addScaledVector(right, du > 1e-5 ? -dh / du : 0).normalize();
-
+        // The geometry normal stays the *ground* normal: snow-material builds its
+        // whole surface treatment off it, and it must agree with the piste beside
+        // us. The trench is added to snNormalW per-pixel instead.
         const k = ski * P + i, o = k * 3;
         rib.pos[o] = x; rib.pos[o + 1] = y; rib.pos[o + 2] = z;
-        rib.nrm[o] = nrmTmp.x; rib.nrm[o + 1] = nrmTmp.y; rib.nrm[o + 2] = nrmTmp.z;
+        rib.nrm[o] = gN.x; rib.nrm[o + 1] = gN.y; rib.nrm[o + 2] = gN.z;
         rib.acr[o] = right.x; rib.acr[o + 1] = right.y; rib.acr[o + 2] = right.z;
-        rib.comp[k] = PROFILE[i][3] * compact;
       }
     }
   }
@@ -517,18 +557,19 @@ export function createTracks(scene, terrain) {
           nrm[v * 3] = rib.nrm[si]; nrm[v * 3 + 1] = rib.nrm[si + 1]; nrm[v * 3 + 2] = rib.nrm[si + 2];
           across[v * 3] = rib.acr[si]; across[v * 3 + 1] = rib.acr[si + 1]; across[v * 3 + 2] = rib.acr[si + 2];
           trk[v * 4] = PROFILE[i][0];
-          trk[v * 4 + 1] = rib.comp[k];
+          trk[v * 4 + 1] = rib.comp;
           trk[v * 4 + 2] = time;
           trk[v * 4 + 3] = rib.along;
+          trk2[v * 4] = rib.halfW;
+          trk2[v * 4 + 1] = rib.depth;
+          trk2[v * 4 + 2] = rib.skid;
+          trk2[v * 4 + 3] = rib.load;
         }
       }
     }
   }
 
-  mesh.onBeforeRender = (r) => {
-    renderer = r;
-    uDeform.value = deform.texture;
-  };
+  mesh.onBeforeRender = (r) => { renderer = r; };
 
   const api = {
     mesh,
@@ -565,7 +606,7 @@ export function createTracks(scene, terrain) {
     update(dt, state) {
       if (!(dt > 0)) dt = 1 / 60;
       time += dt;
-      uTime.value = time;
+      uTrkTime.value = time;
 
       const p = state.pos;
 
@@ -608,20 +649,27 @@ export function createTracks(scene, terrain) {
         slip = Math.abs(clamp(tmp.dot(right), -1, 1));
       }
       const brake = (state.input && state.input.brake) || 0;
-      const skid = clamp(slip * 1.5 + brake * 0.8, 0, 1);
+      const skid = clamp(slip * 1.6 + brake * 0.85, 0, 1);
       const carve = clamp(edgeAbs * (1 - skid * 0.65), 0, 1);
+      const gf = clamp((state.gForce || 0) / 2.2, 0, 1.2);
 
       // Carving cuts a clean narrow trench; skidding smears a wide shallow one.
-      const width = 0.095 + skid * 0.075 + carve * 0.035;
-      const depth = 0.030 + carve * 0.060 + skid * 0.020 +
-                    clamp((state.gForce || 0) * 0.009, 0, 0.022);
-      const spacing = 0.135 + skid * 0.045;
-      const compact = clamp(0.55 + carve * 0.45 - skid * 0.12, 0.35, 1.0);
+      const width = 0.085 + skid * 0.105 + carve * 0.030;
+      const depth = 0.030 + carve * 0.075 + skid * 0.016 + gf * 0.028;
+      const spacing = 0.140 + skid * 0.050;
+      // Even a straight run leaves a visible base track on a groomed piste; a
+      // committed carve leaves a fully polished one.
+      const compact = clamp(0.42 + carve * 0.50 + gf * 0.16 - skid * 0.08, 0.30, 1.0);
 
       travelled += moved;
       const t = ribPrev; ribPrev = ribCur; ribCur = t;     // recycle, never alloc
-      buildRib(ribCur, p.x, p.z, spacing, width, depth, compact);
+      buildRib(ribCur, p.x, p.z, spacing, width, depth);
       ribCur.along = travelled;
+      ribCur.comp = compact;
+      ribCur.halfW = width;
+      ribCur.depth = depth;
+      ribCur.skid = skid;
+      ribCur.load = clamp(gf * 0.7 + carve * 0.5, 0, 1);
 
       if (havePrev) writeSegment(ribPrev, ribCur);
       havePrev = true;
@@ -629,7 +677,7 @@ export function createTracks(scene, terrain) {
 
       // Stamp both ski contacts into the deformation map.
       const rot = Math.atan2(right.z, right.x);
-      const dNorm = clamp(depth / 0.17, 0, 1);
+      const dNorm = clamp(depth / 0.13, 0, 1);
       for (let ski = 0; ski < 2; ski++) {
         const side = ski === 0 ? -1 : 1;
         deform.stamp(p.x + right.x * side * spacing, p.z + right.z * side * spacing,
