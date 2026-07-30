@@ -215,14 +215,24 @@ void main() {
   // one at full opacity, and the result is a field of hard white dots scattered
   // over the snow that reads as dirt on the lens. Grow anything under the floor
   // to the floor and take the coverage it should have had out of its alpha.
+  //
+  // The floor is 2.0 px, not 1.75: a quad narrower than about two pixels cannot
+  // resolve its own soft edge, so its premultiplied fringe lands on a single
+  // pixel and — for the dark ground-shadow blobs especially — reads as a hollow
+  // dark ring rather than as a puff. And below ~55% of the floor the sprite is
+  // covering a fifth of a pixel; dimming it is not enough, because the eye finds
+  // an isolated 2-code speck on flat snow perfectly well. Those are deleted
+  // instead (alpha -> 0, and the fragment shader's dens cutoff then discards
+  // them), which costs nothing visually: at that size the particle contributed
+  // less light than the dither.
   {
     float viewZ = max(-(modelViewMatrix * vec4(p, 1.0)).z, 0.02);
     float px = size * projectionMatrix[1][1] * uPixelScale / viewZ;
-    const float MIN_PX = 1.75;
+    const float MIN_PX = 2.0;
     if (px < MIN_PX) {
       float k = max(px / MIN_PX, 0.02);
       size  /= k;
-      alpha *= k * k;
+      alpha *= k * k * smoothstep(0.30, 0.58, k);
     }
   }
 

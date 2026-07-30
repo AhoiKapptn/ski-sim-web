@@ -205,6 +205,33 @@ export const PARAMS = {
     pivot: 0.553,           // log position of 0.18 mid grey
     saturation: 1.01,
     highlightDesat: 0.30,   // pull extreme highlights toward neutral
+    // How much of the display transform is done on luminance rather than
+    // per-channel. A per-channel filmic curve desaturates as it compresses —
+    // that is why cheap renderers turn a deep sky into cyan milk: blue is the
+    // channel deepest into the shoulder, so it is compressed hardest and B/R
+    // collapses. Measured on the hero framing, going from 0.40 to 0.85 moves
+    // the 25 deg sky B/R from 1.70 to 1.93 while sunlit snow (already neutral,
+    // so there is no chroma to preserve) does not move a code.
+    hueRetain: 0.85,
+    // Blue-qualified chroma secondary — a colourist's sky window, not a global
+    // saturation. Two qualifiers, both measured, so it cannot leak onto snow:
+    //   skyKey  — log-space (B−R). Clear sky measures 0.28, sky-lit snow shade
+    //             0.13, sunlit snow ~0.01. The key opens between the last two.
+    //   skyBand — log luma. Slit-swept on the hero framing: shaded snow lives at
+    //             0.60-0.64, clear sky at 25 deg at 0.69, horizon sky 0.72-0.78,
+    //             sunlit snow at ~0.83. The band brackets the sky only, and its
+    //             upper rolloff is what keeps the boost off the (correctly
+    //             paler) horizon.
+    // It pivots on the BRIGHTEST channel, not on luminance. Reference skies are
+    // not bluer than ours in absolute terms — Megeve's B (231) is the same code
+    // as ours (223); they are far less RED (90 vs 129). A luma-pivoted
+    // saturation would have to push B to 1.28 linear, i.e. clip the sky to a
+    // flat plate, to get R that low. Pivoting on blue takes R and G down and
+    // leaves B exactly where the sky model put it.
+    skyChroma: 0.80,           // chroma gain about the brightest channel
+    skyKey: [0.16, 0.26],      // (B−R) in log space: shade closed, sky open
+    skyGreen: 1.00,            // pull green down onto the R->B line
+    skyBand: [0.60, 0.675, 0.745, 0.83],  // in / out ramps in log luma
     // Lateral CA. Was 0.40 px, which is fine on any continuous edge and wrong on
     // a snow field: every one-pixel sparkle picked up a red side and a blue side
     // and the mid-field filled with what reads as magenta compression confetti.
@@ -319,9 +346,22 @@ void main() {
 
   // Slight spatial sharpen on the current sample counteracts the softening the
   // jitter introduces (this is what keeps thin branches crisp).
+  //
+  // RATIO, LUMINANCE-DRIVEN, WITH A BOUNDED NEGATIVE LOBE. The old form was a
+  // per-channel cur + (cur - blur) * uSharpen in *linear HDR*, and that is
+  // where the ring artefacts on the snow came from: a snow sparkle is a single
+  // pixel at 10-40x white, so its neighbour sees blur ≈ 4 against its own 0.5
+  // and loses 0.35 of 0.5 — a black pixel. Per-channel, the sparkle's slight
+  // tint means each neighbour loses a different amount of R, G and B, which is
+  // the "isolated saturated red and blue pixels" in the same report. Measured
+  // on three framings, this term alone was 44% of the hollow dark rings.
+  // Driving it off luma and applying it as a gain keeps hue exactly; clamping
+  // the dark side to a quarter of the pixel's own light removes the hole.
   vec3 blur = blurAcc / 9.0;
-  vec3 sharp = cur + (cur - blur) * uSharpen;
-  sharp = max(sharp, vec3(0.0));
+  float yCur = luma(cur);
+  float hfT = (yCur - luma(blur)) * uSharpen;
+  hfT = max(hfT, -yCur * 0.12);
+  vec3 sharp = max(cur * (1.0 + hfT / max(yCur, 1e-4)), vec3(0.0));
 
   float fb = uFeedback * inside * uValid;
 
@@ -378,8 +418,14 @@ void main() {
   // dark ring — a bright speck in the raw render arrives on screen as a dirt
   // speck. Where a neighbour is far brighter than this pixel, we are standing in
   // that ring, so the injection is switched off.
+  // Widened and taken to full strength: measured on paired frames the guard at
+  // (1.8, 5.0, 0.9) still left this term responsible for 49% of the hollow
+  // rings, because a snow sparkle is many TIMES brighter than its neighbour,
+  // not 1.8x, and the ramp only reached 0.9 at a 5x ratio. A neighbour 30%
+  // brighter is an ordinary edge and must keep its detail; a neighbour 3x
+  // brighter is a specular and this pixel is standing in its ring.
   float ymax4 = max(max(luma(n), luma(s)), max(luma(w), luma(e))) * uExposure;
-  hf *= 1.0 - 0.9 * smoothstep(1.8, 5.0, ymax4 / max(yc, 1e-3));
+  hf *= 1.0 - smoothstep(1.35, 3.0, ymax4 / max(yc, 1e-3));
 
   // Soft limiter, scaled by the local level, and deliberately asymmetric: adding
   // light to micro-relief is free, but digging a hole next to a highlight is
@@ -543,7 +589,20 @@ void main() {
 
   // Firefly ceiling, applied on the channel max so it never shifts hue.
   float m = max(max(c.r, c.g), c.b);
-  c *= m > uClamp ? uClamp / m : 1.0;
+  float over = m / uClamp;                       // how far past the ceiling
+  c *= over > 1.0 ? 1.0 / over : 1.0;
+
+  // CHROMA CEILING. A sparkle is a Fresnel/iridescence spike on a single texel
+  // and it is rarely neutral; clipped at the ceiling above it keeps its full
+  // chroma, and the pyramid then smears that chroma over a 10 px disc — an
+  // isolated coloured dot on white snow, which is the second artefact family in
+  // the gate report. Real light does not do this: anything this far over white
+  // is being read by the eye (and by a sensor) as white. So the further a
+  // source is past the ceiling, the harder its bloom contribution is pulled to
+  // its own luminance. The sun disc and sky are neutral already and do not
+  // notice; a red or blue firefly cannot bloom as a colour.
+  float yb = luma(c);
+  c = mix(c, vec3(yb), clamp((over - 1.0) * 0.5, 0.0, 0.85));
 
   float v = luma(c);
   float thr = luminosityThreshold;
@@ -734,6 +793,10 @@ uniform float uContrast, uPivot, uSaturation, uHighDesat, uSCurve;
 uniform vec2  uHighNeutral;   // log-luma window over which the split tone → 1.0
 uniform vec2  uShadeHue;      // x = magenta-guard amount, y = luma the guard fades out at
 uniform vec2  uSplitWindow;   // log-luma crossover from shadowTint to highTint
+uniform float uHueRetain;     // 0 = per-channel display transform, 1 = luma-only
+uniform vec3  uSkyChroma;     // x = chroma gain, y = green pull, z = unused
+uniform vec2  uSkyKey;        // (B−R) qualifier ramp, log space
+uniform vec4  uSkyBand;       // log-luma in/out ramps for the blue secondary
 uniform float uChromatic;
 uniform vec2  uTexel;
 ${COMMON}
@@ -837,9 +900,36 @@ void main() {
   // from the ambient term upstream, so this is deliberately a partial pull —
   // enough to move the hue a third of the way to reference without flattening
   // whatever the lighting pass does next.
+  // The sky is blue-dominant and sits below uHighNeutral too, so before this
+  // change the guard was lifting the SKY's green onto the R->B line as well —
+  // measured, that is 18 codes of green on a clear sky, and it is most of why
+  // the sky read cyan. A real clear sky has G *below* the R->B line (Megeve
+  // 90,149,231: G is 11 codes under the midpoint; Seceda 77,126,175: 0 under).
+  // The guard is therefore excluded from the sky window below.
+  float skyBand = smoothstep(uSkyBand.x, uSkyBand.y, lv)
+                * (1.0 - smoothstep(uSkyBand.z, uSkyBand.w, lv));
   float bDom = clamp((lg.b - lg.r) / 0.05, 0.0, 1.0);
   float lowEnd = 1.0 - smoothstep(uHighNeutral.x, uHighNeutral.y, lv);
-  lg.g += max((lg.r + lg.b) * 0.5 - lg.g, 0.0) * uShadeHue.x * bDom * lowEnd;
+  lg.g += max((lg.r + lg.b) * 0.5 - lg.g, 0.0) * uShadeHue.x * bDom * lowEnd
+        * (1.0 - skyBand * clamp(uSkyChroma.x * 4.0, 0.0, 1.0));
+
+  // --- blue secondary (the "sky window") ------------------------------------
+  // Measured against reference: our clear sky at 25 deg elevation read B/R 1.70
+  // where Megeve reads 2.57 and Seceda 2.27 — red 50 codes too high and green
+  // riding up against blue, i.e. cyan-milky rather than deep. Rather than push
+  // global saturation (which turns the jacket and the conifers into candy) this
+  // is a qualified secondary: it opens only on pixels that are already
+  // blue-dominant AND sit in a luma band between sky-lit snow shade below and
+  // sunlit snow above. Snow highlights are neutral to within 3 codes, so the
+  // (B−R) key leaves them alone even before the band gate does.
+  float skyKey = smoothstep(uSkyKey.x, uSkyKey.y, lg.b - lg.r);
+  float skyQ = skyKey * skyBand;
+  float pivotC = max(lg.b, max(lg.r, lg.g));
+  lg = mix(vec3(pivotC), lg, 1.0 + uSkyChroma.x * skyQ);
+  // Hue as well as chroma: the gain above leaves green riding near blue (cyan).
+  // Measured in this log space a reference sky puts G exactly on the R->B line
+  // (Megeve 90,149,231 -> G is +0.004 off it), ours sat +0.018 above it.
+  lg.g -= max(lg.g - (lg.r + lg.b) * 0.5, 0.0) * uSkyChroma.y * skyQ;
 
   float Yl = luma(lg);
   lg = mix(vec3(Yl), lg, uSaturation);
@@ -852,7 +942,7 @@ void main() {
   vec3 perCh = gt3(col);
   float Y = max(luma(col), 1e-5);
   vec3 byLuma = col * (gt(Y, uGT1.x, uGT1.y, uGT1.z, uGT1.w, uGT2.x, uGT2.y) / Y);
-  col = clamp(mix(perCh, byLuma, 0.4), 0.0, 1.0);
+  col = clamp(mix(perCh, byLuma, uHueRetain), 0.0, 1.0);
 
   // ease saturation off in the extreme highlights so speculars read as light
   float Y2 = luma(col);
@@ -887,12 +977,23 @@ void main() {
   vec3 s = texture2D(tDiffuse, vUv + vec2(0.0,  uTexel.y)).rgb;
   vec3 w = texture2D(tDiffuse, vUv + vec2(-uTexel.x, 0.0)).rgb;
   vec3 e = texture2D(tDiffuse, vUv + vec2( uTexel.x, 0.0)).rgb;
-  vec3 mn = min(min(min(n, s), min(w, e)), c);
-  vec3 mx = max(max(max(n, s), max(w, e)), c);
-  vec3 amp = clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0);
-  amp = sqrt(amp);
-  vec3 blur = (n + s + w + e) * 0.25;
-  c = clamp(c + (c - blur) * amp * uSharpen, 0.0, 1.0);
+  //
+  // Driven off luminance and added neutrally, for the same reason the TAA
+  // resolve is: a per-channel unsharp mask beside a clipped specular takes a
+  // different amount out of each channel and leaves a saturated dark pixel.
+  // The dark lobe is also limited to a fifth of the pixel's own level, which is
+  // what stops a one-pixel sparkle from being ringed by a black annulus while
+  // leaving ordinary edge contrast (where the neighbourhood is not extreme)
+  // completely untouched.
+  float yc = luma(c);
+  vec3 mn3 = min(min(min(n, s), min(w, e)), c);
+  vec3 mx3 = max(max(max(n, s), max(w, e)), c);
+  vec3 amp3 = sqrt(clamp(min(mn3, 1.0 - mx3) / max(mx3, vec3(1e-4)), 0.0, 1.0));
+  float amp = min(amp3.r, min(amp3.g, amp3.b));
+  float yb = luma((n + s + w + e) * 0.25);
+  float sd = (yc - yb) * amp * uSharpen;
+  sd = max(sd, -yc * 0.075);
+  c = clamp(c + vec3(sd), 0.0, 1.0);
 
   // Animated fine grain, heavier in the shadows where a real sensor is noisier.
   float g = hash12(gl_FragCoord.xy + vec2(uTime * 131.7, uTime * 97.3));
@@ -1053,6 +1154,10 @@ export function createPostFX(renderer, scene, camera) {
       uHighNeutral: { value: new THREE.Vector2(...g.highNeutral) },
       uShadeHue: { value: new THREE.Vector2(g.shadeHue, 0) },
       uSplitWindow: { value: new THREE.Vector2(...g.splitWindow) },
+      uHueRetain: { value: g.hueRetain },
+      uSkyChroma: { value: new THREE.Vector3(g.skyChroma, g.skyGreen, 0) },
+      uSkyKey: { value: new THREE.Vector2(...g.skyKey) },
+      uSkyBand: { value: new THREE.Vector4(...g.skyBand) },
       uChromatic: { value: g.chromatic },
       uTexel: { value: new THREE.Vector2(1 / W, 1 / H) },
     },
@@ -1299,6 +1404,10 @@ export function createPostFX(renderer, scene, camera) {
       gu.uHighNeutral.value.fromArray(gp.highNeutral);
       gu.uShadeHue.value.set(gp.shadeHue, 0);
       gu.uSplitWindow.value.fromArray(gp.splitWindow);
+      gu.uHueRetain.value = gp.hueRetain;
+      gu.uSkyChroma.value.set(gp.skyChroma, gp.skyGreen, 0);
+      gu.uSkyKey.value.fromArray(gp.skyKey);
+      gu.uSkyBand.value.fromArray(gp.skyBand);
       dofPass.uniforms.uMaxCoC.value = PARAMS.dof.maxCoC * cocScale;
       filmPass.uniforms.uGrainShadow.value = PARAMS.film.grainShadowBias;
 

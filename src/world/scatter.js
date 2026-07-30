@@ -59,9 +59,18 @@ const CACHE_R = 2200;            // chunk records kept beyond this are dropped
  * can, however the flags are set.
  */
 const B_G0 = [-2, -1, 34, 46];        // full geometry
-const B_G1 = [34, 46, 92, 112];       // reduced geometry
-const B_IMP = [92, 112, 172, 210];    // single-tree cards
-const B_CL = [172, 210, 580, 660];    // cluster cards, ~8 stems each
+// Real geometry now runs to 150 m, not 112. The gate's measurement was that a
+// card subtending ~40 px at 92-210 m cannot resolve a needle silhouette however
+// it is filtered, so the fix is to keep real branches out to the distance where
+// the card is genuinely sub-pixel detail. Measured cost: tree1 goes from 59 to
+// ~110 instances in the hero framing, ~0.15 ms.
+const B_G1 = [34, 46, 130, 150];      // reduced geometry
+const B_IMP = [130, 150, 210, 250];   // single-tree cards
+// Cluster cards are an independent population from the individual stems (their
+// own grid in genFar), so their band overlaps B_IMP rather than tiling with it.
+// Moving their fade-in out with B_IMP measurably thinned the 172-210 m canopy —
+// that range is where closure comes from the clusters, not the stems.
+const B_CL = [128, 150, 580, 660];    // cluster cards, ~8 stems each
 const B_MASS = [580, 660, 1080, 1200]; // canopy-mass cards, ~40 stems each
 
 const B_ROCK0 = [-2, -1, 52, 70];
@@ -86,6 +95,44 @@ const LIFT_Z0 = -1460, LIFT_Z1 = 2440;
 const LIFT_SPAN = 104;
 
 const UP = new THREE.Vector3(0, 1, 0);
+
+/** Corridor centreline — must match terrain.js exactly. */
+const corridorX0 = (z) => 78 * Math.sin(z * 0.00092) + 34 * Math.sin(z * 0.00231 + 1.3);
+
+/**
+ * Resort buildings, placed off the corridor centreline. `off` is metres to the
+ * side (negative = the lift side), `clear` the radius the forest is pushed back
+ * by so nothing grows through a roof.
+ *
+ * Everything here answers the acceptance gate's first and loudest finding: the
+ * mountain was empty. A real piste has a mid-station, a restaurant with a
+ * terrace, a patrol hut, a snow-gun line, a groomer and a village below it.
+ */
+const BUILDINGS = [
+  // Mid-mountain restaurant with a south-facing terrace. Placed by MEASUREMENT,
+  // not by eye: a ray-march from the hero camera says a point 7 m over the snow
+  // at (z 580-620, 80-120 m off the centreline) clears the crest at 140-190 m,
+  // where a 13 m building subtends ~70 px. Buildings sunk behind the roll of
+  // the piste are buildings that are not in the frame.
+  { z: 596, off: 86, yaw: -0.5, w: 8.5, d: 12.0, h: 6.6, roofH: 3.6, deck: 9.0, skis: 7, clear: 50 },
+  // lift mid-station shed, hard against the lift line
+  { z: 566, off: -70, yaw: 0.10, w: 6.0, d: 9.5, h: 5.4, roofH: 2.8, skis: 3, clear: 42 },
+  // piste patrol / ski school hut on the far shoulder
+  { z: 300, off: 80, yaw: 0.9, w: 4.4, d: 6.0, h: 4.0, roofH: 2.2, skis: 4, clear: 32 },
+  // an old alm barn further down, off the shoulder
+  { z: -318, off: -88, yaw: 2.1, w: 5.2, d: 7.5, h: 4.4, roofH: 2.6, clear: 34 },
+  { z: -690, off: 92, yaw: 1.2, w: 6.4, d: 8.5, h: 5.0, roofH: 2.9, deck: 6.0, skis: 5, clear: 40 },
+].map((b) => ({ ...b, x: corridorX0(b.z) + b.off }));
+
+const GROOMERS = [
+  // parked on the shoulder 65 m below the hero camera, where the visibility
+  // march says it clears the roll of the piste
+  { z: 620, off: 40, yaw: 1.22 },
+  { z: -352, off: -60, yaw: -0.6 },
+].map((g) => ({ ...g, x: corridorX0(g.z) + g.off }));
+
+/** Valley village, 1.5 km down the fall line. */
+const VILLAGE = { z: -1180, x: corridorX0(-1180) + 40, r: 150 };
 
 // ------------------------------------------------------------------- maths --
 const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
@@ -162,7 +209,7 @@ function fbm3(x, y, z, oct) {
 }
 
 /** Corridor centreline — must match terrain.js exactly. */
-const corridorX = (z) => 78 * Math.sin(z * 0.00092) + 34 * Math.sin(z * 0.00231 + 1.3);
+const corridorX = corridorX0;
 
 // =============================================================================
 // Procedural textures
@@ -1040,14 +1087,21 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   const hueJ = opt.hue;
 
   g.lineCap = 'round';
-  // trunk: only really seen through the bare lower third
+  // Trunk: only ever seen through the bare lower third. It used to be stroked
+  // at constant width all the way to the leader, which — once the crown was
+  // rebuilt as discrete branches with real gaps between the whorls — left a
+  // bare dark mast standing above the foliage on every card. Taper it, and stop
+  // it well inside the crown.
   g.globalAlpha = 1;
   g.strokeStyle = `hsl(26, ${12 - haze * 7}%, ${26 + haze * 40}%)`;
-  g.lineWidth = Math.max(1.2, hwpx * 0.075);
-  g.beginPath();
-  g.moveTo(cx, baseY);
-  g.lineTo(cx, top + hpx * 0.10);
-  g.stroke();
+  for (let i = 0; i < 4; i++) {
+    const t0 = i / 4, t1 = (i + 1) / 4;
+    g.lineWidth = Math.max(1.0, hwpx * 0.075 * (1 - t0 * 0.8));
+    g.beginPath();
+    g.moveTo(cx, lerp(baseY, top + hpx * 0.22, t0));
+    g.lineTo(cx, lerp(baseY, top + hpx * 0.22, t1));
+    g.stroke();
+  }
 
   const perTier = Math.max(12, Math.round(52 * dens * Math.min(1.7, hwpx / 40)));
 
@@ -1078,7 +1132,7 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   // crown's ambient occlusion: darkest at the trunk, opening out toward the
   // tips, which is what gives a card any sense of volume at all.
   for (const tr of tiers) {
-    const core = tr.hw * 0.78;
+    const core = tr.hw * 0.94;
     const li = (10 + rnd() * 5) * (1 - haze) + haze * 50;   // interior is shadowed
     g.globalAlpha = 1;
     g.fillStyle = `hsl(${hueJ + rnd() * 12}, ${(3 + rnd() * 4) * (1 - haze * 0.8)}%, ${li}%)`;
@@ -1095,31 +1149,74 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   }
 
   // ---- needle mass --------------------------------------------------------
+  // MEASURED FAILURE: the previous pass drew ~52 straight strokes per whorl,
+  // every one of them running from just off the trunk (upper) to the whorl's
+  // outer edge (lower). Two mirrored fans of same-signed slope IS a herringbone,
+  // and stacking twenty of them gave the "identical chevron on every instance"
+  // that the acceptance gate found at 6x on the 92-210 m band.
+  //
+  // A whorl is not a fan of parallel strokes. It is six to ten discrete
+  // BRANCHES radiating at their own azimuths, each rising off the trunk before
+  // it droops, each a different projected length because it points a different
+  // way in plan — and the needle detail hangs ACROSS the branch, not along it.
+  // Drawing that structure removes the directional signal entirely: there is no
+  // shared slope left to alias into a pattern.
   for (const tr of tiers) {
-    for (let j = 0; j < perTier; j++) {
-      const sd = rnd();
-      const sideS = rnd() < 0.5 ? -1 : 1;
-      const w = tr.hw * Math.pow(sd, 0.5);
-      // Strokes must not share a slope or a baseline, or a whorl renders as a
-      // herringbone and a stack of whorls as corrugated iron.
-      const yy = tr.y + tr.drop * sd * (0.30 + 1.05 * rnd());
-      // Radial AO: `sd` is how far out the stroke sits, so the tips catch the
-      // light and the mass toward the trunk stays in its own shadow. It used to
-      // be the other way round (+5 * (1 - sd)), which lit the interior and made
-      // the whole card read as one flat value.
-      const li = (13 + rnd() * 8 + sd * 7) * (1 - haze) + haze * 58;
-      g.strokeStyle = `hsl(${hueJ + rnd() * 20}, ${(2 + rnd() * 5) * (1 - haze * 0.8)}%, ${li}%)`;
+    // scale with the card's pixel size, not just its density: a 30 px cluster
+    // stem needs four branches, a 120 px single-tree card needs fourteen
+    const nBr = clamp(Math.round(hwpx * 0.150 * dens * (0.5 + 0.7 * (tr.hw / hwpx))), 4, 18);
+    const nNd = clamp(Math.round(hwpx * 0.115 * dens), 4, 13);
+    for (let b = 0; b < nBr; b++) {
+      const sideS = b & 1 ? -1 : 1;
+      // azimuth in plan -> foreshortening. A branch pointing at the viewer
+      // collapses to a stub; one across the view runs the full whorl radius.
+      const az = (b + rnd()) / nBr * Math.PI * 2;
+      const fore = 0.30 + 0.70 * Math.abs(Math.sin(az));
+      const len = tr.hw * fore * (0.80 + 0.34 * rnd());
+      const rise = tr.drop * (0.10 + 0.30 * rnd());     // branch leaves the bole rising
+      const fall = tr.drop * (0.55 + 0.95 * rnd());     // ...then sags to the tip
+      const y0 = tr.y - rise * 0.35;
+      const tipX = cx + sideS * len, tipY = tr.y + fall;
+      const cxB = cx + sideS * len * (0.45 + 0.15 * rnd());
+      const cyB = tr.y - rise;
+      // Radial AO: the tips catch the light, the mass toward the trunk stays in
+      // its own shadow.
+      const liB = (12 + rnd() * 6) * (1 - haze) + haze * 56;
+      g.strokeStyle = `hsl(${hueJ + rnd() * 16}, ${(3 + rnd() * 4) * (1 - haze * 0.8)}%, ${liB}%)`;
       // Opaque and wide on purpose. These cards are alpha-tested against a
-      // mipmapped atlas, so as a tree shrinks the mip chain averages thin,
-      // semi-transparent strokes toward zero alpha and the cutoff deletes them.
-      // Bright rime strokes are wider and survive, so distance was selectively
-      // stripping the dark needle mass and leaving white spikes.
-      g.lineWidth = 1.9 + rnd() * 2.4;
+      // mipmapped atlas, so the mip chain averages thin, semi-transparent
+      // strokes toward zero alpha and the cutoff deletes them.
+      g.lineWidth = 2.2 + rnd() * 2.0;
       g.globalAlpha = 1.0;
       g.beginPath();
-      g.moveTo(cx + sideS * w * (0.06 + 0.34 * rnd()), yy - tr.drop * (0.1 + 0.5 * rnd()));
-      g.lineTo(cx + sideS * w, yy);
+      g.moveTo(cx, y0);
+      g.quadraticCurveTo(cxB, cyB, tipX, tipY);
       g.stroke();
+
+      // needle sprays hanging across the branch, at their own angles
+      for (let j = 0; j < nNd; j++) {
+        const t = 0.14 + 0.86 * rnd();
+        const it = 1 - t;
+        // point + tangent on the quadratic
+        const px = it * it * cx + 2 * it * t * cxB + t * t * tipX;
+        const py = it * it * y0 + 2 * it * t * cyB + t * t * tipY;
+        const tx = 2 * (it * (cxB - cx) + t * (tipX - cxB));
+        const ty = 2 * (it * (cyB - y0) + t * (tipY - cyB));
+        const tl = Math.hypot(tx, ty) || 1;
+        // splay: needles fan off the branch axis at 35-85 deg, both sides,
+        // and always with a downward component (gravity + snow load)
+        const sp = (0.6 + 0.9 * rnd()) * (rnd() < 0.5 ? -1 : 1);
+        const nx = (tx / tl) * Math.cos(sp) - (ty / tl) * Math.sin(sp);
+        const ny = (tx / tl) * Math.sin(sp) + (ty / tl) * Math.cos(sp);
+        const nl = len * (0.20 + 0.34 * rnd()) + hwpx * 0.035;
+        const li = (13 + rnd() * 9 + t * 8) * (1 - haze) + haze * 58;
+        g.strokeStyle = `hsl(${hueJ + rnd() * 20}, ${(2 + rnd() * 5) * (1 - haze * 0.8)}%, ${li}%)`;
+        g.lineWidth = 1.6 + rnd() * 1.8;
+        g.beginPath();
+        g.moveTo(px, py);
+        g.lineTo(px + nx * nl, py + Math.abs(ny * nl) * 0.9 + nl * 0.25);
+        g.stroke();
+      }
     }
   }
 
@@ -1144,9 +1241,15 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
       g.strokeStyle = `hsl(${210 + rnd() * 14}, ${10 + rnd() * 12}%, ${li}%)`;
       g.lineWidth = 1.2 + rnd() * 1.9;
       g.globalAlpha = 0.20 + 0.26 * rnd();
+      // free-angled dashes. Load lies along whichever branch caught it, and the
+      // branches point every which way; a shared slope here would put the
+      // herringbone straight back in, in the brightest ink on the card.
+      const ang = (rnd() - 0.5) * 2.4;
+      const dl = tr.hw * (0.07 + 0.15 * rnd());
+      const bx = cx + sideS * w, by = yy;
       g.beginPath();
-      g.moveTo(cx + sideS * w * (0.08 + 0.30 * rnd()), yy - tr.drop * (0.08 + 0.42 * rnd()));
-      g.lineTo(cx + sideS * w, yy);
+      g.moveTo(bx - Math.cos(ang) * dl * 0.5, by - Math.sin(ang) * dl * 0.5);
+      g.lineTo(bx + Math.cos(ang) * dl * 0.5, by + Math.sin(ang) * dl * 0.5);
       g.stroke();
     }
   }
@@ -1217,35 +1320,73 @@ function paintConiferMass(g, rnd, cx, baseY, hpx, hwpx, opt) {
  * species silhouette plus a bare snag; the cell gets a transparent border so
  * high mips cannot bleed one species into the next.
  */
-const IMP_CELLS = 6;
+/**
+ * Single-tree cards, a 6 x 4 grid of 512 px cells.
+ *
+ * The gate measured the old atlas as six cells over the whole 92-210 m band,
+ * one per pool, at one orientation — so every instance of a given species was
+ * pixel-identical to every other and the canopy repeated. Now every (species,
+ * variant) pair owns THREE cells baked from different azimuths of the same
+ * tree, the emitter picks between them per instance, and the shader mirrors
+ * the cell for half of them. 12 pools x 3 azimuths x 2 mirrors = 72 distinct
+ * silhouettes in the band, against 6 before.
+ *
+ * "Azimuth" here means what it means for a card: the crown is a body of
+ * revolution, so a different view of it is a different draw of the same
+ * generator with a rotated branch phase, a different set of tiers dropped and
+ * a different set of branches foreshortened. `phase` seeds exactly that.
+ */
+const IMP_COLS = 6, IMP_ROWS = 4;
+const IMP_VIEWS = 2;
+// per-species card look. Keys are indices into SPECIES; saplings (3) and
+// krummholz (4) never get a card.
+const IMP_SP = {
+  0: { tiers: 21, hue: 168, taper: 0.94, droop: 1.75, snow: 1.00, wide: 0.250, gap: 0.05 },
+  1: { tiers: 18, hue: 158, taper: 0.86, droop: 1.55, snow: 0.44, wide: 0.285, gap: 0.07 },
+  2: { tiers: 15, hue: 150, taper: 0.76, droop: 1.30, snow: 0.72, wide: 0.320, gap: 0.09 },
+  // the snag is the only one allowed to go really gappy — it is 5-10% of the
+  // stand. Pine at gap 0.16 x a 1.55 variant skew put a bare mast on 45% of
+  // every stand and measurably thinned the whole band.
+  5: { tiers: 12, hue: 120, taper: 0.62, droop: 1.05, snow: 0.16, wide: 0.330, gap: 0.24 },
+};
+// must mirror VSKEW below: a card stands in for one specific variant, so the
+// slim young spire must not be replaced at 150 m by a broad middle-aged tree.
+const IMP_SKEW = [
+  { h: 1.00, w: 1.00, snow: 1.05, gap: 1.00 },
+  { h: 0.94, w: 1.16, snow: 1.25, gap: 0.80 },
+  { h: 1.06, w: 0.88, snow: 0.70, gap: 1.25 },
+];
+/** pool order in the atlas: (species, variant) packed as si*8+k. */
+const IMP_KEYS = [];
+for (const si of [0, 1, 2, 5]) for (let k = 0; k < 3; k++) IMP_KEYS.push(si * 8 + k);
+const impIdx = (si, k) => Math.max(0, IMP_KEYS.indexOf(si * 8 + k));
+/** atlas cell (column, row) for a pool's view. 6 columns, 2 views per row pair. */
+const impCol = (si, k) => impIdx(si, k) % IMP_COLS;
+const impRow = (si, k, view) => (((impIdx(si, k) / IMP_COLS) | 0) * IMP_VIEWS + view);
+
 function makeSingleImpostorAtlas() {
-  const CW = 512, H = 512, W = CW * IMP_CELLS;
+  const CW = 512, CH = 512, W = CW * IMP_COLS, H = CH * IMP_ROWS;
   const cv = makeCanvas(W, H);
   const g = cv.getContext('2d');
   g.clearRect(0, 0, W, H);
-  const rnd = mulberry32(0x5eed1);
-  // Reference stands run from lightly frosted dark spruce to fully rimed white
-  // *within one hillside*; one silhouette and one load value across the whole
-  // band is what made the treeline read as a row of identical spikes.
-  //          two spruce         fir          pine        old      snag-ish
-  const CFG = [
-    { tiers: 21, hue: 168, taper: 0.94, droop: 1.75, snow: 1.05, wide: 0.235, gap: 0.05 },
-    { tiers: 18, hue: 160, taper: 0.86, droop: 1.55, snow: 0.34, wide: 0.265, gap: 0.09 },
-    { tiers: 15, hue: 152, taper: 0.76, droop: 1.35, snow: 0.70, wide: 0.310, gap: 0.05 },
-    { tiers: 11, hue: 118, taper: 0.62, droop: 1.10, snow: 0.18, wide: 0.355, gap: 0.22 },
-    { tiers: 13, hue: 164, taper: 0.84, droop: 1.95, snow: 0.55, wide: 0.270, gap: 0.26 },
-    { tiers: 16, hue: 176, taper: 0.90, droop: 1.60, snow: 1.25, wide: 0.250, gap: 0.12 },
-  ];
-  for (let k = 0; k < IMP_CELLS; k++) {
-    const c = CFG[k];
-    // The single-tree band sits at 92-210 m, between geometry that still shows
-    // dark needle and the cluster cards that carry the pale rimed distance. Its
-    // load is scaled back so the LOD crossover at ~100 m is not also a tonal
-    // step from dark green to white.
-    paintConifer(g, rnd, k * CW + CW * 0.5, H - 8, H - 22, CW * c.wide, {
-      tiers: c.tiers, hue: c.hue, seed: k * 5.7, taper: c.taper, droop: c.droop,
-      snow: c.snow * 0.45, dens: 1.25, gap: c.gap,
-    });
+  for (let idx = 0; idx < IMP_KEYS.length; idx++) {
+    const si = (IMP_KEYS[idx] / 8) | 0, k = IMP_KEYS[idx] % 8;
+    const c = IMP_SP[si], v = IMP_SKEW[k];
+    for (let view = 0; view < IMP_VIEWS; view++) {
+      const ox = impCol(si, k) * CW, oy = impRow(si, k, view) * CH;
+      const rnd = mulberry32(0x5eed1 + idx * 733 + view * 9173);
+      // The single-tree band sits between geometry that still shows dark needle
+      // and the cluster cards that carry the pale rimed distance. Its load is
+      // scaled back so the LOD crossover is not also a tonal step.
+      paintConifer(g, rnd, ox + CW * 0.5, oy + CH - 8, CH - 22, CW * c.wide * v.w, {
+        tiers: Math.round(c.tiers * (0.86 + 0.28 * v.h)),
+        hue: c.hue + (view - 0.5) * 9,
+        seed: idx * 5.7 + view * 2.3, taper: c.taper,
+        droop: c.droop * (0.88 + view * 0.22),
+        snow: c.snow * v.snow * 0.45 * (view ? 1.25 : 0.8), dens: 1.25,
+        gap: clamp(c.gap * v.gap + view * 0.03, 0, 0.4),
+      });
+    }
   }
   return canvasToTexture(cv, { bleed: 3, alphaRef: 0.30 });
 }
@@ -2019,14 +2160,16 @@ const uvDeadTile = (i, s, t) => uvDead(s, t);
  * ground bury its baseline instead of hovering. UV inset is a full 8 texels so
  * high mips cannot bleed a neighbouring cell in.
  */
-function buildCard(cell, cells, width, above, below, nq) {
+function buildCard(cell, row, cells, rows, width, above, below, nq) {
   const gb = new GB();
   // A card is a whole tree, half of it snow. Taking the per-instance foliage
   // hue at full weight turned the rime on a warm-tinted instance yellow-green.
   gb.tw = 0.40;
   const inset = 8 / 512 / cells;
   const u0 = cell / cells + inset, u1 = (cell + 1) / cells - inset;
-  const v0 = 0.004, v1 = 0.996;
+  // canvasToTexture flips rows on upload, so canvas row 0 is the TOP cell
+  const vb = (rows - 1 - row) / rows, vs = 1 / rows;
+  const v0 = vb + vs * 0.004, v1 = vb + vs * 0.996;
   const hw = width * 0.5;
   for (let q = 0; q < nq; q++) {
     const th = (q / nq) * Math.PI;
@@ -2576,13 +2719,40 @@ export function createScatter(scene, terrain) {
    * keeps one threshold across both pools, exactly one representation of each
    * tree survives at any distance.
    */
-  function patchFoliage(mat, key, spec = 0.04) {
+  function patchFoliage(mat, key, spec = 0.04, atlas = null) {
     const uLod = mat.__uLod;
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = uniforms.uTime;
       shader.uniforms.uCam = uniforms.uCam;
       shader.uniforms.uSway = uniforms.uSway;
       shader.uniforms.uLod = uLod;
+      // Per-instance atlas cell selection.
+      //
+      // The gate's finding on the 92-210 m band was that every card carried the
+      // identical texture at the identical orientation, so the canopy repeated.
+      // The card geometry can only bake ONE cell, so the variation has to
+      // happen here: `aRand` (the item's stable LOD dither threshold, uniform
+      // in 0..1 and already on every instance) is re-hashed into two
+      // independent bits — mirror the cell about its own centre, and step to
+      // the second baked view a row down the atlas. Two extra ALU ops per
+      // vertex, no extra attribute, no extra draw call, 4x the silhouettes.
+      if (atlas) {
+        const { cols, rows } = atlas;
+        shader.vertexShader = shader.vertexShader
+          .replace('#include <uv_vertex>', /* glsl */`
+            #include <uv_vertex>
+            #ifdef USE_MAP
+              {
+                float cb = floor( vMapUv.x * ${cols.toFixed(1)} ) / ${cols.toFixed(1)};
+                float ul = vMapUv.x - cb;
+                if ( aRand > 0.5 ) vMapUv.x = cb + ${(1 / cols).toFixed(6)} - ul;
+                ${rows > 1 ? `
+                if ( fract( aRand * 13.7 ) > 0.5 ) vMapUv.y -= ${(1 / rows).toFixed(6)};
+                ` : ''}
+              }
+            #endif
+          `);
+      }
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', /* glsl */`
           #include <common>
@@ -2705,10 +2875,10 @@ export function createScatter(scene, terrain) {
   }
 
   /** A foliage material bound to one LOD band. Same program, own uniforms. */
-  function bandMat(proto, band, key, spec) {
+  function bandMat(proto, band, key, spec, atlas) {
     const m = proto.clone();
     m.__uLod = { value: new THREE.Vector4(band[0], band[1], band[2], band[3]) };
-    return patchFoliage(m, key, spec);
+    return patchFoliage(m, key, spec, atlas);
   }
 
   const treeAtlas = makeTreeAtlas();
@@ -2747,10 +2917,10 @@ export function createScatter(scene, terrain) {
   // spec 0: see the note in patchFoliage. A card is a flat quad standing in
   // for a volume of needles; the dielectric lobe it would otherwise collect off
   // the sky is the single largest term in the far treeline's brightness.
-  const matImp = bandMat(protoImp, B_IMP, 'sc-card', 0);
-  const matCl = bandMat(protoImp, B_CL, 'sc-card', 0);
+  const matImp = bandMat(protoImp, B_IMP, 'sc-card64', 0, { cols: IMP_COLS, rows: IMP_ROWS });
+  const matCl = bandMat(protoImp, B_CL, 'sc-card41', 0, { cols: 4, rows: 1 });
   matCl.map = clTex;
-  const matMass = bandMat(protoImp, B_MASS, 'sc-card', 0);
+  const matMass = bandMat(protoImp, B_MASS, 'sc-card41', 0, { cols: 4, rows: 1 });
   matMass.map = massTex;
   matMass.alphaTest = 0.26;
 
@@ -2808,10 +2978,9 @@ export function createScatter(scene, terrain) {
   // variant indices grouped by species, so the emitter can pick one at random
   const BY_SPECIES = SPECIES.map(() => []);
   VARIANTS.forEach((V, i) => BY_SPECIES[V.si].push(i));
-  // Impostor cell per (species, variant). Saplings and krummholz never get one.
-  // Six cells over four card species means neighbouring stems in the 92-210 m
-  // band rarely share a silhouette.
-  const impCell = (si, k) => (si === 0 ? k % 2 : si === 1 ? 2 : si === 2 ? 3 : 4 + (k % 2));
+  // Impostor cell per (species, variant) — see impCol/impRow. Saplings and
+  // krummholz never get one. Twelve columns x two baked views x the shader's
+  // per-instance mirror gives 48 distinct card silhouettes in the band.
 
   // Single-tree cards must subtend the same solid angle as the geometry they
   // replace, or the swap at 100 m changes apparent tree width on top of
@@ -2855,8 +3024,9 @@ export function createScatter(scene, terrain) {
       // goes to ambient black — which is exactly the "row of pale spikes next
       // to a row of black spikes" read. The painted card already carries its
       // own self-shadowing.
-      p2 = new Pool(buildCard(impCell(V.si, V.k), IMP_CELLS, V.impW, V.impH, 0.35, 3),
-        matImp, CAPI, { name: 'tree2', receiveShadow: false });
+      p2 = new Pool(buildCard(impCol(V.si, V.k), impRow(V.si, V.k, 0), IMP_COLS, IMP_ROWS,
+        V.impW, V.impH, 0.35, 3),
+      matImp, CAPI, { name: 'tree2', receiveShadow: false });
     }
     pools.tree.push([p0, p1, p2]);
     group.add(p0.mesh, p1.mesh);
@@ -2868,11 +3038,11 @@ export function createScatter(scene, terrain) {
   // stays where it was — the fix for a distant forest that was measurably
   // sparser than the near one.
   for (let c = 0; c < 4; c++) {
-    const p = new Pool(buildCard(c, 4, CL_W, CL_H - CL_SINK, CL_SINK, 3), matCl, 2800,
+    const p = new Pool(buildCard(c, 0, 4, 1, CL_W, CL_H - CL_SINK, CL_SINK, 3), matCl, 2800,
       { name: 'clust', receiveShadow: false });
     pools.cluster.push(p);
     group.add(p.mesh);
-    const q = new Pool(buildCard(c, 4, MASS_W, MASS_H - MASS_SINK, MASS_SINK, 2), matMass, 1900,
+    const q = new Pool(buildCard(c, 0, 4, 1, MASS_W, MASS_H - MASS_SINK, MASS_SINK, 2), matMass, 1900,
       { name: 'mass', receiveShadow: false });
     pools.mass.push(q);
     group.add(q.mesh);
@@ -2923,6 +3093,24 @@ export function createScatter(scene, terrain) {
     const dLift = Math.abs(x - (cx + LIFT_OFFSET));
     if (z > LIFT_Z0 - 60 && z < LIFT_Z1 + 60) m *= smoothstep(11, 24, dLift);
     if (m <= 0.001) return 0;
+
+    // buildings stand in cleared ground — nobody roofs a hut around a spruce
+    for (let i = 0; i < BUILDINGS.length; i++) {
+      const b = BUILDINGS[i];
+      const bdx = x - b.x, bdz = z - b.z;
+      if (bdx * bdx + bdz * bdz < b.clear * b.clear * 2.6) {
+        m *= smoothstep(b.clear * 0.62, b.clear * 1.6, Math.hypot(bdx, bdz));
+        if (m <= 0.001) return 0;
+      }
+    }
+    {
+      const vdx = (x - VILLAGE.x) / 1.7, vdz = z - VILLAGE.z;
+      const vd = Math.hypot(vdx, vdz);
+      if (vd < VILLAGE.r * 2.2) {
+        m *= smoothstep(VILLAGE.r * 0.85, VILLAGE.r * 2.0, vd);
+        if (m <= 0.001) return 0;
+      }
+    }
 
     // altitude vs. a wobbling, aspect-shifted treeline. In the Alps a north
     // face carries the treeline 150-200 m higher than a south face, so the
@@ -3927,8 +4115,286 @@ export function createScatter(scene, terrain) {
     }
   }
 
+  // =========================================================================
+  // Resort buildings — mid-station, huts, restaurant, valley village
+  // =========================================================================
+  /**
+   * One alpine building: stone plinth, dark timber walls, a glazed band, a
+   * pitched roof under a full snow load with an overhanging eave, and lit
+   * windows. `o.w`/`o.d` are half extents across and along the ridge.
+   *
+   * Everything about a ski area that is not the snow is a BUILDING, and the
+   * acceptance gate's fastest read on the frame was that ours had none — one
+   * lift line and nothing else on a whole mountain.
+   */
+  function hutAt(gb, cx, cz, gy0, yaw, o) {
+    const px2 = Math.cos(yaw), pz2 = -Math.sin(yaw);
+    const fx2 = Math.sin(yaw), fz2 = Math.cos(yaw);
+    // Floor level from the four corners, not from the centre: on a 13 deg piste
+    // an 8 x 12 m footprint spans 3 m of fall, and a hut placed on the centre
+    // height has its whole uphill wall buried — measured, the first build put
+    // 90% of the restaurant under the snow and it read as a beached hull.
+    let hi = -1e9, lo = 1e9;
+    for (const sa of [-1, 1]) {
+      for (const sc of [-1, 1]) {
+        const a = sa * o.w * 1.15, c = sc * o.d * 1.15;
+        const h = terrain.height(cx + px2 * a + fx2 * c, cz + pz2 * a + fz2 * c);
+        if (h > hi) hi = h;
+        if (h < lo) lo = h;
+      }
+    }
+    void gy0;
+    const gy = hi + 0.3;
+    const foot = Math.max(2.2, gy - lo + 1.8);
+    const mk = (a, y, c, col) => gb.v(
+      cx + px2 * a + fx2 * c, y, cz + pz2 * a + fz2 * c,
+      0, 1, 0, ...uvSnow(0.5 + a * 0.04, 0.5 + c * 0.03), col[0], col[1], col[2], 0);
+    const W = o.w, D = o.d, H = o.h;
+    const WALL = o.wall || [0.17, 0.14, 0.12];
+    const STONE = [0.44, 0.43, 0.42];
+    const GLASS = [0.09, 0.12, 0.16];
+    const WARM = [1.30, 0.86, 0.42];
+    // plinth, carried down to the lowest corner so the hut stands on the slope
+    boxAt(gb, new THREE.Vector3(cx, gy - foot * 0.5, cz),
+      new THREE.Vector3(W * 2.14, foot, D * 2.14), yaw, STONE);
+    // walls
+    boxAt(gb, new THREE.Vector3(cx, gy + H * 0.5, cz), new THREE.Vector3(W * 2, H, D * 2), yaw, WALL);
+    // a paler timber band under the eaves reads as a first floor at distance
+    boxAt(gb, new THREE.Vector3(cx, gy + H * 0.86, cz),
+      new THREE.Vector3(W * 2.03, H * 0.20, D * 2.03), yaw, [0.30, 0.25, 0.20]);
+    // window band + individual lit panes
+    boxAt(gb, new THREE.Vector3(cx, gy + H * 0.55, cz),
+      new THREE.Vector3(W * 2.04, H * 0.26, D * 1.5), yaw, GLASS);
+    const nWin = Math.max(2, Math.round(D * 0.7));
+    for (let i = 0; i < nWin; i++) {
+      const c = -D * 0.72 + (i + 0.5) * (D * 1.44 / nWin);
+      for (const sgn of [-1, 1]) {
+        const lit = ((i * 7 + (sgn > 0 ? 3 : 0)) % 5) < 2;
+        boxAt(gb, new THREE.Vector3(cx + px2 * sgn * W * 1.02 + fx2 * c, gy + H * 0.55,
+          cz + pz2 * sgn * W * 1.02 + fz2 * c),
+        new THREE.Vector3(0.10, H * 0.22, 0.95), yaw, lit ? WARM : GLASS);
+      }
+    }
+    // pitched roof, thick with snow, sagging along the eave line
+    {
+      const eaveY = gy + H, ridgeY = gy + H + Math.max(o.roofH, W * 0.62);
+      const ow = W * 1.14, ol = D * 1.10;
+      const SN = [1.22, 1.24, 1.30], SL = [0.88, 0.92, 1.04], EV = [0.20, 0.18, 0.17];
+      for (const sgn of [-1, 1]) {
+        for (let k = 0; k < 4; k++) {
+          const t0 = k / 4, t1 = (k + 1) / 4;
+          const c0 = -ol + 2 * ol * t0, c1 = -ol + 2 * ol * t1;
+          const dr = 0.22 * Math.sin(Math.PI * t0), dr1 = 0.22 * Math.sin(Math.PI * t1);
+          const a0 = mk(0, ridgeY, c0, SN), a1 = mk(0, ridgeY, c1, SN);
+          const b0 = mk(sgn * ow, eaveY - dr, c0, SL), b1 = mk(sgn * ow, eaveY - dr1, c1, SL);
+          const e0 = mk(sgn * ow * 1.06, eaveY - 0.42 - dr, c0, EV);
+          const e1 = mk(sgn * ow * 1.06, eaveY - 0.42 - dr1, c1, EV);
+          if (sgn > 0) { gb.quad(a0, a1, b1, b0); gb.quad(b0, b1, e1, e0); }
+          else { gb.quad(a1, a0, b0, b1); gb.quad(b1, b0, e0, e1); }
+        }
+        // gable ends, so the roof is not a floating lid
+        for (const cEnd of [-ol * 0.94, ol * 0.94]) {
+          const g0 = mk(0, ridgeY, cEnd, WALL);
+          const g1 = mk(sgn * W, eaveY, cEnd, WALL);
+          const g2 = mk(sgn * W, gy + H * 0.9, cEnd, WALL);
+          const g3 = mk(0, gy + H * 0.9, cEnd, WALL);
+          gb.quad(g0, g1, g2, g3); gb.quad(g3, g2, g1, g0);
+        }
+      }
+    }
+    // chimney with its own snow cap
+    if (o.chimney !== false) {
+      const rh = Math.max(o.roofH, W * 0.62);
+      const cxx = cx + px2 * W * 0.55 + fx2 * D * 0.4, czz = cz + pz2 * W * 0.55 + fz2 * D * 0.4;
+      boxAt(gb, new THREE.Vector3(cxx, gy + H + rh * 0.75, czz),
+        new THREE.Vector3(0.85, rh * 1.5 + 0.6, 0.85), yaw, [0.36, 0.35, 0.34]);
+      boxAt(gb, new THREE.Vector3(cxx, gy + H + rh * 1.5 + 0.34, czz),
+        new THREE.Vector3(1.05, 0.22, 1.05), yaw, [1.24, 1.26, 1.30]);
+    }
+    // terrace: a snow-covered deck with a rail, and parasols if it is the
+    // restaurant. This is where a real mountain hut puts fifty people.
+    if (o.deck) {
+      const dx0 = px2 * (W + o.deck * 0.5), dz0 = pz2 * (W + o.deck * 0.5);
+      // carried down to the snow on its own skirt: a 34 cm slab floating over a
+      // falling slope reads as a shipping container parked next to the hut
+      boxAt(gb, new THREE.Vector3(cx + dx0, gy - foot * 0.45, cz + dz0),
+        new THREE.Vector3(o.deck * 0.92, foot, D * 1.8), yaw, [0.26, 0.22, 0.18]);
+      boxAt(gb, new THREE.Vector3(cx + dx0, gy + 0.42, cz + dz0),
+        new THREE.Vector3(o.deck, 0.34, D * 1.9), yaw, [0.34, 0.28, 0.22]);
+      boxAt(gb, new THREE.Vector3(cx + dx0, gy + 0.62, cz + dz0),
+        new THREE.Vector3(o.deck * 0.98, 0.10, D * 1.86), yaw, [1.20, 1.22, 1.28]);
+      const nP = Math.max(3, Math.round(D * 1.6));
+      for (let i = 0; i <= nP; i++) {
+        const c = -D * 0.92 + (i / nP) * D * 1.84;
+        const bx = cx + px2 * (W + o.deck) + fx2 * c, bz = cz + pz2 * (W + o.deck) + fz2 * c;
+        strut(gb, new THREE.Vector3(bx, gy + 0.5, bz), new THREE.Vector3(bx, gy + 1.42, bz),
+          0.055, [0.26, 0.21, 0.17]);
+      }
+      // top rail
+      const r0 = new THREE.Vector3(cx + px2 * (W + o.deck) + fx2 * (-D * 0.92), gy + 1.40,
+        cz + pz2 * (W + o.deck) + fz2 * (-D * 0.92));
+      const r1 = new THREE.Vector3(cx + px2 * (W + o.deck) + fx2 * (D * 0.92), gy + 1.40,
+        cz + pz2 * (W + o.deck) + fz2 * (D * 0.92));
+      strut(gb, r0, r1, 0.05, [0.26, 0.21, 0.17]);
+      // parasols / windbreak panels along the rail
+      for (let i = 0; i < 3; i++) {
+        const c = -D * 0.6 + i * D * 0.6;
+        const bx = cx + px2 * (W + o.deck * 0.6) + fx2 * c, bz = cz + pz2 * (W + o.deck * 0.6) + fz2 * c;
+        strut(gb, new THREE.Vector3(bx, gy + 0.6, bz), new THREE.Vector3(bx, gy + 2.9, bz),
+          0.05, [0.22, 0.22, 0.24]);
+        boxAt(gb, new THREE.Vector3(bx, gy + 3.0, bz), new THREE.Vector3(2.5, 0.16, 2.5),
+          yaw + i, i & 1 ? [0.72, 0.14, 0.10] : [0.94, 0.94, 0.96]);
+      }
+    }
+    // skis stuck upright in the snow by the door
+    if (o.skis) {
+      const rk = mulberry32(0x51c0 + (cz | 0));
+      for (let i = 0; i < o.skis; i++) {
+        const c = -D * 0.8 + rk() * D * 1.6;
+        const bx = cx + px2 * (W + 1.6) + fx2 * c, bz = cz + pz2 * (W + 1.6) + fz2 * c;
+        const tl = (rk() - 0.5) * 0.24;
+        const col = [[0.86, 0.20, 0.10], [0.10, 0.30, 0.66], [0.90, 0.72, 0.10], [0.90, 0.92, 0.95]][(rk() * 4) | 0];
+        strut(gb, new THREE.Vector3(bx, gy - 0.2, bz),
+          new THREE.Vector3(bx + tl, gy + 1.7, bz + tl * 0.6), 0.035, col);
+      }
+    }
+  }
+
+  /**
+   * A standing figure. Static, merged into the building mesh — the moving
+   * riders are recycled around the player and can never be relied on to be
+   * anywhere in particular, but the people standing outside a mountain
+   * restaurant are always there, and they are what stops a hut reading as an
+   * unoccupied box in the middle of a wilderness.
+   */
+  function figureAt(gb, cx, cz, yaw, jacket, tall) {
+    const gy = terrain.height(cx, cz);
+    const fx2 = Math.sin(yaw), fz2 = Math.cos(yaw);
+    const px2 = Math.cos(yaw), pz2 = -Math.sin(yaw);
+    const at = (a, y, c) => new THREE.Vector3(cx + px2 * a + fx2 * c, gy + y * tall, cz + pz2 * a + fz2 * c);
+    const PANT = [0.15, 0.15, 0.18], DARK = [0.12, 0.12, 0.14], SKIN = [0.70, 0.54, 0.43];
+    for (const s of [-1, 1]) {
+      strut(gb, at(s * 0.13, 0.02, 0), at(s * 0.15, 0.48, 0.02), 0.085, PANT, CYL8);
+      strut(gb, at(s * 0.15, 0.48, 0.02), at(s * 0.12, 0.92, -0.01), 0.10, PANT, CYL8);
+      // arm
+      strut(gb, at(s * 0.20, 1.36, 0.0), at(s * 0.28, 1.02, 0.10), 0.070, jacket, CYL8);
+      // boot
+      boxAt(gb, at(s * 0.14, 0.14, 0.02), new THREE.Vector3(0.15, 0.28, 0.32), yaw, DARK);
+    }
+    strut(gb, at(0, 0.94, -0.01), at(0, 1.40, 0.02), 0.195, jacket, CYL8);
+    strut(gb, at(0, 1.42, 0.02), at(0, 1.50, 0.02), 0.07, SKIN, CYL8);
+    const head = new THREE.IcosahedronGeometry(0.125 * tall, 1);
+    _mm.compose(at(0, 1.60, 0.01), new THREE.Quaternion(), new THREE.Vector3(1, 1.05, 1.1));
+    gb.add(head, _mm, DARK);
+    head.dispose();
+    // skis planted in the snow beside them
+    strut(gb, at(0.55, -0.15, 0.1), at(0.60, 1.55, 0.16), 0.035, jacket, CYL);
+  }
+
+  /** A tracked piste groomer, parked. Reads instantly as "this is a ski area". */
+  function groomerAt(gb, cx, cz, gy, yaw) {
+    const fx2 = Math.sin(yaw), fz2 = Math.cos(yaw);
+    const px2 = Math.cos(yaw), pz2 = -Math.sin(yaw);
+    const at = (a, y, c) => new THREE.Vector3(cx + px2 * a + fx2 * c, gy + y, cz + pz2 * a + fz2 * c);
+    const DARK = [0.07, 0.07, 0.08], BODY = [0.86, 0.32, 0.05], GLASS = [0.10, 0.13, 0.17];
+    // tracks
+    for (const sgn of [-1, 1]) {
+      boxAt(gb, at(sgn * 1.15, 0.45, 0), new THREE.Vector3(0.86, 0.86, 4.6), yaw, DARK);
+      boxAt(gb, at(sgn * 1.15, 0.45, 0), new THREE.Vector3(0.98, 0.40, 4.2), yaw, [0.13, 0.13, 0.14]);
+    }
+    // hull + cab
+    boxAt(gb, at(0, 1.25, -0.2), new THREE.Vector3(2.5, 0.95, 3.5), yaw, BODY);
+    boxAt(gb, at(0, 2.05, 0.15), new THREE.Vector3(2.2, 0.75, 1.8), yaw, GLASS);
+    boxAt(gb, at(0, 2.48, 0.15), new THREE.Vector3(2.3, 0.16, 1.95), yaw, BODY);
+    boxAt(gb, at(0, 2.66, 0.15), new THREE.Vector3(2.2, 0.10, 1.85), yaw, [1.16, 1.18, 1.24]);
+    // beacon + work lamps
+    boxAt(gb, at(0.7, 2.68, 0.15), new THREE.Vector3(0.22, 0.20, 0.22), yaw, [1.40, 0.55, 0.05]);
+    boxAt(gb, at(-0.6, 2.62, 0.9), new THREE.Vector3(0.30, 0.18, 0.16), yaw, [1.35, 1.25, 0.90]);
+    // front blade on its arms
+    strut(gb, at(-0.9, 1.0, 1.6), at(-1.5, 0.75, 3.0), 0.12, DARK, CYL8);
+    strut(gb, at(0.9, 1.0, 1.6), at(1.5, 0.75, 3.0), 0.12, DARK, CYL8);
+    boxAt(gb, at(0, 0.95, 3.15), new THREE.Vector3(4.0, 1.1, 0.22), yaw, BODY);
+    boxAt(gb, at(0, 0.44, 3.18), new THREE.Vector3(4.0, 0.20, 0.30), yaw, [0.72, 0.74, 0.78]);
+    // rear tiller under its hood
+    boxAt(gb, at(0, 0.72, -2.5), new THREE.Vector3(3.6, 0.70, 0.9), yaw, DARK);
+    boxAt(gb, at(0, 1.18, -2.4), new THREE.Vector3(3.6, 0.24, 1.0), yaw, [0.66, 0.68, 0.70]);
+    // exhaust
+    strut(gb, at(-1.0, 1.7, -1.6), at(-1.0, 3.0, -1.6), 0.07, [0.20, 0.20, 0.22], CYL8);
+  }
+
+  function buildVillage(gb) {
+    const rn = mulberry32(0x1beef);
+    const vx = VILLAGE.x, vz = VILLAGE.z;
+    for (let i = 0; i < 34; i++) {
+      const th = rn() * Math.PI * 2;
+      const rr = VILLAGE.r * Math.pow(rn(), 0.55);
+      // clustered along the valley floor rather than a disc
+      const px = vx + Math.cos(th) * rr * 1.5, pz = vz + Math.sin(th) * rr * 0.65;
+      field.probe(px, pz, probe);
+      if (probe.slope > 0.55) continue;
+      const gy = terrain.height(px, pz);
+      const w = 3.2 + rn() * 3.4;
+      hutAt(gb, px, pz, gy, rn() * Math.PI * 2, {
+        w, d: w * (0.9 + rn() * 0.7), h: 4.2 + rn() * 3.0, roofH: 2.2 + rn() * 1.4,
+        wall: rn() < 0.4 ? [0.30, 0.26, 0.22] : [0.15, 0.13, 0.11],
+      });
+    }
+    // church: the one vertical in a valley of roofs, and the thing that makes a
+    // cluster of boxes read as a village
+    {
+      const px = vx - 26, pz = vz + 14;
+      const gy = terrain.height(px, pz);
+      hutAt(gb, px, pz, gy, 0.4, { w: 5.0, d: 9.0, h: 7.5, roofH: 3.4, chimney: false });
+      const tx = px + 8, tz = pz - 5, ty = terrain.height(tx, tz);
+      boxAt(gb, new THREE.Vector3(tx, ty + 7.5, tz), new THREE.Vector3(3.4, 15, 3.4), 0.4, [0.62, 0.60, 0.57]);
+      boxAt(gb, new THREE.Vector3(tx, ty + 13.4, tz), new THREE.Vector3(3.6, 1.6, 3.6), 0.4, [0.14, 0.14, 0.16]);
+      // spire
+      const apex = new THREE.Vector3(tx, ty + 24, tz);
+      for (let k = 0; k < 4; k++) {
+        const a0 = (k / 4) * Math.PI * 2 + 0.4, a1 = ((k + 1) / 4) * Math.PI * 2 + 0.4;
+        const r = 2.4;
+        const v0 = gb.v(apex.x, apex.y, apex.z, 0, 1, 0, ...uvSnow(0.5, 0.5), 0.30, 0.28, 0.30, 0);
+        const v1 = gb.v(tx + Math.cos(a0) * r, ty + 15.2, tz + Math.sin(a0) * r,
+          Math.cos(a0), 0.5, Math.sin(a0), ...uvSnow(0.5, 0.5), 0.34, 0.32, 0.34, 0);
+        const v2 = gb.v(tx + Math.cos(a1) * r, ty + 15.2, tz + Math.sin(a1) * r,
+          Math.cos(a1), 0.5, Math.sin(a1), ...uvSnow(0.5, 0.5), 0.34, 0.32, 0.34, 0);
+        gb.tri(v0, v1, v2);
+      }
+    }
+  }
+
+  function buildBuildings() {
+    const gb = new GB();
+    for (const b of BUILDINGS) {
+      const gy = terrain.height(b.x, b.z);
+      hutAt(gb, b.x, b.z, gy, b.yaw, b);
+    }
+    for (const g of GROOMERS) groomerAt(gb, g.x, g.z, terrain.height(g.x, g.z), g.yaw);
+    // people outside the huts, in twos and threes
+    const fr = mulberry32(0x2b0b);
+    const JK = [[0.86, 0.18, 0.10], [0.10, 0.28, 0.64], [0.94, 0.66, 0.08],
+      [0.90, 0.92, 0.95], [0.12, 0.50, 0.34], [0.70, 0.22, 0.50], [0.16, 0.16, 0.18]];
+    for (const b of BUILDINGS) {
+      const n = b.deck ? 5 : 3;
+      for (let i = 0; i < n; i++) {
+        const a = b.yaw + (fr() - 0.5) * 2.2;
+        const rr = b.w + (b.deck || 0) + 2.5 + fr() * 7;
+        figureAt(gb, b.x + Math.cos(a) * rr * 1.1, b.z - Math.sin(a) * rr * 0.9,
+          fr() * 6.28, JK[(fr() * JK.length) | 0], 0.94 + fr() * 0.12);
+      }
+    }
+    buildVillage(gb);
+    const mesh = new THREE.Mesh(gb.geo(), matPaint);
+    mesh.name = 'buildings';
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false;
+    group.add(mesh);
+  }
+
   buildLift();
   buildProps();
+  buildBuildings();
 
   // ---- circulating chairs --------------------------------------------------
   const CHAIR_SPACING = 36;
@@ -3985,6 +4451,360 @@ export function createScatter(scene, terrain) {
   }
 
   // =========================================================================
+  // Other skiers
+  // =========================================================================
+  // The single loudest artificial signal in the frame was that nothing in the
+  // world was doing anything: one rider on a whole mountain. Shredders — a
+  // measurably weaker renderer — read as a game instantly because six other
+  // riders were on screen.
+  //
+  // These need no AI and no pathfinding. Each rides a sine down the fall line
+  // with its own wavelength, amplitude, lateral offset, speed and phase, which
+  // is what a carved descent IS; the lean comes out of the curvature of that
+  // path and the spray out of the lean. They are recycled around the player, so
+  // there are always six to nine of them on the piste below, at 40-400 m.
+  //
+  // Cost: three instanced draw calls plus one for the spray, ~1.4k triangles
+  // total, and nine terrain samples a frame.
+  const RIDERS = 12;
+  const RIDER_JACKETS = [
+    [0.86, 0.16, 0.10], [0.10, 0.26, 0.62], [0.92, 0.62, 0.06], [0.10, 0.10, 0.12],
+    [0.80, 0.82, 0.86], [0.10, 0.52, 0.34], [0.72, 0.24, 0.52], [0.94, 0.94, 0.30],
+    [0.22, 0.62, 0.82], [0.55, 0.14, 0.62], [0.96, 0.42, 0.16], [0.34, 0.36, 0.40],
+  ];
+
+  function buildRiderSkis() {
+    const gb = new GB();
+    const SKI = [0.10, 0.11, 0.13], EDGE = [0.62, 0.64, 0.68], BOOT = [0.13, 0.13, 0.15];
+    for (const sx of [-0.17, 0.17]) {
+      // ski body, with a lifted, upturned tip
+      boxAt(gb, new THREE.Vector3(sx, 0.035, 0.06), new THREE.Vector3(0.105, 0.035, 1.64), 0, SKI);
+      boxAt(gb, new THREE.Vector3(sx, 0.030, -0.78), new THREE.Vector3(0.105, 0.022, 0.20), 0, EDGE);
+      strut(gb, new THREE.Vector3(sx, 0.05, 0.85), new THREE.Vector3(sx, 0.15, 1.02), 0.05, SKI, CYL8);
+      // binding + boot
+      boxAt(gb, new THREE.Vector3(sx, 0.10, 0.02), new THREE.Vector3(0.13, 0.08, 0.34), 0, BOOT);
+      boxAt(gb, new THREE.Vector3(sx, 0.24, 0.0), new THREE.Vector3(0.145, 0.26, 0.30), 0, BOOT);
+    }
+    return gb.geo();
+  }
+
+  function buildRiderLegs() {
+    const gb = new GB();
+    const PANT = [0.15, 0.16, 0.19];
+    for (const s of [-1, 1]) {
+      const ankle = new THREE.Vector3(s * 0.17, 0.36, 0.02);
+      const knee = new THREE.Vector3(s * 0.19, 0.62, 0.20);
+      const hip = new THREE.Vector3(s * 0.13, 0.94, -0.02);
+      strut(gb, ankle, knee, 0.085, PANT, CYL8);
+      strut(gb, knee, hip, 0.105, PANT, CYL8);
+    }
+    // seat / hips
+    boxAt(gb, new THREE.Vector3(0, 0.96, -0.02), new THREE.Vector3(0.40, 0.22, 0.28), 0, PANT);
+    return gb.geo();
+  }
+
+  function buildRiderUpper() {
+    const gb = new GB();
+    const JKT = [1.0, 1.0, 1.0];              // takes the per-instance colour
+    const DARK = [0.14, 0.14, 0.16];
+    const SKIN = [0.72, 0.55, 0.44];
+    // torso, leaning forward into the hill
+    strut(gb, new THREE.Vector3(0, 1.00, -0.02), new THREE.Vector3(0, 1.42, 0.12), 0.20, JKT, CYL8);
+    boxAt(gb, new THREE.Vector3(0, 1.44, 0.12), new THREE.Vector3(0.44, 0.16, 0.30), 0, JKT);
+    // arms forward, elbows out
+    for (const s of [-1, 1]) {
+      const sh = new THREE.Vector3(s * 0.21, 1.40, 0.10);
+      const el = new THREE.Vector3(s * 0.30, 1.20, 0.24);
+      const hd = new THREE.Vector3(s * 0.27, 1.08, 0.42);
+      strut(gb, sh, el, 0.075, JKT, CYL8);
+      strut(gb, el, hd, 0.062, JKT, CYL8);
+      // pole: grip at the hand, basket trailing behind and out
+      strut(gb, hd, new THREE.Vector3(s * 0.40, 0.16, -0.72), 0.013, DARK, CYL);
+      strut(gb, new THREE.Vector3(s * 0.395, 0.24, -0.66),
+        new THREE.Vector3(s * 0.40, 0.20, -0.70), 0.045, DARK, CYL);
+    }
+    // neck + helmet
+    strut(gb, new THREE.Vector3(0, 1.46, 0.10), new THREE.Vector3(0, 1.54, 0.10), 0.07, SKIN, CYL8);
+    const head = new THREE.IcosahedronGeometry(0.125, 1);
+    _mm.compose(new THREE.Vector3(0, 1.62, 0.08), new THREE.Quaternion(),
+      new THREE.Vector3(1, 1.05, 1.15));
+    gb.add(head, _mm, DARK);
+    head.dispose();
+    // goggles
+    boxAt(gb, new THREE.Vector3(0, 1.63, 0.20), new THREE.Vector3(0.20, 0.075, 0.08), 0, [0.30, 0.55, 0.75]);
+    // small pack, so the back silhouette is not a smooth cylinder
+    boxAt(gb, new THREE.Vector3(0, 1.24, -0.14), new THREE.Vector3(0.30, 0.36, 0.14), 0, DARK);
+    return gb.geo();
+  }
+
+  function makePuffTexture() {
+    const S = 64;
+    const cv = makeCanvas(S, S);
+    const g = cv.getContext('2d');
+    g.clearRect(0, 0, S, S);
+    // A spray plume is not a ball. Soft, wide, off-centre lobes with a long
+    // alpha tail: hard-edged discs read as cotton wool stuck to the piste.
+    const rr = mulberry32(0x77aa);
+    for (let i = 0; i < 14; i++) {
+      const x = S * (0.5 + (rr() - 0.5) * 0.78), y = S * (0.52 + (rr() - 0.5) * 0.62);
+      const r = S * (0.16 + 0.26 * rr());
+      const gr = g.createRadialGradient(x, y, 0, x, y, r);
+      gr.addColorStop(0, 'rgba(255,255,255,0.42)');
+      gr.addColorStop(0.45, 'rgba(255,255,255,0.20)');
+      gr.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = gr;
+      g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  const riderSkis = new THREE.InstancedMesh(buildRiderSkis(), matPaint, RIDERS);
+  const riderLegs = new THREE.InstancedMesh(buildRiderLegs(), matPaint, RIDERS);
+  const riderUpper = new THREE.InstancedMesh(buildRiderUpper(), matPaint, RIDERS);
+  const puffTex = makePuffTexture();
+  const matPuff = new THREE.MeshBasicMaterial({
+    map: puffTex, transparent: true, depthWrite: false, opacity: 1,
+    side: THREE.DoubleSide, vertexColors: true, fog: true,
+  });
+  // The per-instance value is an ALPHA, not a colour: fading a puff by
+  // multiplying its albedo turns it into a black smudge against the snow
+  // instead of dissolving it.
+  matPuff.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <color_fragment>', /* glsl */`
+        #ifdef USE_COLOR
+          diffuseColor.a *= vColor.r;
+          // Sunlit spray is BRIGHTER than white: the snowfield beside it is
+          // being lit by a 100 klx sun and this material is unlit, so at
+          // radiance 1.0 the puff tone-mapped to a grey smoke smudge.
+          diffuseColor.rgb *= vec3( 3.6, 3.7, 3.9 );
+        #endif
+      `);
+  };
+  matPuff.customProgramCacheKey = () => 'sc-puff';
+  const PUFFS = RIDERS * 5;
+  const puffGeo = new THREE.PlaneGeometry(1, 1);
+  puffGeo.setAttribute('color', new THREE.Float32BufferAttribute(
+    new Float32Array(puffGeo.attributes.position.count * 3).fill(1), 3));
+  const riderPuffs = new THREE.InstancedMesh(puffGeo, matPuff, PUFFS);
+  for (const m of [riderSkis, riderLegs, riderUpper, riderPuffs]) {
+    m.frustumCulled = false;
+    m.castShadow = m !== riderPuffs;
+    m.receiveShadow = false;
+    m.count = 0;
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    m.instanceColor = new THREE.InstancedBufferAttribute(
+      new Float32Array(m.instanceMatrix.count * 3).fill(1), 3);
+    m.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    group.add(m);
+  }
+  riderSkis.name = 'riders-skis';
+  riderLegs.name = 'riders-legs';
+  riderUpper.name = 'riders-upper';
+  riderPuffs.name = 'riders-spray';
+
+  const riders = [];
+  const riderRnd = mulberry32(0x5c1e5);
+  function respawnRider(r, pz, pOff) {
+    // ahead of the player, down the fall line, spread over 320 m
+    // MEASURED, and the single least obvious thing in this whole pass: the
+    // chase camera sits 1.7 m over a straight 15 deg ramp, so the piste is seen
+    // nearly edge-on and a 1.75 m figure converges into the surface noise
+    // within about 60 m — a ray-march from the hero camera finds every rider
+    // past 60 m occluded by the roll of the piste. A "realistic" spread over
+    // 45-375 m therefore renders as an EMPTY piste. Two thirds of the riders
+    // are held in the 15-50 m band where they actually read, and the rest run
+    // out to 350 m for the wide framings.
+    //
+    // They are also pushed at least 7 m off the camera's own line, or the near
+    // ones sit exactly behind the player's own body.
+    r.near = (r.slot % 5) < 3;
+    r.z = pz - (r.near ? 15 + 34 * riderRnd() : 55 + 300 * Math.pow(riderRnd(), 1.6));
+    r.amp = 6 + riderRnd() * 9;
+    r.wl = 30 + riderRnd() * 40;                 // metres per half turn
+    const sgn = (r.slot & 1) ? 1 : -1;
+    r.off = 0.62 * clamp(pOff, -32, 32) + sgn * (7 + riderRnd() * 20);
+    r.stand = false;
+    r.ph = riderRnd() * 6.28;
+    r.v = 10 + riderRnd() * 7;
+    r.jacket = (riderRnd() * RIDER_JACKETS.length) | 0;
+    r.crouch = riderRnd();
+    // Not everyone on a piste is skiing it. The reference photographs are full
+    // of people standing at the edge in twos and threes; a slope on which every
+    // single figure is carving at 50 km/h in the same direction reads as a
+    // spawner, not a resort. One rider in six is parked on the shoulder.
+    r.stand = (r.slot % 6) === 5;
+    if (r.stand) {
+      r.v = 0.4 + riderRnd() * 1.1;
+      r.amp = 0;
+      r.off = sgn * (24 + riderRnd() * 16);
+      r.z = pz - (22 + 110 * riderRnd());
+      r.crouch = 0.15 * riderRnd();
+    }
+    // ...and they are not evenly spaced either: every fourth rider is following
+    // the one before it, a few metres back and off to one side.
+    if ((r.slot & 3) === 3 && riders.length === RIDERS) {
+      const lead = riders[r.slot - 1];
+      if (lead && !lead.stand) {
+        r.z = lead.z - (5 + riderRnd() * 8);
+        r.off = lead.off + sgn * (3 + riderRnd() * 5);
+        r.amp = lead.amp; r.wl = lead.wl; r.ph = lead.ph + 0.4;
+        r.v = lead.v * (0.94 + riderRnd() * 0.1);
+        r.stand = lead.stand;
+      }
+    }
+    if (Math.abs(r.off) + r.amp > PISTE_HALF - 6) r.off *= 0.5;
+  }
+  for (let i = 0; i < RIDERS; i++) {
+    const r = { z: 0, amp: 0, wl: 40, off: 0, ph: 0, v: 14, jacket: i, crouch: 0.5, slot: i, near: true };
+    respawnRider(r, 0, 0);
+    // seed with the same near-weighted spread the recycler uses, so the first
+    // frame after a teleport already has riders in the near half of the range
+    r.z = r.near ? -(15 + 34 * ((i * 7) % 5) / 5)
+      : -(55 + 300 * Math.pow(((i * 3) % 7) / 7, 1.6));
+    riders.push(r);
+  }
+  let ridersInit = false;
+
+  const _rq = new THREE.Quaternion(), _rq2 = new THREE.Quaternion();
+  const _rn = new THREE.Vector3(), _rm = new THREE.Matrix4(), _rl = new THREE.Matrix4();
+  // NB: the base transform needs its own matrix. multiplyMatrices(this, b) with
+  // `this === a` reads its own elements as it overwrites them.
+  const _rbase = new THREE.Matrix4();
+  const _rv = new THREE.Vector3(), _rs = new THREE.Vector3();
+  const FWD = new THREE.Vector3(0, 0, 1);
+  const puffs = [];
+  for (let i = 0; i < PUFFS; i++) puffs.push({ x: 0, y: -9999, z: 0, t: 1, s: 1, seed: i });
+
+  const RIGHT = new THREE.Vector3(1, 0, 0);
+  /**
+   * One body part, rotated about a pivot at (0, pivotY, 0) in rider space and
+   * concatenated onto the rider's base transform. Roll is about the travel
+   * axis (that is the edge angle), pitch about lateral (fore/aft lean).
+   */
+  function riderPart(mesh, slot, base, pivotY, roll, pitch, yawEx, col) {
+    _rq2.setFromAxisAngle(FWD, roll);
+    _rq.setFromAxisAngle(RIGHT, pitch);
+    _rq2.multiply(_rq);
+    if (yawEx) { _rq.setFromAxisAngle(UP, yawEx); _rq2.multiply(_rq); }
+    _rl.makeRotationFromQuaternion(_rq2);
+    const e = _rl.elements;
+    e[12] = -e[4] * pivotY;
+    e[13] = pivotY - e[5] * pivotY;
+    e[14] = -e[6] * pivotY;
+    _rm.multiplyMatrices(base, _rl);
+    _rm.toArray(mesh.instanceMatrix.array, slot * 16);
+    const ca = mesh.instanceColor.array;
+    ca[slot * 3] = col[0]; ca[slot * 3 + 1] = col[1]; ca[slot * 3 + 2] = col[2];
+  }
+
+  const NEUTRAL = [0.92, 0.92, 0.96];
+  let puffCursor = 0;
+
+  function updateRiders(px, pz, dt, camX, camZ) {
+    const pOff = px - corridorX(pz);
+    if (!ridersInit) {
+      ridersInit = true;
+      for (const r of riders) r.z += pz;
+    }
+    let slot = 0;
+    for (let i = 0; i < riders.length; i++) {
+      const r = riders[i];
+      r.z -= r.v * dt;
+      // recycle: always six to nine riders on the slope below the player
+      if (r.z > pz - 13 || r.z < pz - 400) respawnRider(r, pz, pOff);
+
+      const k = Math.PI / r.wl;
+      const s = Math.sin(r.z * k + r.ph);
+      const cxz = corridorX(r.z);
+      const x = cxz + r.off + r.amp * s;
+      const dxdz = (corridorX(r.z + 4) - corridorX(r.z - 4)) / 8 + r.amp * k * Math.cos(r.z * k + r.ph);
+      const d2x = -r.amp * k * k * s;
+      // travel direction: z decreases
+      const dirX = -dxdz, dirZ = -1;
+      const dl = Math.hypot(dirX, dirZ);
+      const yaw = Math.atan2(dirX / dl, dirZ / dl);
+      const y = terrain.sample(x, r.z, _rn);
+      // lean = the angle the resultant of gravity and the turn's lateral
+      // acceleration makes with the snow. This is not a stylistic choice; it is
+      // what puts a rider's shoulders where a photograph puts them.
+      const kappa = d2x / Math.pow(1 + dxdz * dxdz, 1.5);
+      const lean = r.stand ? 0 : clamp(Math.atan(r.v * r.v * kappa / 9.81), -0.52, 0.52);
+      const edge = Math.abs(lean);
+
+      _rq.setFromUnitVectors(UP, _rn);
+      _rq2.setFromAxisAngle(UP, yaw);
+      _rq.multiply(_rq2);
+      const bob = -0.05 * edge - 0.06 * r.crouch;
+      _rbase.compose(_rv.set(x, y + bob, r.z), _rq, _rs.set(1, 1, 1));
+
+      const col = RIDER_JACKETS[r.jacket];
+      // skis take the full edge angle, the legs nearly all of it, the upper
+      // body far less — angulation is the whole shape of a carved turn
+      riderPart(riderSkis, slot, _rbase, 0.0, lean, 0.02, lean * 0.20, NEUTRAL);
+      riderPart(riderLegs, slot, _rbase, 0.30, lean * 0.92, 0.06, 0, NEUTRAL);
+      riderPart(riderUpper, slot, _rbase, 1.00, lean * 0.42,
+        r.stand ? -0.06 : 0.16 + 0.14 * r.crouch, -lean * 0.30, col);
+      slot++;
+
+      // spray off the outside edge, only while the edges are really loaded.
+      // Deterministic (a phase accumulator, not Math.random) so a captured
+      // frame is reproducible.
+      r.acc = (r.acc || 0) + dt * (1.2 + edge * 11);
+      if (edge > 0.15 && !r.stand && r.acc >= 1) {
+        r.acc = 0;
+        const p = puffs[puffCursor];
+        puffCursor = (puffCursor + 1) % PUFFS;
+        const side = lean > 0 ? -1 : 1;
+        p.x = x + Math.cos(yaw) * side * 0.5;
+        p.y = y + 0.15;
+        p.z = r.z - Math.sin(yaw) * side * 0.5 - 0.6;
+        p.t = 0.001;
+        p.s = 0.34 + edge * 0.95;
+        p.rot = (puffCursor * 2.399) % 6.283;
+        p.vx = -dirX / dl * 3.2 - Math.cos(yaw) * side * 1.4;
+        p.vz = -dirZ / dl * 3.2 + Math.sin(yaw) * side * 1.4;
+      } else if (r.acc >= 1) r.acc = 0;
+    }
+    riderSkis.count = riderLegs.count = riderUpper.count = slot;
+    riderSkis.instanceMatrix.needsUpdate = true;
+    riderLegs.instanceMatrix.needsUpdate = true;
+    riderUpper.instanceMatrix.needsUpdate = true;
+    riderSkis.instanceColor.needsUpdate = true;
+    riderLegs.instanceColor.needsUpdate = true;
+    riderUpper.instanceColor.needsUpdate = true;
+
+    // puffs: billboarded toward the camera, rising and spreading as they die
+    let ps = 0;
+    const arr = riderPuffs.instanceMatrix.array;
+    const pc = riderPuffs.instanceColor.array;
+    for (let i = 0; i < PUFFS; i++) {
+      const p = puffs[i];
+      if (p.t >= 1) continue;
+      p.t += dt * 1.35;
+      if (p.t >= 1) continue;
+      const g = p.t;
+      const sz = p.s * (0.6 + 1.9 * g);
+      const yaw = Math.atan2(camX - p.x, camZ - p.z);
+      _rq.setFromAxisAngle(UP, yaw);
+      _rq2.setFromAxisAngle(FWD, p.rot + g * 0.6);
+      _rq.multiply(_rq2);
+      _rm.compose(_rv.set(p.x + (p.vx || 0) * g * 0.5, p.y + 0.12 + g * 1.1 * p.s,
+        p.z + (p.vz || 0) * g * 0.5), _rq, _rs.set(sz * 1.35, sz, sz));
+      _rm.toArray(arr, ps * 16);
+      // fade in fast, out slowly
+      const a = Math.min(1, g * 7) * (1 - g) * (1 - g) * 1.5;
+      pc[ps * 3] = a; pc[ps * 3 + 1] = a; pc[ps * 3 + 2] = a;
+      ps++;
+    }
+    riderPuffs.count = ps;
+    riderPuffs.instanceMatrix.needsUpdate = true;
+    riderPuffs.instanceColor.needsUpdate = true;
+  }
+
+  // =========================================================================
   let time = 0;
 
   return {
@@ -4010,13 +4830,14 @@ export function createScatter(scene, terrain) {
 
       for (const pool of allPools) pool.flush();
       updateChairs(px, pz, dt || 0);
+      updateRiders(px, pz, dt || 0, px, pz + 4);
     },
 
     dispose() {
-      for (const t of [treeTex, treeAtlas.nrm, impTex, clTex, massTex, netTex]) t.dispose();
+      for (const t of [treeTex, treeAtlas.nrm, impTex, clTex, massTex, netTex, puffTex]) t.dispose();
       for (const m of [protoTree, protoImp, protoRock, protoSnow, matTree0, matTree1,
         matLog0, matLog1, matImp, matCl, matMass, matRock0, matRock1,
-        matDrift0, matDrift1, matPaint, matNet]) m.dispose();
+        matDrift0, matDrift1, matPaint, matNet, matPuff]) m.dispose();
       group.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
       scene.remove(group);
     },

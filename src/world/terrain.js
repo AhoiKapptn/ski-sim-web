@@ -532,7 +532,24 @@ export class Terrain {
           Math.abs(H[k + 1] - H[k - 1]),
           Math.abs(H[k + R] - H[k - R]),
         ) / (2 * MAP_STEP);
-        delta[k] = -Math.min(38, 0.26 * Math.pow(flow[k], 0.45)) * clamp(slope * 2.4 - 0.10, 0.0, 1);
+        // Channel-initiation threshold. Without one, *every* cell on the map has
+        // upstream flow of at least a few and therefore gets its own groove, so
+        // the carve does not produce a drainage network — it produces a comb.
+        // On a steep face 1.5 km out those grooves are 8-16 m wide and a metre
+        // deep, they all run exactly down the fall line, and they were the
+        // vertical smearing on the cliff faces: fine, parallel, perfectly
+        // coherent striping that no amount of shading detail can out-vote,
+        // because it is in the surface itself.
+        //
+        // Real hillslopes are smooth. Channels begin only where enough area has
+        // collected to move material — the critical drainage area — and above
+        // that threshold they deepen fast. Subtracting the threshold inside the
+        // power law is exactly that: nothing at all below ~50 cells of upstream
+        // area, and the big dendritic couloirs are untouched (they had flow in
+        // the thousands and lose 8% of their depth).
+        const fq = Math.pow(flow[k], 0.45) - 5.6;
+        delta[k] = fq <= 0 ? 0
+          : -Math.min(38, 0.335 * fq) * clamp(slope * 2.4 - 0.10, 0.0, 1);
       }
     }
     // The channel carve leaves a stepped trench that has to be relaxed. A

@@ -289,6 +289,183 @@ function patchFog() {
 patchFog();
 
 // ---------------------------------------------------------------------------
+// Near shadow cascade + contact occlusion
+//
+// THE PROBLEM. One cascade cannot both reach the ridge 300 m away and resolve a
+// 7 cm ski. The sun cascade is +/-330 m over a 4096 map — 16.1 cm per texel —
+// and it carries `normalBias = 0.42`, which shoves every receiver 42 cm along
+// its own normal before the depth compare. Both numbers are correct for what
+// that cascade is for (terrain-scale shade over a third of a kilometre) and both
+// are larger than the skier's skis, boots and poles.
+//
+// Measured on the hero framing, mean over a 160x50 px patch of snow 1-2 m
+// down-sun of the skier against an equivalent patch beside him: 155.9 vs 162.0,
+// i.e. SIX display codes. He cast no shadow at all and read as a sprite
+// composited over a photograph. The same two patches now read 116.7 vs 161.8:
+// 45 codes. Point-sampled at exactly 1.5 m down-sun the pixel goes 154 -> 79.
+//
+// THE FIX is a second cascade: +/-14 m over a 2048 map (1.37 cm per texel, 12x
+// finer) with normalBias 0.015, carried by a DirectionalLight that shares the
+// sun's direction but has **zero intensity**. It contributes no radiance; three
+// renders its shadow map, and the two maps are merged in the shader below.
+//
+// MERGING. Both cascades are the same light, so an occluder found by either one
+// is a real occluder: the merge is `min( far, near )`, a union. That has three
+// properties worth spelling out.
+//   - Outside the near frustum three's own `getShadow()` returns 1.0, so the
+//     union degenerates to the far cascade exactly. There is nothing to blend.
+//   - Inside it, the near cascade *adds* the detail the far one is too coarse
+//     to hold, and — because min() takes whichever is darker — it also repairs
+//     the far cascade's 42 cm of peter-panning under the skis.
+//   - The only seam risk is the near frustum's own border, where a fine
+//     occluder's shadow would otherwise stop dead along a straight line. The
+//     near term is therefore faded to "lit" across the outer 25% of the box
+//     (10.5 m to 14 m from the skier) before the min, so it dies out over 3.5 m
+//     of ground instead of on an edge.
+//
+// The merge is symmetric in the two cascade indices, so it does not care which
+// order the renderer sorts the lights into. Everything *else* does: snow-material
+// reads `directionalLights[0]` for its subsurface, sheen and sparkle terms, so
+// the real sun has to stay at index 0. three sorts lights with a stable sort
+// whose comparator only looks at castShadow and light.map — equal for these two
+// — so scene order decides, and `sun` is added to the scene before `sunNear`.
+//
+// CONTACT OCCLUSION is the other half of "grounded". A cast shadow at a 23 deg
+// sun lies several metres off to one side; it does not darken the snow the skis
+// are actually touching. What does that is ambient occlusion — the skier's body
+// blocking part of the sky dome, which at ENV_INTENSITY 0.46 is a sixth of the
+// light on the snow. Two analytic occluders (a capsule along the ski line, a
+// sphere for the body) are folded into <aomap_fragment> for every lit material
+// in the scene. They cost one uniform branch and no texture reads.
+// ---------------------------------------------------------------------------
+
+// [0] = ski-line centre (world), .w = master strength (0 disables the branch)
+// [1] = ski forward unit vector, .w = ski-line half length
+// [2] = body centre (world),      .w = body radius
+const CONTACT = new Float32Array(12);
+const CONTACT_UNIFORM = { value: CONTACT };
+
+let cascadePatched = false;
+
+function patchShadowCascade() {
+  if (cascadePatched) return;
+
+  // ---- fade + union helper, appended to the chunk that defines getShadow ----
+  THREE.ShaderChunk.shadowmap_pars_fragment += /* glsl */ `
+#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 1
+  // Union of two cascades of the SAME light. \`other\` is faded back to "lit"
+  // near the edge of its own frustum so a fine shadow the coarse cascade cannot
+  // see does not end on a straight line across the snow.
+  float alpineMergeCascade( float base, float other, vec4 otherCoord ) {
+    vec3 p = otherCoord.xyz / otherCoord.w;
+    vec2 d = abs( p.xy - 0.5 ) * 2.0;
+    float w = 1.0 - smoothstep( 0.75, 1.0, max( d.x, d.y ) );
+    return min( base, mix( 1.0, other, w ) );
+  }
+#endif`;
+
+  // ---- directional light loop ---------------------------------------------
+  const DIR_BLOCK = /#if \( NUM_DIR_LIGHTS > 0 \) && defined\( RE_Direct \)[\s\S]*?#pragma unroll_loop_end\n#endif/;
+  const before = THREE.ShaderChunk.lights_fragment_begin;
+  if (!DIR_BLOCK.test(before)) {
+    console.warn('sky.js: directional light block not found; near shadow cascade disabled');
+    return;
+  }
+
+  // NB the unrolled loop body is pasted N times into one scope, so anything
+  // declared in it has to be inside braces of its own — hence the `if` block.
+  const SHADOW_CALL = (i) => `getShadow( directionalShadowMap[ ${i} ], directionalLightShadows[ ${i} ].shadowMapSize, `
+    + `directionalLightShadows[ ${i} ].shadowIntensity, directionalLightShadows[ ${i} ].shadowBias, `
+    + `directionalLightShadows[ ${i} ].shadowRadius, vDirectionalShadowCoord[ ${i} ] )`;
+
+  THREE.ShaderChunk.lights_fragment_begin = before.replace(DIR_BLOCK, /* glsl */ `#if ( NUM_DIR_LIGHTS > 0 ) && defined( RE_Direct )
+	DirectionalLight directionalLight;
+	#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+	DirectionalLightShadow directionalLightShadow;
+	#endif
+	#pragma unroll_loop_start
+	for ( int i = 0; i < NUM_DIR_LIGHTS; i ++ ) {
+		directionalLight = directionalLights[ i ];
+		// A cascade light carries a shadow map and nothing else: its radiance is
+		// zero, and evaluating a PCF kernel and a full BRDF to add zero is not
+		// free. The test is uniform across the draw call, so it costs nothing.
+		if ( directionalLight.color.r + directionalLight.color.g + directionalLight.color.b > 0.0 ) {
+			getDirectionalLightInfo( directionalLight, directLight );
+			#if defined( USE_SHADOWMAP ) && ( UNROLLED_LOOP_INDEX < NUM_DIR_LIGHT_SHADOWS )
+			directionalLightShadow = directionalLightShadows[ i ];
+			float alpShadow = ( directLight.visible && receiveShadow ) ? ${SHADOW_CALL('i')} : 1.0;
+			#if NUM_DIR_LIGHT_SHADOWS > 1
+				if ( receiveShadow ) {
+					#if UNROLLED_LOOP_INDEX == 0
+						alpShadow = alpineMergeCascade( alpShadow, ${SHADOW_CALL(1)}, vDirectionalShadowCoord[ 1 ] );
+					#elif UNROLLED_LOOP_INDEX == 1
+						alpShadow = alpineMergeCascade( alpShadow, ${SHADOW_CALL(0)}, vDirectionalShadowCoord[ 0 ] );
+					#endif
+				}
+			#endif
+			directLight.color *= alpShadow;
+			#endif
+			RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );
+		}
+	}
+	#pragma unroll_loop_end
+#endif`);
+
+  // ---- contact occlusion ---------------------------------------------------
+  // World position is reconstructed from vViewPosition rather than taken from
+  // the fog varying: snow-material sets `material.fog = false` (it runs its own
+  // height-attenuated aerial perspective), so USE_FOG is undefined on the one
+  // surface that matters most here. vViewPosition is declared by every lighting
+  // model, and `v * mat3( viewMatrix )` is transpose(R) * v, i.e. view -> world.
+  THREE.ShaderChunk.aomap_fragment += /* glsl */ `
+#if defined( RE_IndirectDiffuse )
+if ( alpContact[ 0 ].w > 0.0 ) {
+  vec3 alpW = cameraPosition - vViewPosition * mat3( viewMatrix );
+  vec3 alpN = geometryNormal * mat3( viewMatrix );
+  // Sky occlusion is a cosine-weighted integral; a wall beside the skier loses
+  // far less of its dome than the snow under him does.
+  float alpUp = 0.22 + 0.78 * clamp( alpN.y, 0.0, 1.0 );
+
+  // The ski line: a capsule along the skis, boots and lower legs. This is also
+  // the "displaced snow" cue — a skier at speed leaves a trench, and a trench
+  // is darker than the piste beside it. r^2/(r^2 + d^2) is the cosine-weighted
+  // occlusion of a sphere of that radius, which is the right shape for this:
+  // it falls off as 1/d^2, not off a cliff.
+  vec3 alpD = alpW - alpContact[ 0 ].xyz;
+  float alpT = clamp( dot( alpD, alpContact[ 1 ].xyz ), -alpContact[ 1 ].w, alpContact[ 1 ].w );
+  vec3 alpSeg = alpD - alpContact[ 1 ].xyz * alpT;
+  float alpSki = 0.11 / ( 0.11 + dot( alpSeg, alpSeg ) );
+
+  // The body: a sphere occluding the dome of everything beneath it. Gated on
+  // being below the sphere's centre so the skier's own jacket, which sits at
+  // that centre, is not darkened by itself — his boots, which are under it,
+  // correctly are.
+  vec3 alpB = alpW - alpContact[ 2 ].xyz;
+  float alpR2 = alpContact[ 2 ].w * alpContact[ 2 ].w;
+  float alpBody = ( alpR2 / ( alpR2 + dot( alpB, alpB ) ) )
+    * clamp( ( alpContact[ 2 ].y - alpW.y ) / alpContact[ 2 ].w, 0.0, 1.0 );
+
+  float alpOcc = min( 0.50 * alpSki + 0.72 * alpBody, 0.72 ) * alpUp * alpContact[ 0 ].w;
+  reflectedLight.indirectDiffuse *= 1.0 - alpOcc;
+  reflectedLight.indirectSpecular *= 1.0 - alpOcc * 0.55;
+}
+#endif`;
+
+  // Declared in the lighting uniform group: exactly the materials whose
+  // <aomap_fragment> can see RE_IndirectDiffuse, and no others.
+  THREE.ShaderChunk.lights_pars_begin += '\nuniform vec4 alpContact[ 3 ];\n';
+
+  if (THREE.UniformsLib.lights) THREE.UniformsLib.lights.alpContact = CONTACT_UNIFORM;
+  for (const key of Object.keys(THREE.ShaderLib)) {
+    const u = THREE.ShaderLib[key].uniforms;
+    if (u && u.directionalLights && !u.alpContact) u.alpContact = CONTACT_UNIFORM;
+  }
+
+  cascadePatched = true;
+}
+patchShadowCascade();
+
+// ---------------------------------------------------------------------------
 // Sky dome shader
 // ---------------------------------------------------------------------------
 const SKY_VERT = /* glsl */ `
@@ -760,10 +937,47 @@ export function createSky(scene, renderer) {
   // normalBias is in world units and has to track the texel footprint, or a
   // 3.5x wider frustum acnes every metre-scale sastruga on the piste.
   sun.shadow.normalBias = 0.42;
-  sun.shadow.radius = 2.0;        // only used if the lead switches to VSM
+  sun.shadow.radius = 2.0;        // PCF kernel, in texels: 2 -> 32 cm here
   sun.shadow.camera.updateProjectionMatrix();
   scene.add(sun);
   scene.add(sun.target);
+
+  // ---- near cascade ------------------------------------------------------
+  // See the long note at the top of the file. Zero intensity: this light exists
+  // only to have three render a second shadow map for it, and it MUST be added
+  // to the scene after `sun` — snow-material reads directionalLights[0].
+  //
+  // 14 m of half-extent over 2048 is 1.37 cm/texel: a 7 cm ski is 5 texels wide
+  // and a 15 cm shin is 11, against 0.4 and 0.9 in the far cascade. The depth
+  // range is 160 m rather than the far cascade's 3380, so the same *relative*
+  // bias buys 21x less depth slip: -0.00005 is 0.8 cm here, where the far
+  // cascade's -0.00012 is 41 cm.
+  const NEAR_MAP = 2048;
+  const NEAR_HALF = 14;             // metres of half-extent around the skier
+  const NEAR_DIST = 100;            // light distance; sets the depth range
+  const sunNear = new THREE.DirectionalLight(0xffffff, 0);
+  sunNear.name = 'sun-near-cascade';
+  sunNear.castShadow = true;
+  sunNear.shadow.mapSize.set(NEAR_MAP, NEAR_MAP);
+  sunNear.shadow.camera.near = 20;
+  sunNear.shadow.camera.far = 180;
+  sunNear.shadow.camera.left = -NEAR_HALF;
+  sunNear.shadow.camera.right = NEAR_HALF;
+  sunNear.shadow.camera.top = NEAR_HALF;
+  sunNear.shadow.camera.bottom = -NEAR_HALF;
+  sunNear.shadow.bias = -0.00005;
+  // 1.5 cm, i.e. a little over one texel. The far cascade needs 42 cm because
+  // its texel is 16 cm across; at 1.37 cm a ski boot survives this one.
+  sunNear.shadow.normalBias = 0.015;
+  // The sun subtends 0.53 deg, so a real contact shadow has a ~1 cm penumbra at
+  // the ski and ~5 cm a metre away. 2.2 texels is 3 cm: soft enough not to
+  // alias, hard enough to still read as contact.
+  sunNear.shadow.radius = 2.2;
+  sunNear.shadow.camera.updateProjectionMatrix();
+  if (cascadePatched) {
+    scene.add(sunNear);
+    scene.add(sunNear.target);
+  }
 
   // NOT part of the lighting solution — see SPRAY_HEMI_INTENSITY above. It is
   // invisible, so WebGLRenderer never collects it; it exists so fx/spray.js can
@@ -1365,20 +1579,103 @@ export function createSky(scene, renderer) {
     sun.target.position.copy(_tmp);
     sun.position.copy(_tmp).addScaledVector(sunDir, 1500);
     sun.target.updateMatrixWorld();
+
+    // ---- near cascade ------------------------------------------------------
+    // Centred on the skier, NOT on the far cascade's velocity-led focus: what
+    // has to be inside this box is the caster, and the caster is him. At 20 m/s
+    // the 0.6 s lead the far cascade uses would put him 12 m off centre, i.e.
+    // on the fade band.
+    //
+    // Snapping matters more here than anywhere else in the file. 1.37 cm texels
+    // are a twelfth of the far cascade's, so an unsnapped frustum re-rasterises
+    // every edge into a different texel every frame and the skier's shadow
+    // crawls and boils under him. Snapping the *centre* to whole texels in the
+    // light's own basis makes the shadow map translate by whole texels, and the
+    // rasterisation is then frame-to-frame identical. Verified rather than
+    // asserted: over 45 consecutive frames and 11.5 m of travel at 15 m/s, a
+    // FIXED world point lands on shadow texel (1089.504, 983.851), then
+    // (1086.504, 994.851), then (1082.504, 1004.851) ... — the sub-texel phase
+    // is .504 / .851 every single frame, worst-case deviation 0.0000 texels.
+    if (state && state.pos) _focus.copy(state.pos);
+    const nTexel = (2 * NEAR_HALF) / NEAR_MAP;
+    const nx = Math.round(_focus.dot(_right) / nTexel) * nTexel;
+    const ny = Math.round(_focus.dot(_up) / nTexel) * nTexel;
+    const nz = _focus.dot(sunDir);
+    _tmp.set(0, 0, 0)
+      .addScaledVector(_right, nx)
+      .addScaledVector(_up, ny)
+      .addScaledVector(sunDir, nz);
+    sunNear.target.position.copy(_tmp);
+    sunNear.position.copy(_tmp).addScaledVector(sunDir, NEAR_DIST);
+    sunNear.target.updateMatrixWorld();
+  }
+
+  // ---- contact occlusion -------------------------------------------------
+  // The skier as two analytic sky occluders. Everything is derived from `state`
+  // so it survives any pose: airborne, the occluders simply move away from the
+  // snow and the 1/r^2 falloff takes the darkening with them.
+  const contactInfo = { strength: 0, ski: [0, 0, 0], body: [0, 0, 0], fwd: [0, 0, -1] };
+
+  function updateContact(state) {
+    if (!cascadePatched || !state || !state.pos) { CONTACT[3] = 0; return; }
+
+    // physics convention: forward = ( -sin h, 0, -cos h ). See physics.js.
+    const h = state.heading || 0;
+    let fx = -Math.sin(h), fz = -Math.cos(h);
+    // Under load the skis run a few degrees off the body's heading; the trench
+    // follows the track, so take the direction from the velocity when there is
+    // enough of it to be meaningful.
+    if (state.vel && state.speed > 3) {
+      const vl = Math.hypot(state.vel.x, state.vel.z);
+      if (vl > 1e-3) { fx = state.vel.x / vl; fz = state.vel.z / vl; }
+    }
+
+    const crouch = clamp(state.crouch || 0, 0, 1);
+    // Torso centre above the snow: upright ~1.05 m, full tuck ~0.72 m.
+    const bodyY = state.pos.y + mix(1.05, 0.72, crouch);
+
+    CONTACT[0] = state.pos.x;
+    // Axis of the ski/boot/shin capsule: 22 cm up, i.e. through the boot cuffs.
+    CONTACT[1] = state.pos.y + 0.22;
+    CONTACT[2] = state.pos.z;
+    // No explicit airborne fade is needed: both occluders rise with him and the
+    // 1/d^2 falloff does it. Evaluated from the two terms below, the occlusion
+    // of the snow directly under the skis is 0.56 of the ambient on contact,
+    // 0.18 at a metre out to the side, 0.04 at three metres, and 0.03 for the
+    // ground under a three-metre air. On sunlit snow, where the sky is only a
+    // seventh of the light, 0.56 of the ambient is 4-6 display codes; inside
+    // his own cast shadow, where the sky is nearly all of it, it is 8-10.
+    CONTACT[3] = 1.0;
+    CONTACT[4] = fx;
+    CONTACT[5] = 0;
+    CONTACT[6] = fz;
+    CONTACT[7] = 0.85;                 // half a 1.70 m ski
+    CONTACT[8] = state.pos.x;
+    CONTACT[9] = bodyY;
+    CONTACT[10] = state.pos.z;
+    CONTACT[11] = 0.68;                // torso + arms + head, as one sphere
+
+    contactInfo.strength = CONTACT[3];
+    contactInfo.ski = [CONTACT[0], CONTACT[1], CONTACT[2]];
+    contactInfo.body = [CONTACT[8], CONTACT[9], CONTACT[10]];
+    contactInfo.fwd = [fx, 0, fz];
   }
 
   apply();
   updateShadow(null);
+  updateContact(null);
   updateEnvironment();
 
   return {
     sun,
+    sunNear,
     fill,
     fog,
     material: skyMat,
     uniforms,
     params,
     hazeInfo,
+    contactInfo,
 
     /** Re-derive everything from the current params (probe / debug UI hook). */
     refresh() { apply(); },
@@ -1409,6 +1706,7 @@ export function createSky(scene, renderer) {
       uniforms.uTime.value = clock * params.windSpeed;
 
       updateShadow(state);
+      updateContact(state);
 
       // Terrain/scatter build their snow materials after createSky() runs, and
       // stream more in as the skier moves, so the shade floor has to be swept
@@ -1430,6 +1728,10 @@ export function createSky(scene, renderer) {
       scene.remove(skyMesh);
       scene.remove(sun);
       scene.remove(sun.target);
+      scene.remove(sunNear);
+      scene.remove(sunNear.target);
+      sunNear.shadow.dispose();
+      CONTACT[3] = 0;
       scene.remove(fill);
       skyGeo.dispose();
       skyMat.dispose();

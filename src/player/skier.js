@@ -590,18 +590,27 @@ function makeSkiGeometry(o = {}) {
   const N = 60;
 
   // cross-section ring: [x-scale-of-halfwidth, y-scale-of-thickness, matIndex-of-strip-to-next]
+  // The base is not one strip: a real ski carries a ~2 mm band of polished steel
+  // flush with the base along each side, and that bright rim around a black base
+  // is the single thing that tells the eye a ski is tilted rather than flat. It
+  // has to be geometry — a mirror-metal band cannot be faked with shading on a
+  // surface that is coplanar with the base.
+  const EB = 0.955;                      // steel band inboard limit, x-scale
   const RING = [
-    [-1.00, 0.000, 2], // base  ->
-    [1.00, 0.000, 1],  // edge (right)
+    [-1.00, 0.000, 1], // base-edge steel (left)  ->
+    [-EB, 0.000, 2],   // base ->
+    [EB, 0.000, 1],    // base-edge steel (right) ->
+    [1.00, 0.000, 1],  // edge wall (right)
     [1.00, 0.028, 3],  // sidewall
     [1.00, 0.46, 0],   // topsheet
     [0.62, 0.97, 0],
     [0.00, 1.06, 0],
     [-0.62, 0.97, 0],
     [-1.00, 0.46, 3],  // sidewall
-    [-1.00, 0.028, 1], // edge (left) -> wraps to base
+    [-1.00, 0.028, 1], // edge wall (left) -> wraps to base
   ];
   const R = RING.length;
+  const TOP0 = 5;      // ring index of the first topsheet strip (uv v = 0)
 
   const halfWidth = (t) => {
     let w;
@@ -655,7 +664,7 @@ function makeSkiGeometry(o = {}) {
         nrm.push(0, 1, 0);
         // v is normalised across the four topsheet strips so the graphic fills
         // the visible top face exactly (strips 3..6 -> v 0..1)
-        uv.push(t, (s - 3 + (p === a ? 0 : 1)) / 4);
+        uv.push(t, (s - TOP0 + (p === a ? 0 : 1)) / 4);
       }
     }
     for (let i = 0; i < N; i++) {
@@ -693,15 +702,20 @@ function makeSkiGeometry(o = {}) {
   // `contactY` is the height of the lowest running point: the plane the ski
   // stands on. Everything that grounds the rig is derived from this, so the
   // geometry stays the single source of truth.
-  const samples = [];
+  const samples = [], flex = [];
   let contactY = Infinity;
   for (let i = 0; i <= 24; i++) {
     const t = i / 24;
     const y = baseY(t, false), w = halfWidth(t), z = (t - 0.5) * L;
     samples.push([-w, y, z], [w, y, z]);
+    // the same line once the ski is bent into reverse camber: the waist drops
+    // ~1.5 cm past the unloaded running line, which is the trench it cuts
+    const yf = baseY(t, true);
+    flex.push([-w, yf, z], [w, yf, z]);
     if (t > 0.05 && t < 0.95) contactY = Math.min(contactY, y);
   }
   g.userData.baseSamples = samples;
+  g.userData.baseSamplesFlex = flex;
   g.userData.contactY = contactY;
   g.userData.length = L;
   return g;
@@ -838,14 +852,22 @@ function makeMaterials(env) {
       roughness: 0.38, metalness: 0.05, clearcoat: 0.4, clearcoatRoughness: 0.22,
       envMapIntensity: 0.55,
     }),
-    skiEdge: new THREE.MeshStandardMaterial({ color: 0xd8dee6, roughness: 0.12, metalness: 1.0, envMapIntensity: 1.3, flatShading: true }),
-    skiBase: new THREE.MeshStandardMaterial({ color: 0x0a0c10, roughness: 0.2, metalness: 0.1, flatShading: true }),
+    // freshly tuned steel: near-mirror, so the engaged edge draws a hard bright
+    // line along the snow the instant the ski comes off flat
+    skiEdge: new THREE.MeshStandardMaterial({ color: 0xdfe5ec, roughness: 0.085, metalness: 1.0, envMapIntensity: 1.6, flatShading: true }),
+    // sintered graphite base: black in body colour but glossy, so tilted off the
+    // snow it goes bright with reflected sky instead of staying a dead plank
+    skiBase: new THREE.MeshPhysicalMaterial({
+      color: 0x090b0f, roughness: 0.155, metalness: 0.12,
+      clearcoat: 0.55, clearcoatRoughness: 0.12,
+      envMapIntensity: 1.05, flatShading: true,
+    }),
     skiWall: new THREE.MeshStandardMaterial({ color: 0x2b313a, roughness: 0.45, metalness: 0.05, flatShading: true }),
   };
 
   // materials that must reflect something to read correctly
-  m._reflective = [m.lens, m.helmet, m.metal, m.skiEdge, m.poleShaft, m.skiTop, m.boot,
-    m.bootCuff, m.zip, m.pass];
+  m._reflective = [m.lens, m.helmet, m.metal, m.skiEdge, m.skiBase, m.poleShaft, m.skiTop,
+    m.boot, m.bootCuff, m.zip, m.pass];
   for (const mm of m._reflective) mm.envMap = env;
   return m;
 }
@@ -1758,8 +1780,12 @@ export function createSkier(scene) {
     absorb: 0, absorbV: 0, prevVn: 0, prevAir: false, airT: 0,
     plantSide: 0, plantT: 99, prevEdgeSign: 0, phi: 0, airSpin: 0,
     pop: 0, retract: 0, reach: 0, airPhase: 'ground',
+    // legLine: the frontal-plane angle of the solved ankle->hip line. It is what
+    // the eye reads as "how far over is he", and it is what the edge angle is
+    // built from, so the two can never drift apart.
+    legLine: 0, edgeAng: 0,
     envAssigned: env,
-    dbg: { tilt: 0, angul: 0, hipTilt: 0, extT: 0, R: 0, load: 0, stance: 0, edgeMag: 0 },
+    dbg: { tilt: 0, angul: 0, hipTilt: 0, extT: 0, R: 0, load: 0, stance: 0, edgeMag: 0, legLine: 0 },
   };
 
   // scratch
@@ -1844,13 +1870,24 @@ export function createSkier(scene) {
     const out = { skis: [], legs: [], poles: [] };
     for (const L of legs) {
       const g = L.ski.geometry.userData;
-      let lo = 1e9, hi = -1e9;
+      let lo = 1e9, hi = -1e9, loNow = 1e9;
       for (const p of g.baseSamples) lo = Math.min(lo, hgt(L.ski, p[0], p[1], p[2]));
       for (const p of g.baseSamples) hi = Math.max(hi, hgt(L.ski, p[0], p[1], p[2]));
+      // the same, but on the shape the ski is ACTUALLY bent into this frame —
+      // the reverse camber is what puts the waist down in the trench, and a
+      // grounding number that ignores it is measuring a ski nobody is skiing
+      const inf = clamp((L.ski.morphTargetInfluences || [0])[0] || 0, 0, 1);
+      const flexS = g.baseSamplesFlex || g.baseSamples;
+      for (let i = 0; i < g.baseSamples.length; i++) {
+        const a = g.baseSamples[i], b = flexS[i];
+        loNow = Math.min(loNow, hgt(L.ski, a[0] + (b[0] - a[0]) * inf,
+          a[1] + (b[1] - a[1]) * inf, a[2] + (b[2] - a[2]) * inf));
+      }
       const tip = wp(L.ski, 0, 0, g.length * 0.5), tail = wp(L.ski, 0, 0, -g.length * 0.5);
       out.skis.push({
         side: L.side, inside: L.side * sgn > 0,
         baseMin: +lo.toFixed(4), baseMax: +hi.toFixed(4),
+        baseMinFlexed: +loNow.toFixed(4), camber: +inf.toFixed(2),
         tipY: +(tip.clone().sub(P).dot(N)).toFixed(3),
         tailY: +(tail.clone().sub(P).dot(N)).toFixed(3),
         tipsForward: +tip.clone().sub(tail).normalize().dot(F).toFixed(3),
@@ -1888,6 +1925,9 @@ export function createSkier(scene) {
     const shAxis = shIn.clone().sub(shOut).normalize();
     out.pose = {
       inclDeg: deg(incl), bodyDeg: deg(body), angulationDeg: deg(incl - body),
+      // the two numbers the carve lives or dies on: they must track ~1:1
+      edgeDeg: deg(A.edgeAng), legLineDeg: deg(A.legLine),
+      edgeOverIncl: +(A.edgeAng / Math.max(Math.abs(incl), 1e-3)).toFixed(2),
       // + = outside shoulder LOW (what we want), - = banked into the turn
       shoulderTiltDeg: deg(Math.asin(clamp(shAxis.dot(N), -1, 1))),
       headTopY: +hgt(head, 0, 0.135, 0).toFixed(3),
@@ -2055,25 +2095,59 @@ export function createSkier(scene) {
       // SKIS — the running surface IS the snow plane; edge angle rolls the ski
       // about its downhill edge so the contact line never leaves y = 0.
       // =======================================================================
-      const edgeMag = clamp(Math.max(ae * 1.02, atilt + 0.10 * load), 0, 1.12) * (1 - 0.55 * A.air);
+      // A ski's edge angle is not a free parameter and it is not the steering
+      // input: the boot is a rigid lever, so the base tilts with the LEG LINE the
+      // rig actually solved, plus whatever the ankle and knee add inside the cuff.
+      // Both terms fall out of the same inclination/angulation solution that leans
+      // the body, so the edge can never disagree with the lean — 45 deg of body
+      // over the snow is 45-plus degrees of ski on the snow, which is the whole
+      // reason a carve holds. A.legLine is last frame's solved ankle->hip angle in
+      // the frontal plane; one frame of lag, and the loop reads as a low-pass.
+      // The old code took max(|state.edge|, tilt), an independent quantity that
+      // ran 4x the lean through a transition and under it at the apex.
+      const ankleAngul = (0.11 + 0.15 * load) * angul;   // the break inside the boot
+      const edgeT = (Math.abs(A.legLine) + ankleAngul)
+        * (1 - 0.55 * A.air)
+        * THREE.MathUtils.smoothstep(A.spd, 1.5, 7.0);
+      A.edgeAng = damp(A.edgeAng, clamp(edgeT, 0, 1.20), 18, dt);
+      const edgeMag = A.edgeAng;
       const edgeAngle = edgeMag * es;
       // the stance opens as the body lays over — otherwise the inside leg has to
       // fold into itself to reach a ski that is directly under the hip
       const halfStance = 0.140 + 0.050 * load + 0.028 * A.crouch + 0.135 * atilt;
       const contactX = 0.033;   // half the ski waist width
-      // The bases ride a hair proud of the snow. 24 mm of it is the gap between
+      // The bases ride a hair proud of the snow: 24 mm of it is the gap between
       // the analytic contact height physics publishes and the height the terrain
       // actually triangulates to under the skier — measured, not guessed — and the
-      // rest is the ski's own shape: the shovel is 2.5 cm wider than the waist the
-      // roll pivots on, so at a big edge angle its outboard corner would dip under.
-      const CLEAR = 0.070 + 0.014 * Math.sin(edgeMag);
+      // rest is margin for surface noise between LOD steps. It used to carry a
+      // second, much larger allowance for the ski's own shape (the shovel is 2.5 cm
+      // wider than the waist the roll pivots on, so at a big edge angle its
+      // outboard corner dips below the pivot). That allowance is now solved
+      // exactly, per frame, from the base geometry — see `lowest` below — so the
+      // ski can sit close to the snow at *any* edge angle instead of levitating.
+      // ...and a loaded ski does not glide over the snow, it cuts into it, so the
+      // clearance shrinks with the carve. Together with the reverse camber below
+      // (which bends the waist ~1.5 cm past the running line) the outside ski's
+      // midsection ends up on the surface at full load while its tip and tail ride
+      // clear: a ski sitting in its own trench.
+      const CLEAR = 0.056 - 0.010 * load;
       const skiLift = 0.30 * A.retract - 0.02 * A.pop;
+      const eS = Math.sin(edgeAngle), eC = Math.cos(edgeAngle);
       for (const L of legs) {
         const side = L.side;
         const inside = side * es;                     // +1 if this is the inside ski
         const lead = inside * (0.055 + 0.05 * load + 0.10 * atilt);  // inside ski leads
+        // Lowest running point of THIS ski once rolled onto edge, in pivot space.
+        // Solving it from the published base samples is what lets the cutting edge
+        // sit at a fixed height above the snow whatever the roll angle is.
+        let lowest = Infinity;
+        for (const p of L.ski.geometry.userData.baseSamples) {
+          const px = p[0] - es * contactX, py = p[1] - L.contactY;
+          const h = py * eC - px * eS;
+          if (h < lowest) lowest = h;
+        }
         L.pivot.position.set(side * halfStance + es * contactX,
-          CLEAR + skiLift - chatter * jitter, lead);
+          CLEAR - lowest + skiLift - chatter * jitter, lead);
         L.pivot.rotation.set(0, side * 0.008, -edgeAngle);
         // the pivot sits exactly on the edge that is cutting, so rolling onto edge
         // pivots about the snow contact instead of swinging the base through it
@@ -2142,9 +2216,21 @@ export function createSkier(scene) {
       }
       _pel.set(pivotX + sx * R + sway * 0.006, baseY + sy * R, pelZ);
       pelvis.position.copy(_pel);
+
+      // The leg line this solve just produced, measured in the frontal plane from
+      // the mean ankle to the mean hip joint — the angle a viewer reads as "how
+      // far is he over". The ski roll above is built from it, so edge angle and
+      // body inclination are two readings of one number instead of two guesses.
+      const hipMx = _pel.x - 0.045 * Math.sin(pelvisRoll);
+      const hipMy = _pel.y - 0.045 * Math.cos(pelvisRoll);
+      const ankMx = (legs[0].ankleLocal.x + legs[1].ankleLocal.x) * 0.5;
+      const ankMy = (legs[0].ankleLocal.y + legs[1].ankleLocal.y) * 0.5 - skiLift;
+      A.legLine = Math.atan2(hipMx - ankMx, Math.max(hipMy - ankMy, 0.05));
+
       const dbg = A.dbg;   // preallocated: this runs every frame
       dbg.tilt = tilt; dbg.angul = angul; dbg.hipTilt = hipTilt; dbg.extT = extT;
       dbg.R = R; dbg.load = load; dbg.stance = halfStance; dbg.edgeMag = edgeMag;
+      dbg.legLine = A.legLine;
 
       // Backseat killer: the shoulders come forward as the hips drop, so the mass
       // stays over the balls of the feet instead of trailing behind the boots.
