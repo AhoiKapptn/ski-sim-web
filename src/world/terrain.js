@@ -2243,16 +2243,77 @@ const GLSL_FRAG_REFINE = /* glsl */`
     // face carried nothing but the 200 m ridges and shaded as a smooth cone —
     // the cardboard-cutout skyline. The honest gate here is the world size of
     // a pixel, anisotropy-capped at 3:1 exactly as the snow bands are.
-    float mpA = length( dFdx( P.xz ) ), mpB = length( dFdy( P.xz ) );
+    //
+    // The footprint itself must not be read off dFdx( P.xz ). An interpolated
+    // world position is affine within a triangle and its screen derivative is
+    // therefore *constant* per triangle and steps at every edge — on a 25-100 m
+    // ring the step between the two triangles of one quad is tens of percent.
+    // Anything keyed on it inherits a mesh-shaped discontinuity, which is how a
+    // gate meant to retire a band ends up drawing the tessellation.
+    //
+    // The view ray, by contrast, is a function of the pixel alone: P lies on it
+    // by construction, so ( P - eye ) / |P - eye| is the same field whichever
+    // triangle the fragment came from, and its screen derivative is continuous
+    // across the whole frame. Sliding that ray spread onto the locally
+    // reconstructed surface plane gives the same footprint with no seam.
+    vec3 mrd = ( P - cameraPosition ) / max( snViewDist, 1e-4 );
+    vec3 mnm = normalize( vec3( -mMacroG.x, 1.0, -mMacroG.y ) );
+    float mrn = min( dot( mrd, mnm ), -0.125 );         // ray vs. surface, stretch capped at 8:1
+    vec3 mfx = dFdx( mrd ) * snViewDist;
+    vec3 mfy = dFdy( mrd ) * snViewDist;
+    float mpA = length( ( mfx - mrd * ( dot( mfx, mnm ) / mrn ) ).xz );
+    float mpB = length( ( mfy - mrd * ( dot( mfy, mnm ) / mrn ) ).xz );
     float mpHi = max( mpA, mpB ), mpLo = max( min( mpA, mpB ), 1e-5 );
     float mPx = mpHi / min( mpHi / mpLo, 3.0 );
     #define TERR_BAND( lambda ) smoothstep( 2.0, 4.6, ( lambda ) / mPx )
 
+    // --- snowline raggedness ------------------------------------------------
+    // Every band below is retired once its wavelength drops under ~4.6 pixels.
+    // That is the right call for a shading normal and the wrong one for a
+    // *threshold*: under the cut-off the field the rock mask cuts is perfectly
+    // smooth, and a smooth field cut by a hard threshold gives a smooth curve.
+    // On a couloir wall, where foreshortening puts the finest surviving band at
+    // 60-100 m, "smooth curve" means a ruled line ten or twenty pixels long —
+    // 27.8% of the snowline on the ridge crop sat on a straight run of ten
+    // pixels or more, against 13.6% for the Eiger reference.
+    //
+    // Adding wobble to the slope *value* does almost nothing about that: near
+    // the snowline the field's own gradient is dominated by the ridged bands, so
+    // a tenth of a radian moves the boundary a pixel or two. Warping the sample
+    // *point* does, because the iso-line of a warped field moves by exactly the
+    // warp however steep the field is — the same argument snow-material.js makes
+    // for its own macro warp, one scale further down.
+    //
+    // Locked to the pixel and not to the world, because the whole problem is
+    // precisely that no world-locked band survives out here. Twenty-six pixels
+    // of the *coarser* screen axis, so it is resolved several times over on both
+    // however grazing the face, with a second octave at a third of that; and it
+    // is faded out again wherever a pixel covers less than about a third of a
+    // metre, i.e. wherever the world-locked bands still do the job themselves.
+    //
+    // It is the sample point of the detail cascade that moves, not the macro
+    // field, so the massif keeps its shape, its ridgelines and its aerial
+    // planes: all that changes is which metre of rock relief lands under a given
+    // pixel, and with it where the mask's threshold falls.
+    vec2 Pd = P.xz;
+    {
+      float wAmt = smoothstep( 0.10, 0.30, mpHi );
+      if ( wAmt > 0.004 ) {
+        float lamW = min( 26.0 * mpHi, 700.0 );
+        float iw = 1.0 / lamW;
+        float wa = latNoise( P.xz * iw + vec2( 17.3, -4.1 ) ).x - 0.5;
+        float wb = latNoise( P.xz * iw + vec2( -8.7, 23.4 ) ).x - 0.5;
+        float wc = latNoise( P.xz * ( iw * 2.7 ) + vec2( 5.1, 41.7 ) ).x - 0.5;
+        float wd = latNoise( P.xz * ( iw * 2.7 ) + vec2( -31.2, 7.9 ) ).x - 0.5;
+        Pd += ( vec2( wa, wb ) * 0.90 + vec2( wc, wd ) * 0.14 ) * ( lamW * wAmt );
+      }
+    }
+
     if ( mrocky > 0.002 ) {
-      mg += terrRidgedD( P.xz * ( 1.0 / 200.0 ), 2, 0.5 ).yz * ( 24.0 * mrocky / 200.0 );
+      mg += terrRidgedD( Pd * ( 1.0 / 200.0 ), 2, 0.5 ).yz * ( 24.0 * mrocky / 200.0 );
       float fC = TERR_BAND( 85.0 );
       if ( fC > 0.004 ) {
-        mg += terrRidgedD( P.xz * ( 1.0 / 85.0 ), 1, 0.5 ).yz * ( 12.0 * mrocky * fC / 85.0 );
+        mg += terrRidgedD( Pd * ( 1.0 / 85.0 ), 1, 0.5 ).yz * ( 12.0 * mrocky * fC / 85.0 );
       }
     }
     float fA = TERR_BAND( 64.0 );
@@ -2260,11 +2321,11 @@ const GLSL_FRAG_REFINE = /* glsl */`
     float fD = TERR_BAND( 22.0 );
     if ( fA > 0.004 ) {
       float amp = ( 2.2 * ( 1.0 - mrocky ) + 1.6 * mrocky ) * fA * ( 1.0 / 64.0 );
-      mg += terrFbmD( P.xz * ( 1.0 / 64.0 ), 4, 0.5 ).yz * amp;
+      mg += terrFbmD( Pd * ( 1.0 / 64.0 ), 4, 0.5 ).yz * amp;
     }
     if ( fB > 0.004 && mrocky > 0.004 ) {
       float amp = 11.5 * mrocky * fB * ( 1.0 / 58.0 );
-      mg += terrRidgedD( P.xz * ( 1.0 / 58.0 ), 4, 0.52 ).yz * amp;
+      mg += terrRidgedD( Pd * ( 1.0 / 58.0 ), 4, 0.52 ).yz * amp;
     }
     // Buttress / couloir band. 22 m is five pixels at 4 km and fifty at 400 m,
     // so it lives all the way to the horizon and is what puts ribs, gullies and
@@ -2275,7 +2336,7 @@ const GLSL_FRAG_REFINE = /* glsl */`
     // which puts the same relief in at angles that are not the fall line.
     if ( fD > 0.004 && mrocky > 0.004 ) {
       float amp = 6.2 * mrocky * fD * ( 1.0 - 0.5 * mrocky ) * ( 1.0 / 22.0 );
-      mg += terrRidgedD( P.xz * ( 1.0 / 22.0 ), 3, 0.5 ).yz * amp;
+      mg += terrRidgedD( Pd * ( 1.0 / 22.0 ), 3, 0.5 ).yz * amp;
     }
 
     // Cliff structure: benches, contour lineation, conjugate joints. Fragment
@@ -2284,7 +2345,7 @@ const GLSL_FRAG_REFINE = /* glsl */`
     // band survives, so the whole surface reading comes from here.
     if ( mrocky > 0.004 ) {
       float cdh; vec2 cdg;
-      terrCliff( P.xz, md.x, mMacroG, mrocky,
+      terrCliff( Pd, md.x, mMacroG, mrocky,
                  TERR_BAND( 26.0 ), TERR_BAND( 34.0 ), TERR_BAND( 30.0 ),
                  mix( ${CLF_LIM_V}, ${CLF_LIM_F}, smoothstep( 700.0, 1500.0, snViewDist ) ),
                  cdh, cdg );

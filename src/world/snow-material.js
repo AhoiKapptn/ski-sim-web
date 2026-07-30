@@ -505,6 +505,28 @@ float snSpecTint = 1.0;
   // piste. A noise band can live near the limit because its energy is spread over
   // an octave; a comb cannot.
   #define SN_BAND_DIR( lambda, d, e0, e1 ) smoothstep( e0, e1, ( lambda ) / SN_PX_DIR( d ) )
+  // Nyquist gate for bands that feed a *threshold* rather than a value. Two
+  // things are wrong with SN_BAND for that job and both of them show up as
+  // 1-2 px salt-and-pepper on the upper faces of ridge.png:
+  //
+  //   - it measures against snPx, which has the 3:1 anisotropic-sampler cap in
+  //     it. That cap is the correct model for a band that is going to be
+  //     *averaged* by a 16x aniso filter, and completely wrong for one that is
+  //     going to be compared against a constant: a smoothstep has no filter in
+  //     front of it, so what matters is the worst screen axis, snPxHi. With the
+  //     cap in place a band at 5 px on the notional filtered axis is 1.7 px on
+  //     the real one, and every pixel lands on a different side of the
+  //     threshold.
+  //   - 1.9 px is Nyquist itself. A noise band feeding a *value* can live there
+  //     because its energy is spread over an octave and the display filter eats
+  //     what is left. Through a threshold the same band is a square wave with
+  //     all its energy at the edge, so it needs the same headroom the corduroy
+  //     comb needs — three px to start contributing, seven to count fully.
+  //
+  // Face-on ground, where snAniso is 1 and the band is well resolved, is
+  // unchanged to the last bit; this only shuts off bands on the far couloir
+  // walls that were never resolvable there in the first place.
+  #define SN_MBAND( lambda ) smoothstep( 3.0, 7.0, ( lambda ) / snPxHi )
 
   // Wind is not a constant: it wraps round spurs and pours through cols. A
   // slow rotation field keeps the sastrugi from looking combed with a rake.
@@ -549,7 +571,7 @@ float snSpecTint = 1.0;
   float unit = clamp( gu.x * 1.9 + 0.58, 0.0, 1.0 );
 
   vec3 rGrad = vec3( 0.0 );
-  float rLedge = 0.0, rFrac = 0.0, rB0 = 0.0, rB1 = 0.0;
+  float rLedge = 0.0, rLedgeM = 0.0, rFrac = 0.0, rB0 = 0.0, rB1 = 0.0;
   // Rock lives on 50-80 degree faces, where a planar XZ projection stretches
   // every crack 2-5:1 down the fall line — unbounded on a true wall. This is the
   // layer that was smearing the valley walls into vertical corduroy, so it gets
@@ -594,6 +616,22 @@ float snSpecTint = 1.0;
   // Coefficients raised in step with the amplitude cut above, so the snowline
   // this feeds is bit-for-bit as ragged as it was.
   rLedge = rB0 * 0.0276 + rB1 * 0.201;
+  // The same two bands, each gated on whether its own wavelength survives the
+  // *worst* screen axis, for the one consumer that cannot tolerate an unresolved
+  // input: the snowline threshold. rB1 is the 21 m band and it carries about
+  // 0.39 of the 0.42 total here, so with the 1.5x the mask applies it swings the
+  // decision by ±0.59 against a blend half-width of 0.34-0.50 — i.e. it is the
+  // largest single term in the mask, larger than the macro partition and larger
+  // than the inclination itself. At the 30-60 m per pixel the couloir walls of
+  // steep.png are seen at, a 21 m band is a quarter of a pixel: it does not blur
+  // through a smoothstep, it dithers, and a rock-mask debug render of that crop
+  // came back as a 3-8 px red/blue checkerboard over the entire wall. That is
+  // both the pixel-scale salt-and-pepper on the upper faces of ridge.png and the
+  // reason the buttress had no large connected regions to be partitioned into —
+  // whatever the macro term decided was being overwritten pixel by pixel.
+  // Reflectance keeps the ungated field: a sub-Nyquist band in a *value* merely
+  // averages to its own mean, which is harmless and is not worth the contrast.
+  rLedgeM = rB0 * 0.0276 * SN_MBAND( 80.0 ) + rB1 * 0.201 * SN_MBAND( 21.0 );
   // Structure scale — slabs, joints, cracks. Pure appearance.
   fractureLayerR( P, rw, 0.23,   0.105 * fRk2, 3, SN_ROT( 3.37 ), rGrad, rFrac );
   fractureLayerR( P, rw, 1.10,   0.024 * fRk3, 3, SN_ROT( -2.24 ), rGrad, rFrac );
@@ -906,14 +944,14 @@ float snSpecTint = 1.0;
   // bloom off the snow wash straight over the rock. Where the bands *are*
   // resolved — the far peaks, seen face-on — nothing changes.
   talus += strk.x * ( 0.058 + 0.085 * smoothstep( 900.0, 2800.0, snViewDist ) )
-         * smoothstep( 0.55, 1.05, steep ) * SN_BAND( 18.0 );
+         * smoothstep( 0.55, 1.05, steep ) * SN_MBAND( 18.0 );
   talus += clamp( curvR, -1.0, 1.0 ) * 0.045;                      // snow wedges into hollows/ledges
   talus += clamp( flow * 1.4 - 0.15, 0.0, 1.0 ) * 0.055;           // gullies fill in
   talus += ( lee - wind ) * 0.045;                                 // windward blows clear, lee loads up
   // The fracture field itself has to move the snowline, or snow sits on a face
   // in smooth lobes instead of wedging into every ledge and ramp the way it does
   // on a real wall. Small, high-frequency, and signed: ledges hold, slabs shed.
-  talus += clamp( rFrac * 3.2 + rB1 * 0.10, -0.09, 0.13 ) * SN_BAND( 4.0 );
+  talus += clamp( rFrac * 3.2 + rB1 * 0.10, -0.09, 0.13 ) * SN_MBAND( 4.0 );
 
   // --- the macro partition ---------------------------------------------------
   // Every term above swings the threshold by three to eight degrees at a
@@ -943,11 +981,20 @@ float snSpecTint = 1.0;
   // never look like a contour. Budgeted so the total warp gradient stays under
   // about 0.9 — enough to make the boundary wander back on itself, not enough to
   // fold the field into paisley.
-  vec3 mw1 = snFbm( P.xz * 0.0019 + vec2( 71.3, -22.8 ), 2, 0.5 );   // ~530 m
-  vec3 mw2 = snFbm( P.xz * 0.0165 + vec2( -12.4, 30.9 ), 2, 0.5 );   // ~60 m
-  vec2 mq  = P.xz + vec2( mw1.x, mw1.y ) * 46.0 + vec2( mw2.x, mw2.y ) * 5.5;
-  vec3 mA  = snFbm( mq * 0.00135 + vec2( 61.2, -18.7 ), 2, 0.5 );    // ~740 m
-  vec3 mB  = snFbm( mq * 0.0047  + vec2( -33.4,  9.1 ), 2, 0.5 );    // ~210 m
+  // Frequencies dropped and amplitudes raised against the first cut of this
+  // block. At ~740 m and ~210 m the two carrier bands were still small enough
+  // that a single couloir wall got several cycles of each across it, so the
+  // partition they produced was a mottle rather than a decision: measured on the
+  // steep.png buttress, sd fell to 12.7 and the bright fraction to 5.3% where
+  // the previous build had 16.4 and 17.9%, and 8-60 px band energy rose from 31%
+  // to 43% — the signature of structure moving *down* in scale. At 1.6 km and
+  // 480 m one whole buttress fits inside half a cycle, which is what makes it go
+  // bare or go white as a single connected region.
+  vec3 mw1 = snFbm( P.xz * 0.00105 + vec2( 71.3, -22.8 ), 2, 0.5 );  // ~950 m
+  vec3 mw2 = snFbm( P.xz * 0.0092  + vec2( -12.4, 30.9 ), 2, 0.5 );  // ~110 m
+  vec2 mq  = P.xz + vec2( mw1.x, mw1.y ) * 78.0 + vec2( mw2.x, mw2.y ) * 8.5;
+  vec3 mA  = snFbm( mq * 0.00062 + vec2( 61.2, -18.7 ), 2, 0.5 );    // ~1600 m
+  vec3 mB  = snFbm( mq * 0.0021  + vec2( -33.4,  9.1 ), 2, 0.5 );    // ~480 m
   // Convexity at the same hectometre scale: a rib or a nose sheds, a bowl or a
   // terrace holds. curvR is already the long-range curvature channel.
   float macroCurv = clamp( curvR * 1.6, -1.0, 1.0 );
@@ -958,14 +1005,56 @@ float snSpecTint = 1.0;
   // both — which is precisely the large-region contrast the reference has.
   float sunAsp = dot( normalize( Ng.xz + vec2( 1e-5, 1e-5 ) ),
                       normalize( uSunDirW.xz + vec2( 1e-5, 1e-5 ) ) );
-  float macro = mA.x * 1.30 + mB.x * 0.50 + macroCurv * 0.42 - sunAsp * 0.55;
-  // The -0.62 is the bias, and it is the term that decides how much of the
-  // massif is bare. Snow does not sit on a 70-degree wall except as rime and as
-  // wedges on ledges: on the Eiger crop the wall proper is about 85% rock and
-  // the snow is up on the aprons and the terraces. Ours was roughly half and
-  // half at every scale, which is the other half of "uniformly pale" — an even
-  // mix of white and dark averages to grey however dark the dark is.
-  talus += ( clamp( macro, -1.6, 1.6 ) - 0.62 ) * 0.235 * macroGate;
+  float macro = mA.x * 1.85 + mB.x * 0.78 + macroCurv * 0.42 - sunAsp * 0.70;
+  // The bias is the term that decides how much of the massif is bare. Snow does
+  // not sit on a 70-degree wall except as rime and as wedges on ledges — on the
+  // Eiger crop the wall proper is about 85% rock — but -0.62 went past the
+  // reference and out the other side: the ridge.png wall came back at mean L*
+  // 21.6 with 85% of it under L* 35, against 42.6/41.6 for the Eiger and
+  // 63.2/17.3 for the Arlberg. That is not a partition, it is a black wall with
+  // white confetti on it. Pulled back to roughly halfway between the two builds,
+  // with the *swing* raised instead: the same mean rock fraction now arrives as
+  // a decision between two large states rather than as a uniform darkening, and
+  // the saturation of the clamp is doing real work — it is what makes a whole
+  // buttress sit at one end or the other instead of somewhere in between.
+  // Hardened, not scaled. A linear macro term spends most of its area near its
+  // own mean, and near its mean it is smaller than the per-pixel swing that
+  // steep itself carries at this range — so the fine field wins the threshold
+  // pixel by pixel and the result is mottle whatever amplitude the macro term is
+  // given. Ablated to check: holding talus at a constant and letting steep
+  // alone drive the mask still produced the same 3-8 px red/blue checkerboard on
+  // a rock-mask debug render of the steep.png buttress, i.e. the fine field's
+  // swing is already comparable to the whole blend width.
+  //
+  // Squashing the field through a smoothstep first is what changes the outcome:
+  // over most of its area macroBin is hard 0 or hard 1, which lands the
+  // threshold far enough from the crossing that the fine field cannot reach it,
+  // and the region boundaries are the iso-lines of a domain-warped fbm — as
+  // ragged as the warp at every scale, never a contour. That is the difference
+  // between "the whole massif is dappled" and "this buttress is bare, its
+  // neighbour is white": on the reference crops both organise into a few very
+  // large connected regions, and the number the gate reads it off is the 8-60 px
+  // band energy, which has to come *down*, not up.
+  //
+  // A small linear residual is kept so the two states are not flat: within a
+  // bare buttress the snowline still wanders with the field.
+  float macroBin = smoothstep( -0.32, 0.32, macro );
+  // The bias decides how much of the massif is bare. Snow does not sit on a
+  // 70-degree wall except as rime and as wedges on ledges — on the Eiger crop
+  // the wall proper is about 85% rock — but the -0.62 of the previous cut went
+  // past the reference and out the other side: the ridge.png wall came back at
+  // mean L* 21.6 with 85% of it under L* 35, against 42.6/41.6 for the Eiger and
+  // 63.2/17.3 for the Arlberg. Darker than the darkest reference, and uniformly
+  // so. The mean rock fraction here is close to the old one; what has changed is
+  // that it now arrives as a decision between two large states instead of as a
+  // blanket darkening.
+  // The two states have to be far enough apart to actually *be* two states. A
+  // couloir wall runs 55-70 degrees; a +0.20 nudge to a 0.735 rad threshold
+  // still leaves the whole wall below the snowline, so the white half of the
+  // partition never appeared on the one crop it was written for. +0.38 puts the
+  // threshold at 62 degrees, which is what a plastered flute field genuinely
+  // holds, and -0.52 strips the neighbour to bedrock.
+  talus += ( macroBin * 1.40 - 0.78 + clamp( macro, -1.0, 1.0 ) * 0.055 ) * macroGate;
   float rockRaw = ( steep - talus ) * 4.2;
 
   // Height-blend: snow settles into the low spots of the rock, so the boundary
@@ -980,7 +1069,7 @@ float snSpecTint = 1.0;
   // feeding steep is gated to stay above four pixels. A wide blend on a
   // well-resolved input just dissolves the snowline into grey mush.
   float rEdge = mix( 0.34, 0.50, smoothstep( 300.0, 2000.0, snViewDist ) );
-  snRockMask = smoothstep( -rEdge, rEdge, rockRaw + rLedge * 1.5 ) * uRockAmount;
+  snRockMask = smoothstep( -rEdge, rEdge, rockRaw + rLedgeM * 1.5 ) * uRockAmount;
 
   // --------------------------------------------------------------- snow ----
   // Multi-scale relief.
@@ -1455,7 +1544,7 @@ float snSpecTint = 1.0;
   // darker, wetter, more shattered ground alternate with pale slabs on a
   // hectometre scale, and that big-scale mottling is what reads as "made of
   // something" from three kilometres away, where every crack is sub-pixel.
-  rockAlb *= 0.42 + 0.96 * clamp( rn2.x * 0.9 + gu.x * 0.7 + 0.55, 0.0, 1.0 );
+  rockAlb *= 0.50 + 0.92 * clamp( rn2.x * 0.9 + gu.x * 0.7 + 0.55, 0.0, 1.0 );
 
   // --- rock units, and how dark they actually are -----------------------------
   // A massif is not one reflectance. The Eiger's Rote Fluh is pale nummulitic
@@ -1479,7 +1568,15 @@ float snSpecTint = 1.0;
   vec3 du  = snFbm( P.xz * 0.00105 + vec2( -47.3, 21.6 ), 3, 0.5 );  // ~950 m
   vec3 du2 = snFbm( P.xz * 0.0058  + vec2(  13.9, -6.2 ), 2, 0.5 );  // ~170 m
   float darkUnit = clamp( 0.5 + du.x * 1.05 + du2.x * 0.58 + gu.y * 0.38, 0.0, 1.0 );
-  rockAlb *= mix( 0.38, 1.22, darkUnit );
+  // The floor was 0.38, and stacked on the three gains above it took the whole
+  // shadowed wall of ridge.png to mean L* 21.6 — half the Eiger's 42.6 and well
+  // under the Arlberg's 63.2. Darker than the darkest reference is not a
+  // partition, it is a black hole with nothing organised inside it: measured,
+  // 85% of that crop fell under L* 35 where the Eiger has 42% and the Arlberg
+  // 17%. The *ratio* is what carries the geology, and 2.4:1 across the units is
+  // already a stop and a quarter; the floor is what decides whether the dark end
+  // is legible rock or crushed black, and it belongs above the toe of the curve.
+  rockAlb *= mix( 0.36, 1.34, darkUnit );
 
   // Meltwater streaking. Everything below a melting snow patch on a steep face
   // is permanently wet or permanently stained, and those streaks are metres
@@ -1493,7 +1590,7 @@ float snSpecTint = 1.0;
   float streakWet = clamp( wst.x * 1.5 - 0.36, 0.0, 1.0 )
                   * smoothstep( 0.52, 1.00, steep )
                   * smoothstep( snowLine + 700.0, snowLine - 150.0, P.y );
-  rockAlb *= mix( 1.0, 0.40, streakWet );
+  rockAlb *= mix( 1.0, 0.54, streakWet );
 
   // Iron oxide bleeds out of the bedding and runs down the wet lines.
   float iron = clamp( rn2.x * 1.6 + 0.18, 0.0, 1.0 )
@@ -1512,7 +1609,17 @@ float snSpecTint = 1.0;
   // in full sun is about 25% — and five stacked gains can multiply their way
   // well past 1.0 without one. Clipping there is what compresses the top of the
   // range into a single value and makes the massif read as evenly pale.
-  rockAlb = min( rockAlb, vec3( 0.26 ) );
+  //
+  // A hard min() has exactly the same defect it was written to cure, one stop
+  // lower down: everything above the limit lands on the same number, so the pale
+  // buttresses that carried the top of the histogram all collapsed to one tone.
+  // Measured on the steep.png buttress, the fraction above L* 80 fell from 17.9%
+  // to 5.3% and the whole wall went to a mid-grey continuum. A soft knee holds
+  // the same asymptote — nothing can exceed the ceiling — while keeping the
+  // ordering and about a third of the slope at the limit, so the lit slabs stay
+  // separable from each other.
+  #define SN_ROCK_CEIL 0.34
+  rockAlb = vec3( SN_ROCK_CEIL ) * ( 1.0 - exp( -rockAlb / SN_ROCK_CEIL ) );
 
   // Cavity occlusion from the crack field — the cheapest thing that stops a
   // rock face reading as a decal on a smooth surface. A broken face sees a small
@@ -1749,7 +1856,7 @@ const SNOW_SCATTER = /* glsl */`
   // those recesses are lit by sky and snow bounce and by nothing else, and both
   // of those are blue. Squaring the term on the sun while holding the sky back
   // to a gentle ramp is the entire difference, and it costs nothing.
-  reflectedLight.indirectDiffuse *= mix( snRockAO, 0.30 + 0.70 * snRockAO, snRockMask );
+  reflectedLight.indirectDiffuse *= mix( snRockAO, 0.46 + 0.58 * snRockAO, snRockMask );
   if ( snRockMask > 0.004 ) {
     // A *tint*, not an additive wash. The first attempt at this added saturated
     // blue irradiance on top of the rock and the cliff came back navy: the rock
@@ -1789,7 +1896,7 @@ const SNOW_SCATTER = /* glsl */`
     // sees mostly the snow. Never zero: there is snow on every side of a rib.
     // snNormalW, not N: N is in view space here, and this term is about which
     // way the face is turned in the *world*.
-    float openness = 0.62 + 0.38 * clamp( snNormalW.y * 0.5 + 0.5, 0.0, 1.0 );
+    float openness = 0.72 + 0.28 * clamp( snNormalW.y * 0.5 + 0.5, 0.0, 1.0 );
     // The genuinely additive part: multiple scattering out of a snow bowl, which
     // does pass through the albedo. Only half-occluded by the cavity term — a
     // chimney is shielded from the sky but is still surrounded by snow.
@@ -1803,9 +1910,37 @@ const SNOW_SCATTER = /* glsl */`
     // carries both, it passes through the albedo so it cannot flatten texture,
     // and a shadowed face standing in a snow bowl genuinely does collect this
     // much bounce.
-    reflectedLight.indirectDiffuse += diffuseColor.rgb * skyHue * skyHue
-      * snRockMask * openness * mix( 0.55, 1.0, snRockAO )
-      * ( 0.10 + 1.05 * max( 1.0 - lit, pitR ) );
+    // Raised again, 0.10/1.05 -> 0.15/1.32. This is the *floor* of the whole
+    // rock range: on a wall the sun never reaches — the entire ridge.png crop is
+    // one — it is not merely the dominant light, it is the only one, so the
+    // level of the darks is set here and nowhere else. It was leaving that wall
+    // at mean L* 21.6 against 42.6 for the Eiger and 63.2 for the Arlberg, i.e.
+    // darker than the darkest reference by nearly a stop, with 85% of it under
+    // L* 35. A shadowed face standing in a snow bowl under a clear sky collects
+    // a great deal more than that. It passes through the albedo and carries
+    // skyHue squared, so lifting it cannot flatten texture and can only help the
+    // B/R signature the gate measures.
+    // skyHue squared is two bounces off snow under a blue sky and it is the
+    // right *level*; at this amplitude it is no longer the right chroma. Raising
+    // the term far enough to lift the shadowed wall out of the floor also
+    // multiplied the B-R step across the snowline by the same factor, and where
+    // the far-field mask still alternates rock and snow at pixel scale that step
+    // is what the eye reads as blue speckle: isolated-pixel chroma deviation on
+    // the upper faces of ridge.png went from an sd of 4.8 to 6.0 and its tail
+    // count by an order of magnitude. Pulling the exponent back from 2 to about
+    // 1.55 takes a quarter out of the chroma at essentially unchanged luminance
+    // (1.03 against 1.02 relative), so the level the gate measures does not move
+    // and the speckle does.
+    // 0.90 lifted the shadowed rock's value correctly but tipped the big walls
+    // visibly blue-violet — the stronger bounce multiplies the B-R step across
+    // every pixel-scale boundary in the still-dithering rock mask. 0.62 keeps
+    // most of the value recovery with a markedly less saturated cast; it costs a
+    // little of the shadowed-rock B/R ratio, which is the right trade when the
+    // alternative reads as tinted rather than merely skylit.
+    vec3 bounceHue = skyHue * mix( vec3( 1.0 ), skyHue, 0.62 );
+    reflectedLight.indirectDiffuse += diffuseColor.rgb * bounceHue
+      * snRockMask * openness * mix( 0.68, 1.0, snRockAO )
+      * ( 0.42 + 3.75 * max( 1.0 - lit, pitR ) );
   }
   // Mildly, not squared: snRockAO already averages 0.30, so a square on top of
   // that took the whole face to a twelfth of the sun and the cliff went black.
@@ -1938,9 +2073,9 @@ export function createSnowMaterial(opts = {}) {
     // wet or shattered granite nearer 8%. Against 85%-albedo snow that is a
     // three-stop drop, and holding it is what makes the massif read as stone
     // instead of as grey putty.
-    uRockLo: { value: new THREE.Color(0.014, 0.013, 0.016) },
-    uRockHi: { value: new THREE.Color(0.082, 0.080, 0.086) },     // cool grey granite
-    uRockWarm: { value: new THREE.Color(0.212, 0.158, 0.093) },   // buff limestone
+    uRockLo: { value: new THREE.Color(0.018, 0.017, 0.021) },
+    uRockHi: { value: new THREE.Color(0.102, 0.100, 0.108) },     // cool grey granite
+    uRockWarm: { value: new THREE.Color(0.246, 0.184, 0.110) },   // buff limestone
     uRockIron: { value: new THREE.Color(0.104, 0.052, 0.022) },   // oxide staining
     uRockLichen: { value: new THREE.Color(0.066, 0.074, 0.048) },
     // A near-horizontal bedding plane makes contour terraces out of every face.
