@@ -942,6 +942,7 @@ export class Terrain {
     for (let k = 0; k < R * R; k++) if (flow[k] > maxFlow) maxFlow = flow[k];
     const invLogMax = 1 / Math.log(maxFlow + 1);
     delta.fill(0);
+    const slopeArr = new Float32Array(R * R);
     for (let j = 1; j < R - 1; j++) {
       for (let i = 1; i < R - 1; i++) {
         const k = j * R + i;
@@ -974,10 +975,18 @@ export class Terrain {
         // massif striped at 8-16 m pitch), and raising the repose angle so
         // bedrock could hold structure made it worse, because the carve weight
         // saturates at 1.0 on exactly the faces that got steeper.
+        // The gate above was set at 1.05..1.85, i.e. it only faded the carve out
+        // between 46 and 62 degrees — but the big buttress faces sit at 46-58,
+        // squarely inside it, so the comb was still running at 60-100% strength
+        // on exactly the walls this gate exists to protect. A blind review
+        // measured the result: fall-line autocorrelation on those faces roughly
+        // doubled (coherence length ~20 px -> ~50 px) and they read as draped
+        // fabric rather than rock. Fully off by ~48 degrees now.
+        slopeArr[k] = slope;
         const fq = Math.pow(flow[k], 0.45) - 6.4;
         delta[k] = fq <= 0 ? 0
           : -Math.min(38, 0.335 * fq) * clamp(slope * 2.4 - 0.10, 0.0, 1)
-            * (1 - smoothstep(1.05, 1.85, slope));
+            * (1 - smoothstep(0.62, 1.10, slope));
       }
     }
     // The channel carve leaves a stepped trench that has to be relaxed. A
@@ -986,10 +995,16 @@ export class Terrain {
     // which from three kilometres is exactly the band that reads as buttresses,
     // ribs and gullies. So the relaxation is weighted by how much each cell was
     // actually carved — the trenches get smoothed, the faces keep their bones.
+    // ...but the weight saturated. `-delta * 0.28` hits 1.0 for anything carved
+    // more than 3.6 m, and the carve reaches 38 m, so every carved wall took the
+    // full four passes at 0.30 — the blanket relax this weighting was written to
+    // avoid. Gentler, capped well below 1, and additionally scaled away on steep
+    // ground so bedrock faces keep their bones.
     const relaxW = new Float32Array(R * R);
     for (let k = 0; k < R * R; k++) {
       H[k] += delta[k];
-      relaxW[k] = clamp(-delta[k] * 0.28, 0.10, 1.0);
+      relaxW[k] = clamp(-delta[k] * 0.06, 0.05, 0.45)
+        * (1 - smoothstep(0.8, 1.3, slopeArr[k]));
     }
 
     // -- 4. relax the carve, then a light smooth -----------------------------
@@ -1212,7 +1227,11 @@ export class Terrain {
         // corrugation; this reads as strata.
         const b = hard.brk;
         const t = w < b ? w / b : 1 - (w - b) / (1 - b);
-        bed[k] = (t - 0.5) * (5.2 + 11.5 * m) * m * hard.amp;
+        // Halved from (5.2 + 11.5*m): a review measured 8-60 px band energy on far
+        // rock at 80% against 37% for the Eiger Nordwand, i.e. nearly all the face's
+        // structure sat in one narrow horizontal band at one pitch and nested into
+        // concentric loops around every convexity — a contour map, not strata.
+        bed[k] = (t - 0.5) * (2.6 + 5.5 * m) * m * hard.amp;
       }
     }
     for (let k = 0; k < R * R; k++) H[k] += bed[k];
