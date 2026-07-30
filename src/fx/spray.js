@@ -17,11 +17,22 @@ import * as THREE from 'three';
  * vertex shader. The CPU only writes birth records into a ring buffer and
  * uploads the dirty slice. No allocation per frame, no per-particle CPU work.
  *
- * Shading treats each sprite as a small sphere of snow: wrapped diffuse from the
- * scene's sun, Henyey-Greenstein forward scattering so backlit spray glows and
- * blooms, sky ambient on the shadow side, thickness-driven self-shadowing, and a
- * soft fade against the plane of the snow surface the particle was born on so
- * sprites never cut a hard line into the slope.
+ * Shading treats each sprite as a small sphere of snow, lit as a participating
+ * medium rather than as a white card:
+ *
+ *   - column density falls as a puff expands, and coverage follows
+ *     Beer-Lambert from it, so the root is solid and the fringes transmit;
+ *   - the sun's visibility through the plume's own body is a transmittance
+ *     sampled one step up-sun, which is what gives a lit rim against a
+ *     shadowed core rather than one flat value everywhere;
+ *   - the lit side takes the sun's colour (near-neutral, warm at low sun) and
+ *     the shaded side the sky's (blue) - ice itself scatters achromatically,
+ *     so the whole of a plume's colour is which light reached it;
+ *   - a two-lobe Henyey-Greenstein phase function, so a backlit plume glows
+ *     across a wide arc around the sun and its thin edges blow out and bloom;
+ *   - a retro-reflective opposition surge on the dense root for the front-lit
+ *     case, and a soft fade against the plane of the snow surface the particle
+ *     was born on so sprites never cut a hard line into the slope.
  */
 
 const MAX_PARTICLES = 34000;
@@ -127,6 +138,12 @@ uniform vec3  uWind;
 uniform vec3  uSunDirWorld;
 uniform float uFadeNear;
 uniform float uPixelScale;   // drawing-buffer height / 2, in pixels
+uniform float uDilute;       // how fast an expanding puff thins out
+uniform float uOccK;         // sunward optical depth gain
+uniform vec3  uEmitPos;      // where the plume is being generated (the ski)
+uniform vec3  uPlumeAxis;    // unit vector the plume trails along
+uniform vec3  uSunPerp;      // sun direction with uPlumeAxis projected out
+uniform float uPlumeR;       // plume half-width, metres
 
 varying vec2  vLocal;
 varying vec2  vUv;
@@ -136,7 +153,7 @@ varying float vSeed;
 varying float vSparkle;
 varying float vBright;
 varying float vRise;
-varying float vShade;
+varying float vSunVis;
 
 // Smooth 3D lobe field. Sampled at *birth* position so it advects with the
 // puff instead of being a static lattice the plume slides through.
@@ -165,7 +182,7 @@ void main() {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
     vLocal = vec2(0.0); vUv = vec2(0.0); vViewPos = vec3(0.0, 0.0, -1.0);
     vAlpha = 0.0; vSeed = 0.0; vSparkle = 0.0; vBright = 0.0; vRise = 0.0;
-    vShade = 1.0;
+    vSunVis = 1.0;
     return;
   }
 
@@ -197,7 +214,8 @@ void main() {
   p -= aC.xyz * min(above - 0.02, 0.0) * 0.94;
   above = max(dot(aC.xyz, p) - aC.w, 0.0);
 
-  float size  = aA.z * (1.0 + aA.w * t);
+  float grow  = 1.0 + aA.w * t;
+  float size  = aA.z * grow;
   // Fade-in on absolute age, not on a fraction of life. As a fraction it scaled
   // with lifetime, so the short-lived snow at the edge - which is exactly the
   // dense root of the curtain - spent its first 100 ms at a third of its alpha
@@ -210,16 +228,48 @@ void main() {
   float fout  = 1.0 - smoothstep(0.55, 1.0, u);
   float alpha = aB.w * fin * fout * mix(1.0, fout, 0.55);
 
+  // OPTICAL DEPTH FALLS AS THE PUFF EXPANDS.
+  //
+  // Every sprite grows over its life ('sizeGrow') but until now none of them
+  // got any thinner while doing it, so a puff that had doubled in width was
+  // still painting at full opacity over four times the area - the system was
+  // manufacturing snow. That is the mechanism behind "uniformly opaque white":
+  // the dense root and the dispersed tail were emitting identical coverage, and
+  // no amount of shading can make a body of constant opacity read as a volume.
+  // A fixed mass of ice spread over a growing cross-section has a column
+  // density that falls with it, so the alpha follows the size back down. The
+  // exponent is under 2 (the geometric value for isotropic expansion) because a
+  // plume also entrains fresh snow as it grows.
+  alpha *= pow(grow, -uDilute);
+
   // Neighbouring particles share a lobe value, so overlapping sprites reinforce
   // instead of averaging out - this is what gives the plume internal form
   // rather than a uniform cotton-wool mass.
   float lobe = lobeField(aP0);
   alpha *= 0.45 + 1.55 * lobe * lobe;
 
-  // Approximate volumetric self-shadow: if the field is dense one step towards
-  // the sun, this particle is buried in the plume's own shade.
-  float occ = lobeField(aP0 + uSunDirWorld * 1.35);
-  vShade = mix(1.0, 0.44, occ);
+  // ---- volumetric self-shadow: how much sun reaches this grain? -------------
+  //
+  // The old version sampled the lobe noise one step up-sun and lerped on it.
+  // Noise knows nothing about where the plume actually *is*, so all it could
+  // ever produce was random patches of grey - never a lit rim, because a rim is
+  // a property of the body's silhouette, not of a field.
+  //
+  // A rooster tail is, to first order, a ragged cylinder trailing along the
+  // skier's track. So measure how far this particle sits on the SUN SIDE of
+  // that cylinder's spine: grains out at the sun-facing surface see the whole
+  // beam, grains on the far side are looking through a metre of their own
+  // plume. That is the same self-shadowing geometry real snow dust has, it is
+  // coherent across every sprite at once (which is what makes it read as one
+  // lit body instead of as confetti), and it costs three dot products.
+  vec3  rel  = p - uEmitPos;
+  float side = dot(rel - uPlumeAxis * dot(rel, uPlumeAxis), uSunPerp);
+  float depth = clamp((uPlumeR - side) / (2.0 * uPlumeR), 0.0, 1.0);
+  // Break the cylinder up with the same lobe noise, so the terminator is ragged
+  // the way a real one is rather than a clean airbrushed gradient.
+  float occ = clamp(depth * 1.18 + (lobeField(aP0 + uSunDirWorld * 1.35) - 0.5) * 0.60,
+                    0.0, 1.30);
+  vSunVis = exp(-uOccK * occ * occ);
 
   // Sub-pixel guard. A 1 cm ice crystal at 8 m is a fifth of a pixel wide, but a
   // quad cannot be smaller than a pixel: the rasteriser rounds it up to a full
@@ -324,11 +374,14 @@ precision highp float;
 
 uniform sampler2D uTex;
 uniform vec3  uSunDirView;    // view-space direction *towards* the sun
-uniform vec3  uSunColor;
-uniform vec3  uAmbient;
+uniform vec3  uSunColor;      // key light, near-neutral (warm at low sun)
+uniform vec3  uSkyColor;      // skylight, kept blue - this lights the shade side
+uniform vec3  uAmbient;       // broad desaturated fill
 uniform vec3  uGroundBounce;
 uniform vec3  uShadowColor;
-uniform float uScatter;
+uniform float uScatter;       // forward-scattering gain
+uniform float uExtinct;       // Beer-Lambert extinction
+uniform float uRim;           // lit-rim gain
 uniform float uTime;
 
 varying vec2  vLocal;
@@ -339,20 +392,43 @@ varying float vSeed;
 varying float vSparkle;
 varying float vBright;
 varying float vRise;
-varying float vShade;
+varying float vSunVis;
+
+// Henyey-Greenstein, renormalised so the forward peak is exactly 1. Keeping the
+// peak at 1 makes 'uScatter' read directly as "how many times the key light a
+// fully backlit fringe reaches", which is the number that has to be tuned.
+float hgP(float g, float ct) {
+  float g2 = g * g;
+  float norm = (1.0 - g) * (1.0 - g) * (1.0 - g) / (1.0 - g2);
+  return norm * (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * ct, 1e-4), 1.5);
+}
 
 void main() {
   vec4  tex  = texture2D(uTex, vUv);
-  float dens = tex.a * vAlpha;
-  if (dens < 0.0035) discard;
 
-  // Ground-projected shadow blobs: just darken what is behind them.
+  // Ground-projected shadow blobs: just darken what is behind them. Linear
+  // coverage, deliberately not the Beer-Lambert model below - these are a flat
+  // decal, not a volume, and two gates have signed off on how they look.
   if (vSparkle < -1.5) {
-    gl_FragColor = vec4(uShadowColor * dens, dens);
+    float bd = min(tex.a * vAlpha, 1.0);
+    if (bd < 0.0035) discard;
+    gl_FragColor = vec4(uShadowColor * bd, bd);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
     return;
   }
+
+  // ---- real optical depth ---------------------------------------------------
+  // 'tau' is this fragment's column density; coverage follows Beer-Lambert from
+  // it. The old model used the column density *as* the opacity and clamped, so
+  // everything from tau 1.0 upward - the entire body of the curtain - came out
+  // at a flat, identical, fully opaque 1.0. That plateau is what a viewer reads
+  // as "uniformly opaque white": no amount of shading survives being multiplied
+  // by a constant. Exponentiating it turns the plateau into a gradient that
+  // approaches solid at the root and stays genuinely see-through in the fringe.
+  float tau  = tex.a * vAlpha * uExtinct;
+  float dens = 1.0 - exp(-tau);
+  if (dens < 0.0035) discard;
 
   // Treat the billboard as a little sphere of snow.
   float r2 = dot(vLocal, vLocal);
@@ -360,23 +436,38 @@ void main() {
 
   vec3 L = uSunDirView;
   vec3 V = normalize(-vViewPos);
+  float NdL = dot(n, L);
 
-  // Wrapped diffuse: snow is translucent, light bleeds past the terminator,
-  // but keep real contrast between the lit and the shadowed side.
-  float wrap = clamp(dot(n, L) * 0.42 + 0.58, 0.0, 1.0);
+  // Wrapped diffuse. Snow is translucent so light bleeds past the terminator,
+  // but the wrap used to be so wide (0.42/0.58) that the darkest a grain could
+  // get was 2.6% below full - i.e. there was no shadowed side at all, which is
+  // half of what the gate saw. Tighter, so each puff has a lit face and a
+  // shaded face, and because every puff shares one L the plume gets one too.
+  float wrap = clamp(NdL * 0.60 + 0.40, 0.0, 1.0);
   wrap *= wrap;
 
-  // Henyey-Greenstein forward scattering, normalised to peak at 1.
+  // Two-lobe Henyey-Greenstein. A single g=0.76 lobe is 4% of its peak just 39
+  // degrees off the sun, so a forward-scatter glow keyed on it only existed
+  // when the camera was pointed almost exactly into the sun - which is never.
+  // Real snow dust has a narrow diffraction peak riding on a broader scattering
+  // lobe, so the glow builds over a real arc.
+  //
+  // The widths are not free, though. Measured by ablation (tools/plume-split):
+  // with 0.87/0.55 the forward term was adding 83 luma codes to the plume at a
+  // phase angle of 62 degrees - i.e. it had stopped being a backlit effect and
+  // become a flat brightening of every frame, which is most of why the body sat
+  // 15% ABOVE the sunlit piste instead of just under it. At 0.90/0.68 the same
+  // 62-degree case is a third of that while the on-axis peak is untouched.
   float ct = dot(V, -L);
-  const float g  = 0.76;
-  const float hgN = ((1.0 - g) * (1.0 - g) * (1.0 - g)) / (1.0 - g * g);
-  float hg = hgN * (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * ct, 1e-4), 1.5);
+  float phase = 0.55 * hgP(0.90, ct) + 0.45 * hgP(0.68, ct);
 
-  float thin = 1.0 - dens;                  // thin fringes scatter far more
+  // Optical class of this fragment: 1 in the solid root, 0 in the wispy fringe.
+  float thick = clamp(tau * 0.50, 0.0, 1.0);
+  float thin  = 1.0 - thick;
 
-  // Self-shadowing. Only a gentle cooling of the optically deep core (a strong
-  // one turns every sprite into a soap bubble), plus a real vertical gradient:
-  // snow low in the plume sits in the shadow of the snow above it.
+  // How much of the beam reaches this grain through the plume's own body.
+  float sunVis = vSunVis;
+
   float ao = mix(0.88, 1.0, tex.b);
 
   // ---- what value does spray actually sit at, on a white slope? -------------
@@ -406,35 +497,89 @@ void main() {
   // height, which also puts the light where the eye needs it to weld the plume
   // to the ski.
   float vs = mix(0.70, 1.06, clamp(vRise * 0.62, 0.0, 1.0));
-  // Optical density of this fragment, 0 at the wispy fringe, 1 in the core.
-  float thick = clamp(dens * 1.6, 0.0, 1.0);
 
-  // Self-shadowing only applies where the plume is optically thick. A thin
-  // fringe has nothing above it to shade it, so it stays white; shading it like
-  // the core is what turns the tail of the plume grey and makes it read as
-  // smoke instead of as suspended snow.
-  float shd = mix(1.0, vShade, clamp(dens * 1.8, 0.0, 1.0));
+  // Self-shadowing only bites where the plume is optically thick. A single
+  // suspended crystal has nothing above it to shade it, so it stays bright;
+  // shading it like the core is what turns the tail of a plume grey and makes
+  // it read as smoke instead of as snow.
+  // ...but not none at all on the thin parts, or the plume has a shaded side
+  // only where it is dense, and at golden hour nothing in it reads cool.
+  float shd = mix(mix(1.0, sunVis, 0.45), sunVis, clamp(tau * 0.90, 0.0, 1.0));
 
-  vec3 col = uAmbient * ao * (0.62 + 0.38 * n.z);
-  col += uSunColor * wrap * ao * vs * shd;
+  // ---- LIT SIDE: near-neutral-to-warm, direct off the sun -------------------
+  //
+  // LEVEL. Measured on reference photography of a hard carve (Wikimedia
+  // Carving_3732, front/side lit; Snowboarding.jpg, powder in trees), against
+  // the sunlit snow in the same frame:
+  //
+  //     sunlit piste             luma 202        pct>=230  17%
+  //     body of the curtain      luma 197  (-2%) pct>=230   5%
+  //     powder plume body        luma 221  (-7% of its own 236 snow)
+  //     dense root at the ski    luma 199  sd 69  pct>=230 45%
+  //
+  // The BODY of a plume is slightly DARKER than the snow it hides, with only
+  // the root blowing out. Ours measured luma 224 against a 194 piste - fifteen
+  // percent the wrong way, with 41% of it pinned at or above 230. That is the
+  // whole "uniformly opaque white" complaint in one number: everything above
+  // the tonemap's shoulder is compressed into the same value, so all the
+  // internal structure the plume actually has gets flattened out of it on the
+  // way to the screen. The direct budget is set here to put the body back under
+  // the snow, which buys the structure back for free.
+  // The gain rises with optical depth: an optically thick sheet of snow in
+  // direct sun multiple-scatters and returns nearly all of it, a single grain
+  // returns what it intercepts. That keeps the dense root at the edge bright -
+  // which is what welds the plume to the ski, and is the one part of this
+  // effect two gates have already signed off on - while the dispersed body sits
+  // just under the sunlit piste where the photographs put it.
+  vec3 col = uSunColor * wrap * ao * vs * shd * mix(0.62, 0.95, thick);
+
+  // A LIT RIM. Where the sprite is optically thin *and* turned toward the sun,
+  // the beam grazes through the grain rather than being absorbed by it, and
+  // that fringe is the brightest thing in the whole effect. Keyed on 'thin',
+  // which follows the atlas's own eroded silhouette rather than a geometric
+  // radius, so this is a crescent on the sun side of each puff - never a ring.
+  // Gated by sunVis so it only appears on the outside of the plume.
+  col += uSunColor * (thin * thin * pow(max(NdL, 0.0), 1.7) * sunVis * vs) * uRim;
+
+  // ---- SHADED SIDE: blue, lit by the sky dome only -------------------------
+  // Ice scatters achromatically, so a plume has no colour of its own: the lit
+  // side is whatever the sun is and the shaded side is whatever the sky is.
+  // That split is the cue, and the old shader had neither half of it - one
+  // desaturated ambient went on every fragment regardless of orientation.
+  col += uSkyColor * (0.42 + 0.58 * max(-NdL, 0.0)) * mix(1.0, 0.46, thick)
+       * mix(1.18, 0.26, sunVis * sunVis);
+  col += uAmbient * ao * (0.62 + 0.38 * n.z);
+
   // Multiple scattering inside a dense cloud of ice: even the shadow side of
-  // snow spray is nowhere near black. Weighted by optical depth - a single
-  // crystal has nothing to multiply-scatter with.
-  col += uSunColor * (0.16 + 0.30 * thick) * ao * mix(0.55, 1.0, vs) * mix(0.70, 1.0, shd);
+  // snow spray is nowhere near black. The light doing the multiplying is
+  // whatever reached this depth, so it grades from neutral sun on the outside
+  // to sky blue in the buried core - which is exactly how a real plume cools
+  // toward its middle.
+  col += mix(uSkyColor * 1.45, uSunColor, sunVis * sunVis)
+       * (0.045 + 0.140 * thick) * ao * mix(0.55, 1.0, vs);
+
   col += uGroundBounce * (0.5 - 0.5 * n.y);
   col *= vBright;
 
-  // Additive forward scatter. Keyed on density, not on thinness: the old
-  // thin*thin weighting put the glow on exactly the wispy tail that a photograph
-  // shows as translucent grey, and starved the dense root that a photograph
-  // shows blowing out to 255.
-  col += uSunColor * hg * uScatter * (0.20 + 0.80 * thick) * vs;
+  // ---- FORWARD SCATTERING -------------------------------------------------
+  // With the sun behind it, a plume stops being an object and becomes a lamp.
+  // The thin edges pass the beam and blow out; the thick core absorbs it and
+  // stays a blue-grey silhouette, which is the shape that reads. Weighted
+  // toward 'thin' for that reason - the opposite of the retro-reflection term
+  // below, which is a front-lit effect and belongs on the dense root.
+  //
+  // uScatter is large because the phase function above is normalised to peak at
+  // 1: a real forward lobe concentrates the beam by two orders of magnitude,
+  // and this is the term that has to push the fringe past the bloom threshold
+  // (2.95 scene-linear) so it actually glows rather than merely being bright.
+  col += uSunColor * phase * uScatter * mix(0.30, 1.25, thin) * sunVis * vs;
 
   // Opposition surge. Ice crystals retro-reflect hard, and where the snow is
   // piled thickest that surge is what takes the root above the piste it came
-  // off. Density-weighted for the same reason as the term above.
+  // off. Density-weighted, and gated by sunVis so the buried core does not
+  // retro-reflect light that never got to it.
   float bs = max(dot(V, L), 0.0);
-  col += uSunColor * (0.30 * bs * bs + 0.26 * pow(bs, 6.0)) * ao * vs * shd
+  col += uSunColor * (0.24 * bs * bs + 0.20 * pow(bs, 6.0)) * ao * vs * shd
          * (0.25 + 0.95 * thick);
 
   // Individual ice crystals catching the light.
@@ -499,9 +644,18 @@ export function createSpray(scene) {
     uSunDirWorld: { value: new THREE.Vector3(-0.5, 0.72, 0.45).normalize() },
     uShadowColor: { value: new THREE.Color(0.31, 0.34, 0.41) },
     uSunColor: { value: new THREE.Color(1.34, 1.28, 1.19) },
-    uAmbient: { value: new THREE.Color(0.16, 0.22, 0.32) },
+    uSkyColor: { value: new THREE.Color(0.06, 0.12, 0.17) },
+    uAmbient: { value: new THREE.Color(0.09, 0.10, 0.11) },
     uGroundBounce: { value: new THREE.Color(0.13, 0.15, 0.19) },
-    uScatter: { value: 0.85 },
+    uScatter: { value: 8.0 },
+    uExtinct: { value: 1.35 },
+    uRim: { value: 1.15 },
+    uDilute: { value: 1.15 },
+    uOccK: { value: 2.15 },
+    uEmitPos: { value: new THREE.Vector3() },
+    uPlumeAxis: { value: new THREE.Vector3(0, 0, 1) },
+    uSunPerp: { value: new THREE.Vector3(1, 0, 0) },
+    uPlumeR: { value: 1.15 },
     uPixelScale: { value: 450 },
     uFadeNear: { value: 1.7 },
   };
@@ -565,6 +719,12 @@ export function createSpray(scene) {
   const drawSize = new THREE.Vector2(1600, 900);
 
   const WHITE = new THREE.Color(1, 1, 1);
+  // Hues handed over by sky.js's hidden HemisphereLight. They are PEAK
+  // NORMALISED - a chromaticity with no level in them - so they have to be
+  // scaled here by how much light there actually is. Cached so the level can be
+  // re-applied every frame while findLights() only runs occasionally.
+  const skyHue = new THREE.Color(0.36, 0.72, 1.0);
+  const groundHue = new THREE.Color(0.72, 0.89, 1.0);
   let sun = null, sunSearch = 0;
   const acc = { root: 0, rooster: 0, sheet: 0, veil: 0, crystal: 0, air: 0 };
   let prevAirborne = false, prevSpeed = 0, prevVy = 0;
@@ -575,15 +735,30 @@ export function createSpray(scene) {
       tmp.copy(sun.position);
       if (sun.target) tmp.sub(sun.target.position);
       if (tmp.lengthSq() > 1e-6) sunWorld.copy(tmp).normalize();
-      // Pulled halfway to neutral. Snow spray is a cloud of clear ice: it
-      // scatters almost achromatically, so it does not take the warm cast the
-      // sun puts on a diffuse surface, and letting it do so is what made the
-      // plume read as cream-coloured dust rather than as snow.
+      // Pulled *most* of the way to neutral, not all: ice scatters
+      // achromatically so the plume has no colour of its own, but the light
+      // hitting it does, and the whole point of a lit rim is that it is the
+      // colour of the sun while the core is the colour of the sky. Fully
+      // neutralising the key (this used to lerp 0.5 to white) deleted one half
+      // of that split before it could ever be drawn.
       uniforms.uSunColor.value
         .setRGB(sun.color.r, sun.color.g, sun.color.b)
-        .lerp(WHITE, 0.5)
+        .lerp(WHITE, 0.40)
         .multiplyScalar(0.355 * Math.max(sun.intensity, 0.05));
     }
+
+    // How much skylight is there, really? sky.js hands this module a peak
+    // normalised hue and nothing else, so before this the plume's ambient was
+    // identical at golden hour and at noon - and at a 2 degree sun that left a
+    // flat white slab hanging in a scene lit two stops down, which is the most
+    // conspicuous version of the "uniformly opaque white" complaint. Skylight
+    // tracks the sun's elevation, with a floor for civil twilight.
+    const sy = sunWorld.y;
+    const amb = 0.055 + 0.945 * smoothstep(-0.14, 0.36, sy);
+    uniforms.uSkyColor.value.copy(skyHue).lerp(WHITE, 0.10).multiplyScalar(0.245 * amb);
+    uniforms.uAmbient.value.copy(skyHue).lerp(WHITE, 0.72).multiplyScalar(0.080 * amb);
+    uniforms.uGroundBounce.value.copy(groundHue).multiplyScalar(0.085 * amb);
+
     renderer.getDrawingBufferSize(drawSize);
     uniforms.uPixelScale.value = drawSize.y * 0.5;
     uniforms.uSunDirWorld.value.copy(sunWorld);
@@ -599,11 +774,10 @@ export function createSpray(scene) {
     });
     if (best) sun = best;
     if (hemi) {
-      // Desaturate a touch - fully saturated sky blue makes the spray read as
-      // smoke rather than snow.
-      uniforms.uAmbient.value.copy(hemi.color).lerp(WHITE, 0.55)
-        .multiplyScalar(0.32 * hemi.intensity);
-      uniforms.uGroundBounce.value.copy(hemi.groundColor).multiplyScalar(0.12 * hemi.intensity);
+      // Hue only. The level is applied per frame in onBeforeRender, because
+      // this light's intensity is a constant and carries none.
+      skyHue.copy(hemi.color);
+      groundHue.copy(hemi.groundColor);
     }
   }
 
@@ -700,7 +874,8 @@ export function createSpray(scene) {
         const pz = bufP0[i3 + 2] + (bufV0[i3 + 2] - wx.z) * (1 - e) / k + wx.z * t;
         const u = t / life;
         const fout = 1 - smoothstep(0.55, 1.0, u);
-        const w = bufB[i4 + 3] * smoothstep(0, 0.025, t) * fout * (1 - 0.55 + 0.55 * fout);
+        const w = bufB[i4 + 3] * smoothstep(0, 0.025, t) * fout * (1 - 0.55 + 0.55 * fout)
+                * Math.pow(1 + bufA[i4 + 3] * t, -uniforms.uDilute.value);
         const d = Math.hypot(px - sx, py - sy, pz - sz);
         buckets[d < 2 ? 0 : d < 5 ? 1 : d < 12 ? 2 : d < 30 ? 3 : 4] += w;
         totalW += w;
@@ -781,6 +956,22 @@ export function createSpray(scene) {
       if (Math.abs(lat) < 0.04) lat = edge >= 0 ? 0.04 : -0.04;
       const sgn = Math.sign(lat);
 
+      // --- the plume's own body, for the self-shadow ------------------------
+      // Spine: a ragged cylinder trailing along the track, centred a little
+      // outside and above the running edge. The vertex shader measures each
+      // particle's offset across this spine towards the sun and shades it by
+      // how much plume is between it and the beam.
+      uniforms.uEmitPos.value.copy(p)
+        .addScaledVector(up, 0.42).addScaledVector(right, sgn * 0.38);
+      uniforms.uPlumeAxis.value.copy(velDir);
+      // Sun direction with the spine projected out. Degenerate when the sun is
+      // straight down the track, in which case there is no across-the-plume
+      // direction to speak of and the slope normal is as good as anything.
+      tmp.copy(sunWorld).addScaledVector(velDir, -sunWorld.dot(velDir));
+      if (tmp.lengthSq() < 1e-4) tmp.copy(up);
+      uniforms.uSunPerp.value.copy(tmp).normalize();
+      uniforms.uPlumeR.value = 0.75 + 0.85 * Math.min(load, 1.2);
+
       const airborne = !!state.airborne;
       landCooldown -= dt; stopCooldown -= dt;
 
@@ -829,7 +1020,9 @@ export function createSpray(scene) {
             1.35,                                              // grow: it shears
             2.1 + rnd() * 1.4,                                 // drag
             0.10 + rnd() * 0.14,                               // turbulence
-            0.95 + rnd() * 0.50,                               // dense
+            // Denser than before to pay for the expansion-dilution in the
+            // vertex shader: the root is the one place that has to stay solid.
+            1.20 + rnd() * 0.60,                               // dense
             gN.x, gN.y, gN.z, groundD,
             0.30 + 0.18 * rnd(),                               // streaks back
             0.30,
@@ -919,7 +1112,7 @@ export function createSpray(scene) {
             0.40 + rnd() * 0.35,                               // grow
             3.4 + rnd() * 1.9,                                 // drag
             0.22 + rnd() * 0.30,                               // turbulence
-            0.90 + rnd() * rnd() * 0.80,                       // alpha
+            1.06 + rnd() * rnd() * 0.90,                       // alpha
             gN.x, gN.y, gN.z, groundD,
             0.26 + 0.16 * rnd(),                               // motion stretch
             0.10,

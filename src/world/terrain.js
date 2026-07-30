@@ -96,6 +96,82 @@ const WIND_X = 0.82, WIND_Z = 0.57;
 // instead, blended in over 3.4 km, carrying the skyline out into successive
 // snow ranges. Evaluated identically on CPU and GPU, so `height()` still agrees
 // with the mesh out there.
+// --- cliff structure ---------------------------------------------------------
+// Why a separate detail family exists for steep ground at all.
+//
+// A heightfield hides detail on exactly the ground that needs it most. The
+// surface normal is `normalize(-hx, 1, -hz)`, so the angle it makes with the
+// vertical is `atan(|g|)` and the *sensitivity* of that angle to an added
+// gradient is `1/(1+|g|^2)`. A wall at 55 degrees has |g| = 1.43, i.e. a third
+// of the response of a 25-degree slope; at 65 degrees it is a fifth. Every
+// detail band in this file is authored at an amplitude that reads correctly on
+// moderate ground, and therefore reads as almost nothing on a cliff.
+//
+// Worse, what *does* survive is biased. A perturbation of the cross-slope
+// derivative rotates the normal by `d/(|g|.sqrt(1+g^2))` while the same
+// perturbation down the fall line rotates it by `d/(1+g^2)` — nearly twice as
+// much for the cross-slope one, and cross-slope variation is what draws a
+// *vertical* line on screen. On top of that, plan-view foreshortening stretches
+// any plan-isotropic feature by tan(alpha) in screen height: a 20 m blob on a
+// 70-degree face renders 20 m wide and 55 m tall. Every band in this file is
+// plan-isotropic, so a steep face necessarily combs itself into vertical
+// striae, unbroken from crest to valley floor. That is the drape. It is not the
+// flow carve and it is not the relax weight — both were retuned with no
+// measurable change to the fall-line autocorrelation (0.65/0.50/0.40/0.26
+// before, 0.64/0.48/0.37/0.20 after) — it is geometric, and it needs a detail
+// family that is anisotropic *in screen space*, not in plan.
+//
+// The trick that gets that for free: sample the noise in a domain whose second
+// axis is the *elevation* rather than a second horizontal coordinate. On any
+// steep face elevation is screen-vertical and the remaining horizontal axis is
+// screen-horizontal, so the feature aspect ratio is controlled directly in the
+// image, with no orientation field to swirl at the crests, and features wrap
+// the mountain at constant elevation — which is what strata do. Its gradient is
+// analytic: d/dp of h is just the macro gradient we already hold.
+//
+// Three members, all evaluated in that domain:
+//   benches  — a bedding stack with a sharp riser and a back-sloping terrace.
+//              Two derivative discontinuities per bed: the outcrop line at the
+//              foot of the riser and the lip at the top. Ledges are what
+//              terminate a gully, and a terminated gully cannot correlate at
+//              lag 64.
+//   ribs     — contour-parallel lineation, 86 m along strike by 24 m of relief.
+//   joints   — a conjugate pair of fracture sets at roughly +-47 degrees to the
+//              horizontal on the face. Not down the fall line and not across
+//              it, which is the one thing the existing bands cannot produce.
+// None of the three needs an explicit slope-compensation gain, and the first
+// version of this had one — capped at 3.2x, which on the 77-82 degree walls
+// flanking the couloir gives back a twentieth of what the heightfield takes.
+// Sampling against elevation compensates *exactly*, for free, at every angle:
+//
+//   - the ridged members' gradient is `A . dr . dh/dp / lambda_h`, i.e. already
+//     proportional to the macro gradient, so their perturbation is a constant
+//     *fraction* of the base slope from 30 degrees to 85;
+//   - the bench's back-slope is `-A . cos(dip) / pitch` along the bed normal,
+//     so `A = pitch / cos(dip)` makes the terrace exactly horizontal — again at
+//     any steepness, and it is a fixed number of metres, not a slope-scaled one.
+//     Beyond that the bench tips backwards into an overhang, so it is capped
+//     just under it and `hard.amp` only ever scales it *down*.
+const CLF_PITCH = 31.0;        // bed thickness, metres, perpendicular to bedding
+const CLF_BENCH = 0.95;        // fraction of a dead-flat terrace, 1.0 = flat
+const CLF_RIB = 28.0;          // contour-parallel lineation
+const CLF_JNT = 19.0;          // conjugate joint sets
+// ...but the two ridged members go into *geometry* at a third of that. See the
+// note in GLSL_DISPLACE_BODY: at full amplitude their gradient is about twice
+// the macro gradient, which a fragment normal absorbs happily and a 0.4 m
+// clipmap ring does not — it folds, and a folded heightfield is a field of
+// spikes. The CPU twin uses the same fractions so the physics surface still
+// matches the mesh.
+const CLF_VTX_RIB = 0.32, CLF_VTX_JNT = 0.37;
+// Soft cap on |dg| as a multiple of (0.4 + |g|), and it has to differ by path.
+// The mesh cannot take a perturbation larger than the surface it perturbs — it
+// folds — and neither can the rock/snow threshold at close range, where it goes
+// binary and the face reads as shattered foil. A 2 km wall is under neither
+// constraint: it is drawn by the fragment program's normal, its mesh is 25 m
+// per cell and its snow mask is averaged over the pixel anyway. So the cap
+// opens up with distance.
+const CLF_LIM_V = 0.55, CLF_LIM_F = 1.75;
+
 const BD_IN = 3600, BD_OUT = 7000;
 const BD_F1 = 1 / 2400, BD_A1 = 1500;
 const BD_F2 = 1 / 620, BD_A2 = 175;
@@ -603,16 +679,30 @@ for (const r of RIDGES) {
  *   - the bedding displacement itself, which raises the resistant part of each
  *     bed proud of the recessive one.
  *
- * Dip 12-23 degrees, beds 44-74 m, both from slow noise so each massif gets its
- * own structural domain instead of one pattern stamped across the range.
+ * Dip 17-38 degrees from slow noise, so each massif gets its own structural
+ * domain instead of one pattern stamped across the range. The old range was
+ * 12-23 degrees, i.e. cos(dip) = 0.92-0.98 against sin(dip) = 0.21-0.39: the
+ * elevation term dominated by four to one and the bands were, to within a few
+ * degrees, *contours*. That is what nested them into concentric loops around
+ * every convexity. Past about 25 degrees they cut across the topography and
+ * read as strata instead.
+ *
+ * Bed thickness is fixed and the *phase* is warped, not the period. Dividing a
+ * plane by a noisy period looks like the same thing and is not: d(s)/dx picks
+ * up a term `-s . dP/P.dx` which, with s running to ~45 beds across the map,
+ * measured four times the plane's own gradient. The "bedding" was therefore
+ * mostly a beat pattern between two noise fields, which is exactly how it came
+ * out — one pitch, everywhere, at one amplitude. A phase warp thickens and
+ * thins beds laterally without ever swamping the plane.
  */
+const BED_P0 = 52;
 function bedPhase(x, z, h) {
   const dom = fbm(x * 0.00042, z * 0.00042, 2);
-  const dip = 0.21 + 0.19 * dom;
+  const dip = 0.30 + 0.36 * dom;
   const strike = dom * 3.1 + 1.2;
-  const period = 44 + 30 * vnoise(x * 0.0007 + 13.4, z * 0.0007 - 7.1);
   return (h * Math.cos(dip)
-    + (x * Math.cos(strike) + z * Math.sin(strike)) * Math.sin(dip)) / period;
+    + (x * Math.cos(strike) + z * Math.sin(strike)) * Math.sin(dip)) / BED_P0
+    + fbm(x * 0.00085 + 3.3, z * 0.00085 - 6.1, 2) * 1.6;
 }
 
 /**
@@ -630,7 +720,20 @@ function bedHardness(s) {
   const r = Math.sin(bi * 12.9898 + 78.233) * 43758.5453;
   const u = r - Math.floor(r);
   const r2 = Math.sin(bi * 39.3468 - 11.7) * 24634.6345;
-  return { amp: 0.30 + 1.55 * u * u, brk: 0.46 + 0.34 * (r2 - Math.floor(r2)) };
+  // Bundles. Per-bed hashing alone gives every face the same *pitch* — 52 m —
+  // and only varies how loudly each bed shouts, so a detrended row profile puts
+  // nearly all its energy in one narrow band (measured 80% against 37% for the
+  // Eiger Nordwand). Grouping four beds under a shared multiplier that can go
+  // as low as 0.35 and as high as 1.7 means a face carries a 52 m pitch, a
+  // 210 m pitch, and long stretches with essentially nothing — which is what a
+  // real section looks like.
+  const bu = Math.floor(s * 0.25);
+  const r3 = Math.sin(bu * 7.113 + 2.31) * 19341.7;
+  const v3 = r3 - Math.floor(r3);
+  return {
+    amp: (0.14 + 1.90 * u * u) * (0.35 + 1.35 * v3),
+    brk: 0.20 + 0.38 * (r2 - Math.floor(r2)),
+  };
 }
 
 /** Polynomial smooth-max: keeps ridge intersections from creasing. */
@@ -1030,8 +1133,6 @@ export class Terrain {
       for (let k = 0; k < R * R; k++) H[k] += delta[k] * 0.30 * relaxW[k];
     }
 
-    // -- 4b. bedding planes ---------------------------------------------------
-    this._beddingPlanes(H);
 
     // -- 5. the piste --------------------------------------------------------
     for (let j = 0; j < R; j++) {
@@ -1041,7 +1142,7 @@ export class Terrain {
       for (let i = 0; i < R; i++) {
         const x = MAP_ORIGIN + i * MAP_STEP;
         const d = Math.abs(x - cx);
-        const w = smoothstep(560, 200, d);
+        let w = smoothstep(560, 200, d);
         if (w <= 0) continue;
         const bank = Math.min(62, (d / 260) * (d / 260) * 30);
         const roll = 2.4 * Math.sin(z * 0.0135 + x * 0.004) + 2.0 * Math.sin(x * 0.0125 - z * 0.007);
@@ -1054,10 +1155,94 @@ export class Terrain {
           + (ridgedMF(x * 0.019, z * 0.0056, 2) - 0.32) * 3.2;
         const prof = base + bank + roll + rib;
         const k = j * R + i;
+        // Do not drag a wall down into the piste. At 420 m from the centreline
+        // the blend is still 0.34, and the two buttresses flanking the couloir
+        // sit at exactly 420-470 m and 66-74 degrees: a third of every one of
+        // those pixels was a smooth corridor ramp, and the same weight was
+        // taking 29% off their bedrock-exposure channel, which is why they came
+        // out both the smoothest and the whitest faces on the map.
+        //
+        // Gating on *slope* here does not work and is not a matter of tuning:
+        // the corridor is cut into steep ground by design, so the pre-blend
+        // gradient under the piste is large everywhere and a slope gate deletes
+        // the piste (measured — the skier fell onto the raw massif at 838 km/h).
+        // Gating on how far the ground stands *above the corridor profile* is
+        // safe, because that is small by construction anywhere the piste can
+        // actually run, and it is only allowed to act on the outer shoulder.
+        //
+        // The boundary itself wanders, in a field of z and *elevation*, by up
+        // to 150 m. Without that the outer edge of the blend is the graph of a
+        // smoothstep in |x - cx| — a smooth, monotone, laterally-constant curve
+        // running unbroken from crest to valley floor, which is the theatre
+        // curtain in one line of code. A silhouette cannot be argued with by
+        // surface detail. Sampling the wander against elevation makes the
+        // boundary climb, step back into a re-entrant, jut out into a buttress
+        // and climb again, so the wall is a row of buttresses rather than a
+        // funnel. Jittering `d` directly instead does the same job to the
+        // *skiable* shoulder and strands the skier in the trees at 312 m out on
+        // the `ridge` framing — hence the `above` factor, which is small by
+        // construction anywhere the piste can actually run.
+        const above = H[k] - prof;
+        if (above > 70) {
+          const nz = fbm(z * 0.0016 + 5.1, H[k] * 0.0042 - 2.7, 3);
+          w *= 1 - smoothstep(300, 480, d + nz * 150) * smoothstep(70, 240, above);
+        }
         H[k] = H[k] + (prof - H[k]) * w;
         strip[k] *= 1 - w * 0.85;
       }
     }
+
+    // -- 5b. let the walls of the slot fall over -----------------------------
+    // The thermal pass ran in step 2; the corridor cuts its slot in step 5.
+    // Everything the slot leaves standing is therefore ground that no erosion
+    // has ever seen, and it is not marginal: probed on the two buttresses
+    // flanking the couloir, the sides of the slot stand at 77-82 degrees over
+    // 800 m of relief. Nothing else on the map exceeds about 60, because that
+    // is what the repose angles in step 2 allow, and those two faces are the
+    // ones that own the skyline of every wide shot. Five iterations at a
+    // 62-degree threshold bring them back into the range the rest of the massif
+    // lives in and drop the material at the foot as a fan.
+    //
+    // Gated to the couloir vicinity so the authored cliffs elsewhere keep the
+    // steepness the hierarchy was tuned around, and faded out inside 320 m so
+    // it can never reach the piste. `strip` takes the balance, exactly as in
+    // step 2, so a scoured wall reads as bedrock and its fan reads as talus.
+    {
+      const T = 1.58 * MAP_STEP;                       // 61.6 degrees
+      for (let it = 0; it < 12; it++) {
+        delta.fill(0);
+        for (let j = 1; j < R - 1; j++) {
+          const z = MAP_ORIGIN + j * MAP_STEP;
+          const cx = corridorX(z);
+          for (let i = 1; i < R - 1; i++) {
+            const x = MAP_ORIGIN + i * MAP_STEP;
+            const dd = Math.abs(x - cx);
+            if (dd > 1250) continue;
+            const g = smoothstep(210, 370, dd) * smoothstep(1250, 1050, dd);
+            if (g <= 0.01) continue;
+            const k = j * R + i, h0 = H[k];
+            let tot = 0, d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            let dd0 = h0 - H[k - 1]; if (dd0 > T) { d0 = dd0 - T; tot += d0; }
+            dd0 = h0 - H[k + 1]; if (dd0 > T) { d1 = dd0 - T; tot += d1; }
+            dd0 = h0 - H[k - R]; if (dd0 > T) { d2 = dd0 - T; tot += d2; }
+            dd0 = h0 - H[k + R]; if (dd0 > T) { d3 = dd0 - T; tot += d3; }
+            if (tot <= 0) continue;
+            const move = Math.min(tot * 0.30, (h0 - Math.min(H[k - 1], H[k + 1], H[k - R], H[k + R])) * 0.4) * g;
+            const s = move / tot;
+            delta[k] -= move;
+            delta[k - 1] += d0 * s; delta[k + 1] += d1 * s;
+            delta[k - R] += d2 * s; delta[k + R] += d3 * s;
+          }
+        }
+        for (let k = 0; k < R * R; k++) { H[k] += delta[k]; strip[k] -= delta[k] * 0.6; }
+      }
+    }
+
+    // -- 5c. bedding planes ---------------------------------------------------
+    // After the slot and after its walls have relaxed, so the beds are cut into
+    // the surface that is actually rendered rather than into one the corridor
+    // pass then blends 34% of a smooth ramp over.
+    this._beddingPlanes(H);
 
     // -- 6. taper to a plain at the map edge ---------------------------------
     for (let j = 0; j < R; j++) {
@@ -1193,9 +1378,18 @@ export class Terrain {
    * snow sits on ground too steep to hold a slab, and it costs one pass over
    * the grid.
    *
-   * Bands are cut along a plane, not along a contour: dip 12-23 degrees, with
-   * dip direction and bed thickness coming from a slow noise so each massif is
-   * its own structural domain instead of one pattern stamped across the range.
+   * Bands are cut along a plane, not along a contour: see `bedPhase`.
+   *
+   * A second, much coarser member runs in the same pass and is the one that
+   * moves a silhouette. Every shape-generating term in `_bake` is a function of
+   * the plan coordinates only, and a plan-isotropic field on a 60-degree face
+   * renders stretched by tan(60) = 1.7 in screen height on top of the
+   * heightfield's own bias towards cross-slope derivatives — which is why the
+   * 625 m and 2.2 km ridged bands, isotropic in plan, came out as a fan of
+   * vertical folds converging on the valley floor. The same folds, sampled with
+   * *elevation* as one of the two axes instead, run round the mountain at
+   * constant height and step the buttress rather than draping it. Nothing else
+   * in the bake has any way to make a horizontal feature on a wall.
    *
    * Two gates, both load-bearing. Slope, because a ledge system is a feature of
    * a *wall*; and distance from the fall line, because the piste corridor is
@@ -1214,24 +1408,68 @@ export class Terrain {
         const k = j * R + i;
         const gx = (H[k + 1] - H[k - 1]) * (1 / (2 * MAP_STEP));
         const gz = (H[k + R] - H[k - R]) * (1 / (2 * MAP_STEP));
-        let m = smoothstep(0.46, 0.95, Math.sqrt(gx * gx + gz * gz));
+        const sl2 = gx * gx + gz * gz;
+        let m = smoothstep(0.46, 0.95, Math.sqrt(sl2));
         if (m <= 0.02) continue;
         const x = MAP_ORIGIN + i * MAP_STEP;
-        m *= smoothstep(520, 900, Math.abs(x - cx));
+        // The distance gate is about *skiable* ground: a 16 m bed cut into the
+        // piste shoulder is a ski jump. It was a plain smoothstep(520, 900) in
+        // |x - centreline|, and that is what hollowed out the two walls flanking
+        // the couloir — the ones that own the skyline of every wide shot and
+        // that a blind review called the whole remaining gap. Probed: they stand
+        // at x = -512 and x = +421 against a centreline at x = -41, i.e. 462 and
+        // 471 m out, where the gate is 0.00, and they are 68-77 degrees. Nothing
+        // at 70 degrees is reachable and nothing at 70 degrees is a hazard, so
+        // steep ground opens the gate on its own and the two smoothest, largest,
+        // most-photographed faces in the world stop being the two faces with no
+        // rock structure baked into them at all.
+        const near = smoothstep(520, 900, Math.abs(x - cx));
+        const wall = smoothstep(1.15, 1.70, Math.sqrt(sl2));     // 49..60 deg
+        m *= Math.max(near, wall);
         if (m <= 0.02) continue;
         const bs = bedPhase(x, z, H[k]);
         const w = bs - Math.floor(bs);
         const hard = bedHardness(bs);
-        // Asymmetric: a resistant bed over a recessive one, i.e. a long ramp up
-        // to a lip and a short drop off its front. Symmetric bands read as
-        // corrugation; this reads as strata.
+        // A riser and then a terrace, not a ramp and a drop. The old profile
+        // was a symmetric-ish tent, which on a wall is corrugation; this is
+        // flat over the back four fifths of every bed and near-vertical across
+        // the front fifth, so the face *steps*. `t - w` rather than `t - 0.5`
+        // keeps it zero at both ends of the bed, so the steps stack without
+        // the stack drifting off the surface it is cut into.
         const b = hard.brk;
-        const t = w < b ? w / b : 1 - (w - b) / (1 - b);
-        // Halved from (5.2 + 11.5*m): a review measured 8-60 px band energy on far
-        // rock at 80% against 37% for the Eiger Nordwand, i.e. nearly all the face's
-        // structure sat in one narrow horizontal band at one pitch and nested into
-        // concentric loops around every convexity — a contour map, not strata.
-        bed[k] = (t - 0.5) * (2.6 + 5.5 * m) * m * hard.amp;
+        const t = w < b ? w / b : 1;
+        // A vertical displacement rotates the normal by 1/(1+|g|^2), so the
+        // same bench that reads clearly at 25 degrees is invisible at 60. Give
+        // it back, capped — this is the whole reason the bedding could be
+        // measured at 80% of the row-profile energy and still not read as rock.
+        const comp = 1 + Math.min(sl2, 2.4);
+        let v = (t - w) * (2.4 + 4.6 * m) * m * hard.amp * comp * 0.55;
+
+        // --- coarse cliff banding, the member that owns the silhouette ------
+        const dm = fbm(x * 0.00042, z * 0.00042, 2);
+        const th = 1.10 + 2.60 * dm;
+        const c1 = Math.cos(th), s1 = Math.sin(th);
+        const uu = x * c1 + z * s1;
+        const h = H[k];
+        // Buttress steps: 260 m along strike against 105 m of relief, so on a
+        // wall they read as terraces four to six hundred metres wide and one
+        // to two hundred high — the scale a face is *organised* at.
+        const ps = 0.68 + 0.72 * dm;                 // per-domain terrace scale
+        const bandA = ridgedMF(uu / (260 * ps), h / (105 * ps), 3) - 0.32;
+        // ...and an oblique ramp system across them, so the terraces are cut
+        // by something and a gully has a reason to stop.
+        const bandB = ridgedMF((uu * 0.80 + h * 0.90) * (1 / 155),
+          (h * 0.50 - uu * 0.50) * (1 / 215), 2) - 0.32;
+        // Amplitude rises steeply with slope, and not out of taste: a 50 m
+        // terrace cut into an 800 m face at 65 degrees is 6% of its relief and
+        // the 200-600 m folds the ridged bands put there survive straight
+        // through it. The steepest faces are exactly the ones with the least to
+        // hold structure and the most screen area, so they get up to 2.6x.
+        const slN = Math.sqrt(sl2);
+        v += (bandA * 30 + bandB * 19) * m
+          * (0.45 + 0.55 * smoothstep(0.8, 1.5, slN))
+          * (1 + 1.6 * smoothstep(1.5, 3.1, slN));
+        bed[k] = v;
       }
     }
     for (let k = 0; k < R * R; k++) H[k] += bed[k];
@@ -1420,6 +1658,12 @@ export class Terrain {
       mh += (r2[0] - 0.33) * amp2;
       mgx += r2[1] * amp2 * f2; mgy += r2[2] * amp2 * f2;
     }
+    // cliff structure — benches, contour lineation, conjugate joint sets
+    if (rocky > 0.004) {
+      const c = this._cliff(x, z, h, dx, dz, rocky, 1, CLF_VTX_RIB, CLF_VTX_JNT,
+        CLF_LIM_V, this._clfOut || (this._clfOut = [0, 0, 0]));
+      mh += c[0]; mgx += c[1]; mgy += c[2];
+    }
     // ridged rock ribs
     {
       const amp = 10.2 * rocky, f = 1 / 74;
@@ -1472,6 +1716,98 @@ export class Terrain {
       x = nx; y = ny; a *= gain;
     }
     out[0] = s / nrm; out[1] = gx / nrm; out[2] = gy / nrm;
+    return out;
+  }
+
+  /**
+   * Cliff structure — the CPU twin of GLSL `terrCliff`. See the CLF_* block at
+   * the top of the file for why steep ground needs its own detail family.
+   *
+   * `out` receives [dh, d/dx, d/dz]. `gx,gz` is the *macro* gradient, before
+   * any detail: the elevation axis of the sampling domain is differentiated
+   * through it, and feeding it the already-perturbed gradient would compound.
+   */
+  _cliff(x, z, h, gx, gz, rocky, gBench, gRib, gJoint, lim0, out) {
+    out[0] = 0; out[1] = 0; out[2] = 0;
+    if (rocky <= 0.004) return out;
+
+    const dm = latNoise(x * 0.00042, z * 0.00042, _n3)[0];
+    const dip = 0.34 + 0.42 * dm;
+    const th = 1.10 + 2.60 * dm;
+    const c1 = Math.cos(th), s1 = Math.sin(th);
+    const u = x * c1 + z * s1;
+    const v = -x * s1 + z * c1;
+    const cd = Math.cos(dip), sd = Math.sin(dip);
+    let dh = 0, dgx = 0, dgz = 0;
+
+    if (gBench > 0.004) {
+      // One pitch everywhere is corduroy — the same failure the fall-line comb
+      // was, rotated ninety degrees. The pitch is a property of the structural
+      // domain, so it rides the same 2.4 km field as the dip and the strike:
+      // 19 m beds on one massif, 46 m on the next. (This is a *slow* field on
+      // purpose. Dividing the bed plane by a fast noisy period puts a term
+      // `-s . dP/P.dx` into the phase gradient that swamps the plane's own —
+      // see `bedPhase`, where it was worth four times the carrier. At 2.4 km it
+      // is 23% of the carrier: the beds thicken and thin, they do not beat.)
+      const pitch = CLF_PITCH * (0.62 + 0.85 * dm);
+      const iP = 1 / pitch;
+      const s = (h * cd + v * sd) * iP;
+      const sx = (gx * cd - s1 * sd) * iP;
+      const sz = (gz * cd + c1 * sd) * iP;
+      const bi = Math.floor(s), w = s - bi;
+      const bu = Math.floor(s * 0.2);
+      const b1 = latNoise(bi * 1.618 + 0.5, bi * 2.717 + 3.5, _n3)[0];
+      const b2 = latNoise(bu * 1.618 + 11.5, bu * 2.717 + 2.5, _n3)[0];
+      const amp = (0.20 + 1.90 * b1 * b1) * (0.34 + 1.40 * b2);
+      const riser = 0.18 + 0.40 * b1;
+      const t = w < riser ? w / riser : 1;
+      const A = (pitch / cd) * Math.min(amp * 0.95, CLF_BENCH) * rocky * gBench;
+      const dD = (w < riser ? 1 / riser : 0) - 1;
+      dh += A * (t - w); dgx += A * dD * sx; dgz += A * dD * sz;
+    }
+
+    if (gRib > 0.004) {
+      const fu = 1 / 86, fh = 1 / 24, fs = 1 / 900;
+      const r = this._ridgedD(u * fu + h * fs, h * fh + v * 0.0013, 2, 0.5);
+      const rv = r[0], ry = r[1], rz = r[2];
+      const A = CLF_RIB * rocky * gRib;
+      dh += (rv - 0.33) * A;
+      dgx += A * (ry * (c1 * fu + gx * fs) + rz * (gx * fh - s1 * 0.0013));
+      dgz += A * (ry * (s1 * fu + gz * fs) + rz * (gz * fh + c1 * 0.0013));
+    }
+
+    if (gJoint > 0.004) {
+      const A = CLF_JNT * rocky * gJoint;
+      const fa = 1 / 38, fb = 1 / 64;
+      const ra = this._ridgedD((u * 0.82 + h * 0.75) * fa, (h * 0.55 - u * 0.60) * fb, 2, 0.5);
+      const av = ra[0], ay = ra[1], az = ra[2];
+      dh += (av - 0.33) * A;
+      dgx += A * (ay * (c1 * 0.82 + gx * 0.75) * fa + az * (gx * 0.55 - c1 * 0.60) * fb);
+      dgz += A * (ay * (s1 * 0.82 + gz * 0.75) * fa + az * (gz * 0.55 - s1 * 0.60) * fb);
+      const B = A * 0.8, fc = 1 / 44, fd = 1 / 70;
+      const rb = this._ridgedD((u * 0.82 - h * 0.75) * fc, (h * 0.55 + u * 0.60) * fd, 1, 0.5);
+      const bv = rb[0], by = rb[1], bz = rb[2];
+      dh += (bv - 0.33) * B;
+      dgx += B * (by * (c1 * 0.82 - gx * 0.75) * fc + bz * (gx * 0.55 + c1 * 0.60) * fd);
+      dgz += B * (by * (s1 * 0.82 - gz * 0.75) * fc + bz * (gz * 0.55 + s1 * 0.60) * fd);
+    }
+
+    // Soft clip, relative to the surface being perturbed. A ridged derivative
+    // is heavy-tailed — it spikes to five times its typical value — and the
+    // members here are deliberately sized to be a large fraction of the macro
+    // gradient, so those spikes land at two or three times it. On the mesh that
+    // folds; in the fragment program the shading normal tips past horizontal
+    // and the rock/snow threshold goes binary, which is the shattered
+    // black-and-white foil the mid-field cliffs came back as. A hard clamp puts
+    // a visible crease along its own contour, so this is the smooth one.
+    const m2 = Math.sqrt(dgx * dgx + dgz * dgz);
+    if (m2 > 1e-6) {
+      const lim = lim0 * (0.40 + Math.sqrt(gx * gx + gz * gz));
+      const k = lim / Math.sqrt(lim * lim + m2 * m2);
+      dh *= k; dgx *= k; dgz *= k;
+    }
+
+    out[0] = dh; out[1] = dgx; out[2] = dgz;
     return out;
   }
 
@@ -1773,6 +2109,76 @@ vec3 terrRidgedD( vec2 p, int oct, float gain ) {
   return vec3( s / nrm, g / nrm );
 }
 
+// Cliff structure. The CPU twin is Terrain._cliff; the reasoning is in the
+// CLF_* block at the top of this file. 'gm' must be the *macro* gradient, i.e.
+// before any detail band, because the sampling domain differentiates through it.
+void terrCliff( vec2 p, float h, vec2 gm, float rocky,
+                float gBench, float gRib, float gJoint, float lim0,
+                out float dh, out vec2 dg ) {
+  dh = 0.0;
+  dg = vec2( 0.0 );
+  if ( rocky <= 0.004 ) return;
+
+  float dm = latNoise( p * 0.00042 ).x;
+  float dip = 0.34 + 0.42 * dm;
+  float th  = 1.10 + 2.60 * dm;
+  float c1 = cos( th ), s1 = sin( th );
+  float u =  p.x * c1 + p.y * s1;
+  float v = -p.x * s1 + p.y * c1;
+  vec2 eu = vec2( c1, s1 ), ev = vec2( -s1, c1 );
+  float cd = cos( dip ), sd = sin( dip );
+
+  if ( gBench > 0.004 ) {
+    float pitch = ${CLF_PITCH.toFixed(1)} * ( 0.62 + 0.85 * dm );
+    float iP = 1.0 / pitch;
+    float s = ( h * cd + v * sd ) * iP;
+    vec2 dsdp = ( gm * cd + ev * sd ) * iP;
+    float bi = floor( s ), w = s - bi;
+    float bu = floor( s * 0.2 );
+    float b1 = latNoise( vec2( bi * 1.618 + 0.5, bi * 2.717 + 3.5 ) ).x;
+    float b2 = latNoise( vec2( bu * 1.618 + 11.5, bu * 2.717 + 2.5 ) ).x;
+    float amp = ( 0.20 + 1.90 * b1 * b1 ) * ( 0.34 + 1.40 * b2 );
+    float riser = 0.18 + 0.40 * b1;
+    float t = w < riser ? w / riser : 1.0;
+    float A = ( pitch / cd ) * min( amp * 0.95, ${CLF_BENCH.toFixed(3)} ) * rocky * gBench;
+    dh += A * ( t - w );
+    dg += A * ( ( w < riser ? 1.0 / riser : 0.0 ) - 1.0 ) * dsdp;
+  }
+
+  if ( gRib > 0.004 ) {
+    const float fu = ${(1 / 86).toFixed(9)}, fh = ${(1 / 24).toFixed(9)}, fs = ${(1 / 900).toFixed(9)};
+    vec3 r = terrRidgedD( vec2( u * fu + h * fs, h * fh + v * 0.0013 ), 2, 0.5 );
+    float A = ${CLF_RIB.toFixed(3)} * rocky * gRib;
+    dh += ( r.x - 0.33 ) * A;
+    dg += A * ( r.y * ( eu * fu + gm * fs ) + r.z * ( gm * fh + ev * 0.0013 ) );
+  }
+
+  if ( gJoint > 0.004 ) {
+    float A = ${CLF_JNT.toFixed(3)} * rocky * gJoint;
+    const float fa = ${(1 / 38).toFixed(9)}, fb = ${(1 / 64).toFixed(9)};
+    vec3 ra = terrRidgedD( vec2( ( u * 0.82 + h * 0.75 ) * fa,
+                                 ( h * 0.55 - u * 0.60 ) * fb ), 2, 0.5 );
+    dh += ( ra.x - 0.33 ) * A;
+    dg += A * ( ra.y * ( eu * 0.82 + gm * 0.75 ) * fa
+              + ra.z * ( gm * 0.55 - eu * 0.60 ) * fb );
+    float B = A * 0.8;
+    const float fc = ${(1 / 44).toFixed(9)}, fd = ${(1 / 70).toFixed(9)};
+    vec3 rb = terrRidgedD( vec2( ( u * 0.82 - h * 0.75 ) * fc,
+                                 ( h * 0.55 + u * 0.60 ) * fd ), 1, 0.5 );
+    dh += ( rb.x - 0.33 ) * B;
+    dg += B * ( rb.y * ( eu * 0.82 - gm * 0.75 ) * fc
+              + rb.z * ( gm * 0.55 + eu * 0.60 ) * fd );
+  }
+
+  // Soft clip relative to the surface being perturbed — see the JS twin.
+  float m2 = length( dg );
+  if ( m2 > 1e-6 ) {
+    float lim = lim0 * ( 0.40 + length( gm ) );
+    float k = lim * inversesqrt( lim * lim + m2 * m2 );
+    dh *= k; dg *= k;
+  }
+}
+
 // Background ranges beyond the baked map. The CPU twin lives in _sample().
 // Outside a 8.2 km square the baked texture can only replicate its edge texel,
 // which is the -42 m taper plain — a dead-flat table stretching to the 19.7 km
@@ -1864,9 +2270,25 @@ const GLSL_FRAG_REFINE = /* glsl */`
     // so it lives all the way to the horizon and is what puts ribs, gullies and
     // snow-holding ledges on a distant face. Fragment-only by necessity: the
     // outer clipmap rings are 25-100 m per cell and could never displace it.
+    // ...but plan-isotropic, so on a wall it renders as a vertical comb (see
+    // the CLF_* block). Half of its energy on bedrock is handed to terrCliff,
+    // which puts the same relief in at angles that are not the fall line.
     if ( fD > 0.004 && mrocky > 0.004 ) {
-      float amp = 6.2 * mrocky * fD * ( 1.0 / 22.0 );
+      float amp = 6.2 * mrocky * fD * ( 1.0 - 0.5 * mrocky ) * ( 1.0 / 22.0 );
       mg += terrRidgedD( P.xz * ( 1.0 / 22.0 ), 3, 0.5 ).yz * amp;
+    }
+
+    // Cliff structure: benches, contour lineation, conjugate joints. Fragment
+    // side is the important one — the walls that read as drape are 1.5-3 km
+    // out, where every clipmap ring is 12-100 m per cell and no displacement
+    // band survives, so the whole surface reading comes from here.
+    if ( mrocky > 0.004 ) {
+      float cdh; vec2 cdg;
+      terrCliff( P.xz, md.x, mMacroG, mrocky,
+                 TERR_BAND( 26.0 ), TERR_BAND( 34.0 ), TERR_BAND( 30.0 ),
+                 mix( ${CLF_LIM_V}, ${CLF_LIM_F}, smoothstep( 700.0, 1500.0, snViewDist ) ),
+                 cdh, cdg );
+      mg += cdg;
     }
 
     float mSteep = atan( length( mg ) );
@@ -1984,6 +2406,31 @@ const GLSL_DISPLACE_BODY = /* glsl */`
     vec3 r = terrRidgedD( P * f, 4, 0.52 );
     h += ( r.x - 0.33 ) * amp;
     g += r.yz * amp * f;
+  }
+  // Cliff structure — the near-field half of the fragment block. Real
+  // displacement, so it moves the silhouette of a buttress within ~2 km; past
+  // that the rings cannot carry a 30 m feature and only the shading normal
+  // survives. Differentiated through the *macro* gradient, hence mgrad.
+  //
+  // The two ridged members run at ~a third of their fragment-side amplitude
+  // here, and that split is load-bearing rather than cosmetic. Their gradient
+  // is a fixed multiple of the macro gradient (that is the whole point of
+  // sampling against elevation), and at the amplitude a 2 km wall needs — where
+  // the ring is 25 m per cell and the fragment program is doing the shading
+  // anyway — the same term is roughly twice the base slope. On a 0.4 m ring
+  // 200 m from the camera that folds the mesh, and a folded heightfield is a
+  // field of spikes: the 'ridge' framing came back as shattered foil. A normal
+  // cannot fold, so the fragment side keeps the full amount; the geometry gets
+  // what it can carry. The bench is exempt — it is monotone along the bed
+  // normal by construction and can only flatten a terrace and steepen a riser.
+  if ( rocky > 0.002 ) {
+    float cdh; vec2 cdg;
+    float cFar = smoothstep( 2000.0, 1000.0, fd );
+    terrCliff( P, mdata.x, mgrad, rocky,
+               cFar, cFar * ${CLF_VTX_RIB}, smoothstep( 1500.0, 800.0, fd ) * ${CLF_VTX_JNT},
+               ${CLF_LIM_V}, cdh, cdg );
+    h += cdh;
+    g += cdg;
   }
   // Slope used for the rock blend. Deliberately excludes the metre-scale
   // detail: a mask keyed on the full normal snaps to LOD triangle edges,
