@@ -44,6 +44,9 @@ const SYSTEMS = [terrain, sky, scatter, skier, spray, tracks, postfx, audio, hud
 
 function update(dt) {
   controls.update(dt, state);
+  // Capture tools (tools/flyby.mjs) drive a scripted run by pinning the input
+  // after the live sampler has written it.
+  if (harness.__scripted) Object.assign(state.input, harness.__scripted);
   physics.update(dt, state);
   chaseCam.update(dt, state);
   for (const s of SYSTEMS) s.update?.(dt, state);
