@@ -708,7 +708,7 @@ export class Terrain {
         const scal = 0.55 + 0.9 * sc[0];
         const inv = 1 / Math.max(slope, 1e-4);
         const lee = clamp(-(dx * inv) * WIND_X - (dz * inv) * WIND_Z, 0, 1);
-        const camp = -2 + 12 * lee * lee;
+        const camp = -2.6 + 18 * lee * lee;
         mh += ca * cb * scal * camp;
         mgx += ((-dca * cvx * cb) * scal + (ca * cb) * 0.9 * sc[1] * (1 / 70)) * camp;
         mgy += ((-dca * cvz * cb) * scal + (ca * cb) * 0.9 * sc[2] * (1 / 70)) * camp;
@@ -728,14 +728,14 @@ export class Terrain {
       const r = this._ridgedD(x * f, z * f, 2, 0.5);
       mh += (r[0] - 0.36) * amp;
       mgx += r[1] * amp * f; mgy += r[2] * amp * f;
-      const amp2 = 10 * rocky, f2 = 1 / 85;
+      const amp2 = 7 * rocky, f2 = 1 / 85;
       const r2 = this._ridgedD(x * f2, z * f2, 1, 0.5);
       mh += (r2[0] - 0.33) * amp2;
       mgx += r2[1] * amp2 * f2; mgy += r2[2] * amp2 * f2;
     }
     // ridged rock ribs
     {
-      const amp = 15 * rocky, f = 1 / 74;
+      const amp = 10.2 * rocky, f = 1 / 74;
       const r = this._ridgedD(x * f, z * f, 4, 0.52);
       mh += (r[0] - 0.33) * amp;
       mgx += r[1] * amp * f; mgy += r[2] * amp * f;
@@ -1085,7 +1085,7 @@ const GLSL_FRAG_REFINE = /* glsl */`
       mg += terrRidgedD( P.xz * ( 1.0 / 200.0 ), 2, 0.5 ).yz * ( 24.0 * mrocky / 200.0 );
       float fC = smoothstep( 5000.0, 3000.0, mfd );
       if ( fC > 0.004 ) {
-        mg += terrRidgedD( P.xz * ( 1.0 / 85.0 ), 1, 0.5 ).yz * ( 10.0 * mrocky * fC / 85.0 );
+        mg += terrRidgedD( P.xz * ( 1.0 / 85.0 ), 1, 0.5 ).yz * ( 7.0 * mrocky * fC / 85.0 );
       }
     }
     float fA = smoothstep( 2400.0, 1200.0, mfd );
@@ -1095,7 +1095,7 @@ const GLSL_FRAG_REFINE = /* glsl */`
       mg += terrFbmD( P.xz * ( 1.0 / 64.0 ), 4, 0.5 ).yz * amp;
     }
     if ( fB > 0.004 && mrocky > 0.004 ) {
-      float amp = 17.0 * mrocky * fB * ( 1.0 / 58.0 );
+      float amp = 11.5 * mrocky * fB * ( 1.0 / 58.0 );
       mg += terrRidgedD( P.xz * ( 1.0 / 58.0 ), 4, 0.52 ).yz * amp;
     }
 
@@ -1111,7 +1111,7 @@ const GLSL_FRAG_REFINE = /* glsl */`
       vec3 sc = latNoise( P.xz * ( 1.0 / 70.0 ) );
       float scal = 0.55 + 0.9 * sc.x;
       float lee = clamp( dot( -mMacroG / max( mslope, 1e-4 ), vec2( ${WIND_X}, ${WIND_Z} ) ), 0.0, 1.0 );
-      float camp = -2.0 + 12.0 * lee * lee;
+      float camp = -2.6 + 18.0 * lee * lee;
       mg += ( ( -dca * mc * cb ) * scal + ( ca * cb ) * 0.9 * sc.yz * ( 1.0 / 70.0 ) ) * camp;
       cornAmt = ca * cb * scal * lee;
     }
@@ -1162,7 +1162,7 @@ const GLSL_DISPLACE_BODY = /* glsl */`
     g += r.yz * amp * f;
     float fC = smoothstep( 5000.0, 3000.0, fd );
     if ( fC > 0.004 ) {
-      float amp2 = 10.0 * rocky * fC, f2 = 1.0 / 85.0;
+      float amp2 = 7.0 * rocky * fC, f2 = 1.0 / 85.0;
       vec3 r2 = terrRidgedD( P * f2, 1, 0.5 );
       h += ( r2.x - 0.33 ) * amp2;
       g += r2.yz * amp2 * f2;
@@ -1189,7 +1189,7 @@ const GLSL_DISPLACE_BODY = /* glsl */`
       vec3 sc = latNoise( P * ( 1.0 / 70.0 ) );
       float scal = 0.55 + 0.9 * sc.x;
       float lee = clamp( dot( -mgrad / max( slope, 1e-4 ), vec2( ${WIND_X}, ${WIND_Z} ) ), 0.0, 1.0 );
-      float camp = -2.0 + 12.0 * lee * lee;
+      float camp = -2.6 + 18.0 * lee * lee;
       cornH = ca * cb * scal * camp;
       cornG = ( ( -dca * mcgrad * cb ) * scal + ( ca * cb ) * 0.9 * sc.yz * ( 1.0 / 70.0 ) ) * camp;
       cornAmt = ca * cb * scal * lee;
@@ -1204,7 +1204,7 @@ const GLSL_DISPLACE_BODY = /* glsl */`
     g += r.yz * amp * f;
   }
   if ( fadeB > 0.002 && rocky > 0.002 ) {
-    float amp = 17.0 * rocky * fadeB;
+    float amp = 11.5 * rocky * fadeB;
     float f = 1.0 / 58.0;
     vec3 r = terrRidgedD( P * f, 4, 0.52 );
     h += ( r.x - 0.33 ) * amp;

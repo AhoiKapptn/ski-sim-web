@@ -7,11 +7,18 @@
  * Pipeline (HDR linear until the grade pass, display-referred after it):
  *
  *   scene  ──► sceneRT (half-float + depth)     camera jittered (Halton 2,3)
- *          ──► TAA resolve   reprojected history, YCoCg variance clipping;
- *                            also applies exposure, so everything downstream
- *                            is sensor-referred rather than scene-referred
- *          ──► UnrealBloom   threshold 2.6 exposed-linear, tight pyramid: only
- *                            specular glints and the sun disc, never the snow
+ *          ──► TAA resolve   reprojected history (through the JITTERED inverse
+ *                            view-projection, so the half-pixel offset the
+ *                            jitter just applied is undone), YCoCg variance
+ *                            clipping, then a second output step that adds the
+ *                            current frame's high-frequency residual back on
+ *                            top — that is what keeps snow sparkle alive
+ *                            through a temporal filter. Also applies exposure,
+ *                            so everything downstream is sensor-referred.
+ *          ──► UnrealBloom   threshold 2.6 exposed-linear, with a firefly clamp
+ *                            and a soft knee on the high pass and an explicitly
+ *                            authored (narrow) pyramid: only specular glints and
+ *                            the sun disc, never the snow, and never an orb
  *          ──► DOF           depth CoC, golden-angle gather bokeh. Deep focus:
  *                            the far field is essentially sharp (no CoC at all
  *                            inside 1 km, ~1 px at the horizon), the near field
@@ -48,7 +55,27 @@ import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 // GLSL. All values are deliberately conservative.
 // -----------------------------------------------------------------------------
 export const PARAMS = {
-  taa: { enabled: true, feedback: 0.89, clipScale: 1.0, sharpen: 0.20 },
+  // TAA. `feedback` is the weight of the reprojected history. It used to be
+  // 0.89 — a nine-frame box average — which measured out at a 21–26% loss of
+  // snow micro-detail against the un-antialiased render, i.e. TAA was quietly
+  // deleting a fifth of the one thing the snow shader exists to produce.
+  //
+  // `detail` is the fix that matters. A snow sparkle only exists in the *current*
+  // frame: the history at that texel is dim, so any feedback above ~0.5 blends it
+  // away no matter how the neighbourhood clamp is tuned. So the resolve writes a
+  // clean, stable temporal average into the history buffer, and the *output* step
+  // adds the current frame's high-frequency residual back on top at full
+  // amplitude. Because the injection happens after the history write it cannot
+  // accumulate, which is what makes it safe to run at a high amount.
+  taa: {
+    enabled: true,
+    feedback: 0.78,
+    clipScale: 1.0,
+    sharpen: 0.10,      // pre-blend sharpen; mostly superseded by `detail`
+    detail: 0.55,       // current-frame high-frequency re-injected on output
+    detailLimit: 0.22,  // soft ceiling on that residual, as a fraction of level
+    clipRelax: 0.45,    // extra history rejection when the clamp had to work hard
+  },
 
   // SMAA on top of TAA is belt-and-braces that costs real sharpness: the jitter
   // already resolves every edge in the frame, and running a second morphological
@@ -62,12 +89,32 @@ export const PARAMS = {
     enabled: true,
     // Threshold is in *exposed* linear units. Sunlit snow lands around 1.0–1.6
     // after exposure, so 2.6 means only genuine speculars, the sun disc and ice
-    // glints bloom — never the snow field itself. Radius is deliberately tight:
-    // a wide pyramid turns every snow sparkle into a 25 px orb and the frame
-    // starts to look like a dirty lens.
+    // glints bloom — never the snow field itself.
+    //
+    // Threshold alone is not enough, and this is the mistake this pass used to
+    // make. A snow sparkle is a *single pixel* at 6–15x white; the stock
+    // UnrealBloom high-pass passes that pixel through at FULL value once it is
+    // over threshold, and the stock pyramid then weights the 1/32-res mip at
+    // 0.44. One pixel of ice therefore came back as a 25 px soft orb — the
+    // dirty-lens look, and the one effect a viewer can name on sight. Three
+    // things fix it and all three are needed:
+    //   * `clamp`  — fireflies are clipped to this many units of exposed white
+    //                BEFORE the high pass, so no single pixel can dominate;
+    //   * soft knee — the high pass subtracts the threshold instead of passing
+    //                the whole texel, so a value just over the line contributes
+    //                almost nothing (see BLOOM_HIGHPASS_FRAG);
+    //   * `mipWeights` — the pyramid is authored explicitly rather than via the
+    //                `radius` mirror trick, so the two widest mips (which are
+    //                what actually make an orb) are almost switched off. The
+    //                sun disc is thousands of units and still blooms through
+    //                them; a 3 px sparkle does not.
     threshold: 2.6,
-    strength: 0.18,
-    radius: 0.30,
+    strength: 0.10,
+    radius: 0.0,        // pyramid shape comes from mipWeights, not this
+    clamp: 8.0,         // × exposed white — firefly ceiling on the bloom input
+    knee: 1.1,          // width of the soft knee, in exposed-linear units
+    // half, 1/4, 1/8, 1/16, 1/32 resolution mips
+    mipWeights: [1.0, 0.42, 0.16, 0.06, 0.03],
   },
 
   // Deep focus. A chase camera on a 35 mm-equivalent lens stopped down to f/8
@@ -105,28 +152,66 @@ export const PARAMS = {
     // Applied before bloom (sensor-referred). Mid grey after this should sit
     // near 0.18 linear; sunlit snow around 1.0–1.6.
     exposure: 0.88,
-    trim: 1.0,          // small post-bloom exposure trim
+    // Post-bloom trim. Held at 1.0 the mid-field piste sat at 244 with its top
+    // decile at 254 — snow pinned against paper white with nowhere left to show
+    // relief, which is most of why the frame read "washed". Steep's screenshots
+    // put lit snow at 182–229 and an alpine photograph at 211–215. This is a
+    // deliberately small −0.07 stop: enough to unpin the highlights without
+    // fighting whatever the lighting pass does to the sun.
+    trim: 0.952,        // small post-bloom exposure trim
     // Uchimura "GT" tonemap. m/l give a linear section through mid grey (0.18
     // maps to 0.18) and then a long exponential shoulder — linear 1.0 lands at
     // 231/255 and 2.0 at 251/255, so sunlit snow still has two stops of
     // separation instead of a single flat white.
-    P: 1.0, a: 1.0, m: 0.16, l: 0.30, c: 1.25, b: 0.0,
-    temperature: 0.010,   // + warms
+    P: 1.0, a: 1.0, m: 0.16, l: 0.30, c: 1.45, b: 0.0,
+    // White balance. Was +0.010 warm on top of a warm split tone, which double
+    // counted: snow measured 17 codes warm. The remaining bias is a hair of
+    // warmth, which is what direct sun on snow actually is once the blue sky
+    // fill is accounted for.
+    temperature: 0.002,   // + warms
     tint: -0.004,
     // ASC-CDL, applied in log space (see the shader).
     lift: [-0.002, 0.0, 0.006],
     gamma: [1.0, 1.0, 1.006],
-    gain: [1.004, 1.0, 0.996],
+    gain: [1.000, 1.0, 1.000],
     // Split tone. Snow shadows are already lit by a blue sky, so the cool push
     // here is tiny — any more and the shade goes lavender.
-    shadowTint: [0.982, 0.996, 1.020],   // cool shadows
-    highTint: [1.018, 1.004, 0.982],     // warm highlights
-    contrast: 1.075,
+    // Cool shadows. The old value put G *below* the R→B line, which is a magenta
+    // bias: measured on the `trees` framing our shaded snow came out 113,128,180
+    // — R→B midpoint 146, G 18 codes under it, i.e. violet. Steep's shaded snow
+    // measures 84,107,129, with G sitting exactly on the line: clean blue, no
+    // magenta. G is now a shade ABOVE the line, so shade reads blue-cyan the way
+    // sky-lit snow actually does.
+    shadowTint: [0.973, 1.000, 1.027],   // cool shadows
+    highTint: [1.018, 1.004, 0.982],     // warm *mid*-highlights (rock, trees)
+    // Log-luma window over which the split tone fades back to neutral. Sunlit
+    // snow sits at ~0.83 in this log space, mid-tone rock and conifer around
+    // 0.55–0.68, so this leaves the warm push exactly where it belongs and
+    // takes it off the snow. See the comment in GRADE_FRAG.
+    highNeutral: [0.715, 0.815],
+    // Where the split tone crosses from shadowTint to highTint, in log luma.
+    // This used to start at 0.30, which put the *mid-tones* — rock faces, lit
+    // conifers, the whole middle of the frame — on the warm side of the split.
+    // Measured full-frame, our image averaged B−R +5 where Steep's screenshots
+    // average +27 to +31 and an alpine photograph +37: AAA alpine frames are
+    // overwhelmingly cool everywhere except the sunlit highlights, which are
+    // neutral. Starting the crossover at 0.52 puts the mids back in the cool
+    // half, and highNeutral above still keeps sunlit snow neutral.
+    splitWindow: [0.52, 0.90],
+    // Magenta guard for the cool end — see GRADE_FRAG. 0 disables it.
+    shadeHue: 0.40,
+    contrast: 1.115,
     sCurve: 0.16,           // extra mid-tone slope; decays to 0 at both ends
     pivot: 0.553,           // log position of 0.18 mid grey
-    saturation: 1.05,
+    saturation: 1.01,
     highlightDesat: 0.30,   // pull extreme highlights toward neutral
-    chromatic: 0.40,        // px of lateral CA at the corners
+    // Lateral CA. Was 0.40 px, which is fine on any continuous edge and wrong on
+    // a snow field: every one-pixel sparkle picked up a red side and a blue side
+    // and the mid-field filled with what reads as magenta compression confetti.
+    // Measured against the same frame with CA off, that was the single most
+    // visible remaining artefact. A sixth of a pixel still separates the corners
+    // of a long edge without ever fringing a point highlight.
+    chromatic: 0.16,        // px of lateral CA at the corners
   },
 
   film: {
@@ -180,6 +265,7 @@ uniform mat4  uReproject;      // prevViewProj * inverse(currViewProj)
 uniform vec2  uTexel;
 uniform float uFeedback;
 uniform float uClipScale;
+uniform float uClipRelax;
 uniform float uSharpen;
 uniform float uValid;          // 0 on the first frame / after a resize
 uniform float uExposure;       // applied here so bloom sees sensor-referred light
@@ -238,15 +324,72 @@ void main() {
   sharp = max(sharp, vec3(0.0));
 
   float fb = uFeedback * inside * uValid;
-  // Luma-weighted blend: bright fireflies get less weight, so snow speculars
-  // stop crawling instead of strobing.
-  float wc = 1.0 / (1.0 + luma(sharp));
-  float wh = 1.0 / (1.0 + luma(hist));
-  float a = (1.0 - fb) * wc;
-  float b = fb * wh;
-  vec3 outc = (sharp * a + hist * b) / max(1e-5, a + b);
+
+  // The old blend was Karis luma weighting — 1/(1+luma) on each side. That is a
+  // firefly filter, and on a snow field the "fireflies" ARE the subject: every
+  // specular got systematically down-weighted relative to the dull snow around
+  // it, so the sparkle was attenuated by construction. It is gone. What replaces
+  // it is a *clip-distance* rejection: if the neighbourhood clamp had to drag the
+  // history a long way, the history was describing different geometry (an
+  // occlusion edge, a moved specular) and deserves less weight. That kills
+  // ghosting without ever penalising a pixel for being bright.
+  float clipDist = length(hy - cy) / (length(sigma) * uClipScale + 0.06);
+  fb *= 1.0 - uClipRelax * clamp(clipDist, 0.0, 1.0);
+
+  vec3 outc = mix(sharp, hist, fb);
 
   gl_FragColor = vec4(outc, 1.0);
+}
+`;
+
+// Output step of the TAA resolve. Blits the freshly written history and adds the
+// CURRENT frame's high-frequency residual back on top. See PARAMS.taa.detail.
+const TAA_OUT_FRAG = /* glsl */ `
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D tDiffuse;     // resolved history
+uniform sampler2D tCurrent;     // this frame's jittered render (pre-exposure)
+uniform vec2  uTexel;
+uniform float uDetail;
+uniform float uDetailLimit;
+uniform float uExposure;
+${COMMON}
+void main() {
+  vec3 res = texture2D(tDiffuse, vUv).rgb;
+  if (uDetail <= 0.001) { gl_FragColor = vec4(res, 1.0); return; }
+  vec3 c  = texture2D(tCurrent, vUv).rgb;
+  vec3 n  = texture2D(tCurrent, vUv + vec2(0.0, -uTexel.y)).rgb;
+  vec3 s  = texture2D(tCurrent, vUv + vec2(0.0,  uTexel.y)).rgb;
+  vec3 w  = texture2D(tCurrent, vUv + vec2(-uTexel.x, 0.0)).rgb;
+  vec3 e  = texture2D(tCurrent, vUv + vec2( uTexel.x, 0.0)).rgb;
+  vec3 mean4 = (n + s + w + e) * 0.25;
+
+  // LUMINANCE ONLY. A per-channel residual turns the snow shader's slightly
+  // iridescent sparkle into magenta confetti, because the negative lobe of the
+  // unsharp kernel lands on a different channel than the positive one. A neutral
+  // luminance delta on near-white snow is indistinguishable and cannot fringe.
+  float ym = luma(mean4) * uExposure;
+  float yc = luma(c) * uExposure;
+  float hf = yc - ym;
+
+  // HALO GUARD. Snow sparkle is a single pixel at many times white. Its four
+  // neighbours therefore see a large NEGATIVE residual, and since the sparkle
+  // itself is already clipped at display white, all the viewer gets back is a
+  // dark ring — a bright speck in the raw render arrives on screen as a dirt
+  // speck. Where a neighbour is far brighter than this pixel, we are standing in
+  // that ring, so the injection is switched off.
+  float ymax4 = max(max(luma(n), luma(s)), max(luma(w), luma(e))) * uExposure;
+  hf *= 1.0 - 0.9 * smoothstep(1.8, 5.0, ymax4 / max(yc, 1e-3));
+
+  // Soft limiter, scaled by the local level, and deliberately asymmetric: adding
+  // light to micro-relief is free, but digging a hole next to a highlight is
+  // exactly the artefact above, so the negative side gets a third of the room.
+  float knee = uDetailLimit * (ym + 0.08) * (hf < 0.0 ? 0.35 : 1.0);
+  hf = hf / (1.0 + abs(hf) / max(knee, 1e-4));
+
+  // Flat regions (sky) have no residual, so they gain nothing and cannot band;
+  // snow micro-relief and branch edges get theirs back at full amplitude.
+  gl_FragColor = vec4(max(res + hf * uDetail, vec3(0.0)), 1.0);
 }
 `;
 
@@ -263,6 +406,7 @@ class TAAPass extends Pass {
       uTexel: { value: new THREE.Vector2(1 / 1600, 1 / 900) },
       uFeedback: { value: PARAMS.taa.feedback },
       uClipScale: { value: PARAMS.taa.clipScale },
+      uClipRelax: { value: PARAMS.taa.clipRelax },
       uSharpen: { value: PARAMS.taa.sharpen },
       uValid: { value: 0 },
       uExposure: { value: PARAMS.grade.exposure },
@@ -274,12 +418,16 @@ class TAAPass extends Pass {
       depthTest: false, depthWrite: false,
     });
     this.copyMaterial = new THREE.ShaderMaterial({
-      uniforms: { tDiffuse: { value: null } },
+      uniforms: {
+        tDiffuse: { value: null },
+        tCurrent: { value: source },
+        uTexel: this.uniforms.uTexel,
+        uDetail: { value: PARAMS.taa.detail },
+        uDetailLimit: { value: PARAMS.taa.detailLimit },
+        uExposure: { value: PARAMS.grade.exposure },
+      },
       vertexShader: VERT,
-      fragmentShader: `
-        precision highp float;
-        varying vec2 vUv; uniform sampler2D tDiffuse;
-        void main(){ gl_FragColor = texture2D(tDiffuse, vUv); }`,
+      fragmentShader: TAA_OUT_FRAG,
       depthTest: false, depthWrite: false,
     });
     this.fsq = new FullScreenQuad(this.material);
@@ -316,6 +464,7 @@ class TAAPass extends Pass {
     this.uniforms.tHistory.value = src.texture;
     this.uniforms.uFeedback.value = PARAMS.taa.feedback;
     this.uniforms.uClipScale.value = PARAMS.taa.clipScale;
+    this.uniforms.uClipRelax.value = PARAMS.taa.clipRelax;
     this.uniforms.uSharpen.value = PARAMS.taa.sharpen;
     this.uniforms.uExposure.value = PARAMS.grade.exposure;
 
@@ -324,6 +473,10 @@ class TAAPass extends Pass {
     this.fsq.render(renderer);
 
     this.copyMaterial.uniforms.tDiffuse.value = dst.texture;
+    this.copyMaterial.uniforms.tCurrent.value = this.source;
+    this.copyMaterial.uniforms.uDetail.value = PARAMS.taa.detail;
+    this.copyMaterial.uniforms.uDetailLimit.value = PARAMS.taa.detailLimit;
+    this.copyMaterial.uniforms.uExposure.value = PARAMS.grade.exposure;
     this.fsq.material = this.copyMaterial;
     renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
     this.fsq.render(renderer);
@@ -361,6 +514,50 @@ class BlitPass extends Pass {
   }
   dispose() { this.material.dispose(); this.fsq.dispose(); }
 }
+
+// -----------------------------------------------------------------------------
+// Bloom high pass, replacing three's LuminosityHighPassShader.
+//
+// The stock one is `mix(black, texel, smoothstep(thr, thr + 0.01, luma))`: a
+// hard gate that passes the ENTIRE texel value the instant it crosses the line.
+// A single snow sparkle at 12x white therefore injects 12 units into the bloom
+// pyramid, and after the widest mips smear it around you get a soft orb bigger
+// than the skier's head. Two changes:
+//
+//   1. clamp the input to `uClamp` units first, so no lone pixel can dominate;
+//   2. a soft knee that passes the energy ABOVE the threshold rather than the
+//      whole value, so contribution ramps from zero instead of stepping.
+//
+// The sun disc sits thousands of units over the line and is unaffected by both.
+// -----------------------------------------------------------------------------
+const BLOOM_HIGHPASS_FRAG = /* glsl */ `
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D tDiffuse;
+uniform float luminosityThreshold;
+uniform float smoothWidth;
+uniform float uClamp;
+${COMMON}
+void main() {
+  vec3 c = max(texture2D(tDiffuse, vUv).rgb, vec3(0.0));
+
+  // Firefly ceiling, applied on the channel max so it never shifts hue.
+  float m = max(max(c.r, c.g), c.b);
+  c *= m > uClamp ? uClamp / m : 1.0;
+
+  float v = luma(c);
+  float thr = luminosityThreshold;
+  float knee = max(smoothWidth, 1e-3);
+
+  // Soft-knee high pass: quadratic through the knee, then a straight
+  // (v - thr) above it. Returns the *excess* over the threshold.
+  float soft = clamp(v - thr + knee, 0.0, 2.0 * knee);
+  soft = soft * soft / (4.0 * knee);
+  float contrib = max(soft, v - thr) / max(v, 1e-4);
+
+  gl_FragColor = vec4(c * clamp(contrib, 0.0, 1.0), 1.0);
+}
+`;
 
 // -----------------------------------------------------------------------------
 // Depth of field — golden-angle gather with a CoC-weighted kernel.
@@ -534,6 +731,9 @@ uniform vec2  uWhiteBalance;
 uniform vec3  uLift, uGamma, uGain;
 uniform vec3  uShadowTint, uHighTint;
 uniform float uContrast, uPivot, uSaturation, uHighDesat, uSCurve;
+uniform vec2  uHighNeutral;   // log-luma window over which the split tone → 1.0
+uniform vec2  uShadeHue;      // x = magenta-guard amount, y = luma the guard fades out at
+uniform vec2  uSplitWindow;   // log-luma crossover from shadowTint to highTint
 uniform float uChromatic;
 uniform vec2  uTexel;
 ${COMMON}
@@ -607,8 +807,40 @@ void main() {
   // gain bite. Driven off luminance so it never shifts hue.
   float sd = dot(lg, vec3(0.3333)) - uPivot;
   lg = max(lg + uSCurve * sd * exp(-sd * sd * 11.0), vec3(0.0));
-  float w = smoothstep(0.30, 0.86, dot(lg, vec3(0.3333)));
-  lg *= mix(uShadowTint, uHighTint, w);              // split tone
+  // --- split tone, with a HIGHLIGHT NEUTRAL rolloff --------------------------
+  // A two-point warm-highlight / cool-shadow split is the standard look and on
+  // most scenes it works. On snow it does not, and this grade fell into the
+  // trap: on an alpine frame the *subject* lives in the highlights, so "warm the
+  // highlights" means "make all the snow beige". Measured, direct-sun snow was
+  // landing at 254,247,237 — B−R of −17, a cream no reference has. The same
+  // measurement on an alpine photograph gives B−R +10, and on Steep's own
+  // screenshots −5 to +1: neutral, within a few codes either way.
+  //
+  // So the tint now ramps UP through the mid-tones — rock faces, lit conifers,
+  // the jacket, where warmth reads as sunlight — and then ramps back OUT to
+  // unity above uHighNeutral.x, which is exactly where snow sits. That is also
+  // what film does at the shoulder: the dye layers saturate together and the
+  // curve converges on neutral. The split-tone amplitudes are untouched; it is
+  // the *window* that was wrong.
+  float lv = dot(lg, vec3(0.3333));
+  float w = smoothstep(uSplitWindow.x, uSplitWindow.y, lv);
+  float neu = smoothstep(uHighNeutral.x, uHighNeutral.y, lv);
+  lg *= mix(mix(uShadowTint, uHighTint, w), vec3(1.0), neu);
+  // --- cool-end magenta guard ----------------------------------------------
+  // Sky-lit snow shade must read blue-CYAN. Measured by hue angle, ours sat at
+  // 226 deg — violet — against 209 deg for Steep's shaded snow and 210-215 for
+  // alpine photographs. The green channel was sitting well under the R→B line,
+  // which is the definition of a magenta cast. This lifts G back toward that
+  // line, and only ever lifts it: it cannot invent a green cast, it does nothing
+  // to anything that is not blue-dominant (so sunlit snow, rock and the jacket
+  // are untouched), and it fades out in the highlights. Most of the violet comes
+  // from the ambient term upstream, so this is deliberately a partial pull —
+  // enough to move the hue a third of the way to reference without flattening
+  // whatever the lighting pass does next.
+  float bDom = clamp((lg.b - lg.r) / 0.05, 0.0, 1.0);
+  float lowEnd = 1.0 - smoothstep(uHighNeutral.x, uHighNeutral.y, lv);
+  lg.g += max((lg.r + lg.b) * 0.5 - lg.g, 0.0) * uShadeHue.x * bDom * lowEnd;
+
   float Yl = luma(lg);
   lg = mix(vec3(Yl), lg, uSaturation);
 
@@ -744,6 +976,26 @@ export function createPostFX(renderer, scene, camera) {
     new THREE.Vector2(W, H), PARAMS.bloom.strength, PARAMS.bloom.radius, PARAMS.bloom.threshold);
   bloomPass.enabled = PARAMS.bloom.enabled;
 
+  // Swap in the clamped soft-knee high pass (see BLOOM_HIGHPASS_FRAG).
+  bloomPass.highPassUniforms.uClamp = { value: PARAMS.bloom.clamp };
+  bloomPass.materialHighPassFilter.uniforms = bloomPass.highPassUniforms;
+  bloomPass.materialHighPassFilter.fragmentShader = BLOOM_HIGHPASS_FRAG;
+  bloomPass.materialHighPassFilter.needsUpdate = true;
+
+  // Author the pyramid explicitly. UnrealBloomPass's `radius` is a mirror-lerp
+  // over a fixed [1, .8, .6, .4, .2] ramp, and even at radius 0.30 it leaves the
+  // 1/32-res mip weighted 0.44 — that mip IS the orb. `radius` is pinned to 0 so
+  // lerpBloomFactor() is the identity and these weights are what actually ships.
+  // The array is only assigned in UnrealBloomPass's constructor, never in
+  // render(), so overwriting it here sticks.
+  const bloomFactors = bloomPass.compositeMaterial.uniforms.bloomFactors.value;
+  const applyMipWeights = () => {
+    for (let i = 0; i < bloomFactors.length; i++) {
+      bloomFactors[i] = PARAMS.bloom.mipWeights[i] ?? 0;
+    }
+  };
+  applyMipWeights();
+
   const dofPass = new ShaderPass(new THREE.ShaderMaterial({
     uniforms: {
       tDiffuse: { value: null },
@@ -798,6 +1050,9 @@ export function createPostFX(renderer, scene, camera) {
       uPivot: { value: g.pivot },
       uSaturation: { value: g.saturation },
       uHighDesat: { value: g.highlightDesat },
+      uHighNeutral: { value: new THREE.Vector2(...g.highNeutral) },
+      uShadeHue: { value: new THREE.Vector2(g.shadeHue, 0) },
+      uSplitWindow: { value: new THREE.Vector2(...g.splitWindow) },
       uChromatic: { value: g.chromatic },
       uTexel: { value: new THREE.Vector2(1 / W, 1 / H) },
     },
@@ -835,6 +1090,7 @@ export function createPostFX(renderer, scene, camera) {
 
   // --- per-frame scratch -----------------------------------------------------
   const projU = new THREE.Matrix4();
+  const projJ = new THREE.Matrix4();
   const viewU = new THREE.Matrix4();
   const currVP = new THREE.Matrix4();
   const currVPInv = new THREE.Matrix4();
@@ -929,19 +1185,20 @@ export function createPostFX(renderer, scene, camera) {
       projU.copy(camera.projectionMatrix);
       viewU.copy(camera.matrixWorldInverse);
       currVP.multiplyMatrices(projU, viewU);
-      currVPInv.copy(currVP).invert();
 
       // --- render the scene with a sub-pixel jitter -------------------------
       const useTAA = PARAMS.taa.enabled;
       taaPass.enabled = useTAA;
       blitPass.enabled = !useTAA;
 
+      projJ.copy(projU);
       if (useTAA) {
         const j = JITTER[jitterIndex % JITTER.length];
         jitterIndex++;
         camera.projectionMatrix.elements[8] += (j[0] * 2) / W;
         camera.projectionMatrix.elements[9] += (j[1] * 2) / H;
         camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+        projJ.copy(camera.projectionMatrix);
       }
 
       renderer.setRenderTarget(sceneRT);
@@ -952,7 +1209,20 @@ export function createPostFX(renderer, scene, camera) {
         camera.projectionMatrixInverse.copy(projU).invert();
       }
 
-      // --- TAA reprojection matrix ------------------------------------------
+      // --- reprojection ------------------------------------------------------
+      // JITTER COMPENSATION. The depth buffer we are about to unproject was
+      // rendered through the JITTERED projection, so the inverse used to recover
+      // a world position must be the jittered one too. It used to be the clean
+      // one, which meant every reprojection carried a half-pixel error — and on a
+      // slope seen at a grazing angle a half pixel of screen error is metres of
+      // error along the view ray. The history then landed on the wrong surface
+      // point, the neighbourhood clamp threw it away, and the resolve fell back
+      // on a blurred current frame. That was a third of the missing detail.
+      //
+      // The *target* space stays unjittered: the history buffer is anchored at
+      // texel centres, not at this frame's sample position.
+      currVPInv.multiplyMatrices(projJ, viewU).invert();
+
       if (!havePrev) prevVP.copy(currVP);
       taaPass.uniforms.uReproject.value.multiplyMatrices(prevVP, currVPInv);
 
@@ -972,8 +1242,10 @@ export function createPostFX(renderer, scene, camera) {
       virtWorld.compose(virtPos, shutterQuat, camScale);
       virtView.copy(virtWorld).invert();
 
+      // Both ends use the *jittered* projection so the jitter cancels exactly and
+      // a stationary camera produces a velocity of precisely zero.
       mbPass.uniforms.uReproject.value
-        .multiplyMatrices(projU, virtView)     // virtual previous viewProj
+        .multiplyMatrices(projJ, virtView)     // virtual previous viewProj
         .multiply(currVPInv);
       mbPass.uniforms.uStrength.value = mbAmount;
       mbPass.uniforms.uMaxPixels.value = PARAMS.motion.maxPixels * cocScale;
@@ -1003,6 +1275,9 @@ export function createPostFX(renderer, scene, camera) {
       bloomPass.strength = PARAMS.bloom.strength;
       bloomPass.radius = PARAMS.bloom.radius;
       bloomPass.threshold = PARAMS.bloom.threshold;
+      bloomPass.highPassUniforms.smoothWidth.value = PARAMS.bloom.knee;
+      bloomPass.highPassUniforms.uClamp.value = PARAMS.bloom.clamp;
+      applyMipWeights();
 
       // Push the whole grade every frame so PARAMS stays live-tuneable.
       const gp = PARAMS.grade, gu = gradePass.uniforms;
@@ -1021,6 +1296,9 @@ export function createPostFX(renderer, scene, camera) {
       gu.uPivot.value = gp.pivot;
       gu.uSaturation.value = gp.saturation;
       gu.uHighDesat.value = gp.highlightDesat;
+      gu.uHighNeutral.value.fromArray(gp.highNeutral);
+      gu.uShadeHue.value.set(gp.shadeHue, 0);
+      gu.uSplitWindow.value.fromArray(gp.splitWindow);
       dofPass.uniforms.uMaxCoC.value = PARAMS.dof.maxCoC * cocScale;
       filmPass.uniforms.uGrainShadow.value = PARAMS.film.grainShadowBias;
 

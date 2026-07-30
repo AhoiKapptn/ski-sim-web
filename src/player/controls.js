@@ -103,7 +103,15 @@ export function createControls() {
 
       const jump = k('Space', 'KeyW', 'ArrowUp') || !!(g && g.jump);
 
-      i.steer = clamp(steer, -1, 1);
+      // --- speed-shaped steering --------------------------------------------
+      // The same stick travel means very different things at 5 m/s and at 30 m/s:
+      // at walking pace you want the whole range to pivot the skis, at 110 km/h
+      // half a stick is a 3 g edge set and the rider darts. So bend the curve, do
+      // not cap it — the ceiling stays at full lock, only the middle gets finer.
+      const fine = clamp(((state.speed || 0) - 10) / 22, 0, 1);
+      const sh = (x) => Math.sign(x) * Math.pow(Math.abs(x), 1 + 0.85 * fine);
+
+      i.steer = clamp(sh(steer), -1, 1);
       i.crouch = clamp(tuck, 0, 1);
       i.brake = clamp(brake, 0, 1);
       i.jump = jump;

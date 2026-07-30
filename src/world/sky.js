@@ -20,15 +20,29 @@ import * as THREE from 'three';
  * directions and interpolates along the view ray, so a distant ridge fogs
  * toward the colour of the sky it is actually standing in front of.
  *
- * The numbers in here are not taste. They are measured with tools/probe.mjs,
- * which renders the real snow shader into a float target and reports linear
- * radiance. The contract it asserts, at the default sun:
+ * The numbers in here are not taste. They are measured with
+ * tools/skylight-probe.mjs, which renders the *whole real scene* into a Float32
+ * target, then renders it a second time with the key light switched off and
+ * reads the same pixels again. Key-to-fill is therefore a measurement of one
+ * surface under two conditions rather than a comparison of two guesses, and it
+ * cannot be fooled by picking a flattering pixel. The contract, at the default
+ * sun (23 deg), median over the hero / closeup / steep framings:
  *
- *     sunlit horizontal snow      0.96 linear
- *     the same snow, shadowed     0.28 linear    -> 3.4:1, 1.8 stops
- *     3 km sunlit ridge           0.48 linear, B/R 1.63 (near snow: 1.25)
- *     +Y IBL irradiance at dusk   B/R 1.37       (shadows stay blue)
- *     solar disc                  2.5-3.4 linear, reddening to R/B 1.5 at dusk
+ *     sunlit horizontal snow          1.00 linear, B/R 1.00   (neutral, not blue)
+ *     the same pixels, key off        0.155 linear, B/R 2.58  (skylight, blue)
+ *                                     -> 6.4 : 1, 2.7 stops, 129 display codes
+ *     snow in a real cast shadow      0.14 linear, B/R 2.48 -> disp 83,89,108
+ *                                        (blue, and it does NOT crush to black)
+ *     sunlit ridge at 3 km            0.48 linear, B/R 1.6
+ *     cloud base / cloud top          0.08-0.24 of top radiance
+ *     sky zenith / horizon            0.20 / 0.40 linear, B/R 4.9 / 1.9
+ *     solar disc                      2.5-3.4 linear, reddening at dusk
+ *
+ * The number that actually decided how the mountain reads was none of those: it
+ * was the *shadow frustum*, which used to be +/-95 m. Nothing past 95 metres
+ * cast a shadow at all, so 85% of the snow in the hero framing sat inside a
+ * 0.2-stop band of received sunlight and 0% was in shade. Sun/shade separation
+ * measured 11 code values because there was no shade in the frame to measure.
  *
  * No textures, no assets, no dependencies beyond `three`.
  */
@@ -67,24 +81,47 @@ const MIE_COEF_SUN = 0.005;
 // ---------------------------------------------------------------------------
 // Key / fill balance. This is the single most important number in the file.
 //
-// Real sunlit snow against its own cast shadow is 2.5-3 stops apart. Measured
-// with tools/probe.mjs (which runs the *actual* snow shader into a float
-// target), the pair we are aiming at is:
+// On a clear day at 2000 m the direct beam puts ~450 W/m2 on horizontal snow
+// and the whole sky dome puts ~90. That is the 5:1 the render has to show.
+// Measured with tools/skylight-probe.mjs, which renders the *actual* scene into
+// a Float32 target and reads the same snow pixels twice — once as rendered and
+// once with the key light switched off — so key:fill is a measurement of one
+// surface, not a comparison of two guesses:
 //
-//     horizontal sunlit snow   ~1.00 linear
-//     the same snow, sun off   ~0.30 linear      -> 3.3:1, 1.7 stops
+//     horizontal sunlit snow            ~1.00 linear
+//     the same pixels, key light off    ~0.16 linear   -> 6.2:1, 2.6 stops
 //
-// 0.30 is a floor we cannot go under from here: snow-material.js adds a
-// hard-coded ambient of `albedo * uShadeTint * 0.48` (~0.234 linear) to every
-// shadowed snow pixel regardless of the sky. Everything sky.js contributes to
-// a shadow — the IBL and the hemisphere fill — is the remaining ~0.07. Driving
-// the IBL any lower than SUN_PEAK/ENV_INTENSITY below buys almost no contrast
-// and starts crushing trees, rocks and the skier, none of which have that
-// floor. (If the shadow floor in snow-material.js ever drops, take
-// ENV_INTENSITY down with it and this file needs no other change.)
-const SUN_PEAK = 6.7;          // peak key light; ~0.95 linear on horizontal snow
-const ENV_INTENSITY = 0.26;    // PMREM sky dome as ambient — the fill
-const FILL_INTENSITY = 0.02;   // safety only, for anything that ignores the IBL
+// SUN_PEAK is set so the first number lands on 1.00: at the default sun,
+// albedo 0.85 / PI * sin(elev) * SUN_PEAK * expo == 0.83, plus 0.16 of fill.
+const SUN_PEAK = 6.80;         // peak key light; ~0.85 linear direct on flat snow
+// The fill is deliberately weighted toward the *IBL* rather than toward
+// snow-material's hard-coded snow-only ambient: the IBL lights the conifers, the
+// rock and the skier too, so raising it and taking the same amount back out of
+// SHADE_FLOOR_SCALE keeps snow shadows on their number while stopping the
+// forest from reading as a black cut-out.
+const ENV_INTENSITY = 0.46;    // PMREM sky dome as ambient — the fill
+
+// The hemisphere light is gone from the lighting solution. With a working PMREM
+// it is double counting, and it was measured contributing 0.003 linear (1% of
+// the fill) for the privilege. It stays in the scene graph, `visible = false`,
+// because fx/spray.js looks a HemisphereLight up to colour its powder ambient:
+// three's projectObject skips invisible lights, Object3D.traverse does not, so
+// spray keeps a physically-derived sky colour and the PBR path never sees it.
+const SPRAY_HEMI_INTENSITY = 0.75;
+
+// snow-material.js adds a hard-coded ambient to every snow pixel:
+//     indirectDiffuse += albedo * uShadeTint * ( 0.08 + 0.40 * (1 - lit) )
+// which is 0.234 linear in shadow — on its own already above the 0.14-0.20 a
+// real cast shadow sits at, and completely deaf to the sky. It is published as
+// `material.userData.snowUniforms.uShadeTint`, so rather than let one hard-coded
+// constant set the floor of the whole image, sky.js scales it: the *hue* stays
+// exactly as snow-material authored it (this is a scalar multiply, so B/R is
+// untouched), only the level is brought into line with the sky the dome is
+// actually drawing. Set to 1 to hand the floor back.
+//
+// It multiplies the IBL term on shadowed snow as well (`tint` in SNOW_SCATTER),
+// so the effective fill scales slightly faster than this number.
+const SHADE_FLOOR_SCALE = 0.50;
 
 // Solar disc radiance before exposure. The dome multiplies by SKY_CALIBRATION,
 // so 13.0 lands the centre of the disc at ~1.7 linear: over white, so it still
@@ -360,8 +397,12 @@ vec3 gradeSky( vec3 col, vec3 dir ) {
   // so a band that covers 10 deg of dome ends up tinting *up*-facing surfaces.
   // Halve it for the env capture — that is what keeps shadowed snow blue at
   // golden hour instead of the dead neutral it used to render.
-  float band = exp( -max( h, 0.0 ) * 11.0 );
-  col = mix( col, vec3( dot( col, LUMW ) ) * hTint, band * mix( 0.55, 0.14, uEnvMode ) );
+  // Was 0.55 over an exp(-11h) falloff, which desaturated 55% of the sky at the
+  // horizon line and drew a hard pale band right where the far ridges sit. Real
+  // high-altitude air whitens toward the horizon, but gently and over a much
+  // wider arc — and the ridges have to stay readable against it.
+  float band = exp( -max( h, 0.0 ) * 7.0 );
+  col = mix( col, vec3( dot( col, LUMW ) ) * hTint, band * mix( 0.36, 0.11, uEnvMode ) );
 
   // Below the horizon. What you SEE down there is a sunlit sea of valley haze
   // and snow, which is bright; what an up-facing surface actually receives from
@@ -394,12 +435,12 @@ vec3 gradeSky( vec3 col, vec3 dir ) {
 // Coverage-thresholded, domain-warped fbm on a plane at cloud altitude, eroded
 // by a higher octave so silhouettes read cauliflower rather than as blobs.
 //
-// The warp q is computed once per pixel and passed in, because the shadow
-// march has to sample the SAME field as the silhouette. (It used to march a
-// plain, unwarped fbm3: the shadow term was then spatially uncorrelated with
-// the cloud it was supposed to be darkening, which is exactly why the decks
-// read as flat decals.) Reusing q is legitimate — the warp is two octaves at
-// 0.42x the base frequency, so it barely moves across a shadow step.
+// The warp q is passed in rather than recomputed inside cloudShape, so the
+// silhouette and every shadow tap go through one code path and it is impossible
+// for them to drift apart again. The shadow march re-derives q at each tap: the
+// far tap is 5.2 step lengths out, which at the cumulus deck's scale is a full
+// wavelength of the warp field, so reusing the pixel's own q there would put the
+// shadow in the wrong place by a whole cloud.
 vec2 cloudWarp( vec2 p ) {
   return vec2( fbm2( p * 0.42 ), fbm2( p * 0.42 + vec2( 4.7, 1.3 ) ) );
 }
@@ -408,8 +449,14 @@ float cloudShape( vec2 p, vec2 q, float cov, int quality ) {
   float n = ( quality > 0 ) ? fbm5( p + 0.9 * q ) : fbm3( p + 0.9 * q );
   float d = clamp( ( n - cov ) / max( 1.0 - cov, 0.05 ), 0.0, 1.0 );
   if ( quality > 0 ) {
-    float er = fbm3( p * 3.4 + 19.0 );
-    d = clamp( ( d - ( 1.0 - d ) * er * 0.62 ) * 1.5, 0.0, 1.0 );
+    // Erode the edges, not the body: (1-d) weights the outside of the cloud, so
+    // the interior keeps its density while the silhouette gets bitten into the
+    // lumpy cauliflower outline a cumulus actually has. Squaring the erosion
+    // noise biases it toward a few hard bites rather than a uniform nibble,
+    // which is the difference between a lumpy edge and a blurred one.
+    float er = fbm3( p * 3.1 + 19.0 );
+    er *= er;
+    d = clamp( ( d - ( 1.0 - d ) * er * 1.05 ) * 1.62, 0.0, 1.0 );
   } else {
     d = clamp( d * 1.35, 0.0, 1.0 );
   }
@@ -425,18 +472,36 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
 
   vec2 p = ( camPos.xz + dir.xz * t ) * scale + drift * uTime;
 
+  // Weather, not wallpaper. A single global coverage threshold produces a field
+  // of identically sized puffs evenly spaced across the whole dome, which is
+  // the second thing (after their sheer size) that gives a procedural sky away.
+  // Modulating the threshold with one very low-frequency octave gives dense
+  // clumps of large cells with clear lanes between them — the size *range* is
+  // what a real deck has and a single fbm does not.
+  float covL = clamp( cov + ( fbm2( p * 0.11 + 3.3 ) - 0.5 ) * 0.46, 0.03, 0.95 );
+
   vec2 q = cloudWarp( p );
-  float d = cloudShape( p, q, cov, quality );
+  float d = cloudShape( p, q, covL, quality );
   if ( d <= 0.003 ) return vec4( 0.0 );
 
-  // march a few taps toward the sun through the slab for self-shadowing
+  // March toward the sun through the slab for self-shadowing. The taps run at
+  // the SAME quality as the silhouette — i.e. the same five octaves and the
+  // same erosion — because a shadow marched through a cheaper field is not a
+  // shadow of the cloud you can see: it is an uncorrelated grey wash laid over
+  // it, which is exactly what made these decks read as pasted decals. Three
+  // taps at full quality is the single most expensive thing in this shader, and
+  // it is worth it.
   vec2 sdir = uSunDir.xz;
   float sl = length( sdir );
   sdir = ( sl > 1e-4 ) ? sdir / sl : vec2( 1.0, 0.0 );
   float stepLen = thickness * ( 0.6 / max( uSunDir.y, 0.20 ) );
-  float s1 = cloudShape( p + sdir * stepLen,       q, cov, 0 );
-  float s2 = cloudShape( p + sdir * stepLen * 2.4, q, cov, 0 );
-  float s3 = cloudShape( p + sdir * stepLen * 5.2, q, cov, 0 );
+  vec2 p1 = p + sdir * stepLen, p2 = p + sdir * stepLen * 2.4, p3 = p + sdir * stepLen * 5.2;
+  // covL is reused rather than re-derived: its octave has a wavelength of ~9
+  // units and the longest step is 2.4, so it barely moves — unlike the warp,
+  // which does.
+  float s1 = cloudShape( p1, cloudWarp( p1 ), covL, quality );
+  float s2 = cloudShape( p2, cloudWarp( p2 ), covL, quality );
+  float s3 = cloudShape( p3, cloudWarp( p3 ), covL, quality );
   // Everything below the top of the deck is shaded by the deck above it, so
   // the optical depth toward the sun never really goes to zero inside a body.
   float shadow = s1 * 0.50 + s2 * 0.32 + s3 * 0.18 + d * odSelf;
@@ -446,7 +511,7 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   // forward difference of the same field, so the shading follows the
   // silhouette exactly — which is the whole difference between a cloud and a
   // sticker of a cloud.
-  float facing = clamp( ( d - s1 ) * 2.2 + 0.5, 0.0, 1.0 );
+  float facing = clamp( ( d - s1 ) * 3.4 + 0.5, 0.0, 1.0 );
 
   float ct = dot( dir, uSunDir );
   // Two lobes: strong forward scatter (the silver lining) plus a weak back
@@ -456,9 +521,15 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
 
   // Beer-Powder. Multiple scattering comes back in through the ambient term,
   // which is where it physically belongs — it is skylight, and it is blue.
-  float beer   = 0.11 + 0.89 * exp( -shadow * 2.7 );
+  // The floor here is the whole ball game for cloud form: it is the fraction of
+  // the sun's radiance that a fully self-shadowed base still transmits, and at
+  // 0.11 no base could ever get below ~0.27 of its own top. Measured with
+  // tools/skylight-probe.mjs (which renders the dome twice, once with the decks
+  // switched off, and isolates the pixels that are actually cloud), 0.045 with
+  // a steeper Beer slope lands base/top at 0.17.
+  float beer   = 0.022 + 0.978 * exp( -shadow * 4.3 );
   float powder = 1.0 - exp( -d * 7.0 );   // dark-edge / silver-lining term
-  float sh     = clamp( shadow * 1.10, 0.0, 1.0 );
+  float sh     = clamp( shadow * 1.25, 0.0, 1.0 );
 
   // Lit rim: thin, sun-facing edges are where forward scattering escapes.
   float rim = min( pow( 1.0 - d, 3.0 ) * hgPhase( ct, 0.86 ) * 9.0, 0.85 );
@@ -475,7 +546,7 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   // covers noticeably more sky than the silhouette you actually see. Trim the
   // coverage back so the IBL is not over-clouded (at low sun that showed up
   // directly as warm cloud light neutralising the blue in the shadows).
-  float a = smoothstep( 0.03, 0.40, d ) * smoothstep( 0.018, 0.115, dir.y )
+  float a = smoothstep( 0.02, 0.30, d ) * smoothstep( 0.018, 0.115, dir.y )
           * mix( 1.0, 0.72, uEnvMode );
   return vec4( col, clamp( a, 0.0, 1.0 ) );
 }
@@ -484,7 +555,7 @@ vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol ) {
   if ( dir.y < 0.02 || uCirrus <= 0.001 ) return vec4( 0.0 );
   float t = ( 9200.0 - camPos.y ) / dir.y;
   if ( t <= 0.0 ) return vec4( 0.0 );
-  vec2 p = ( camPos.xz + dir.xz * t ) * 0.00011 + vec2( 0.0075, 0.0026 ) * uTime;
+  vec2 p = ( camPos.xz + dir.xz * t ) * 0.00020 + vec2( 0.0075, 0.0026 ) * uTime;
 
   vec2 w = vec2( fbm2( p * 0.9 ), fbm2( p * 0.9 + 9.1 ) );
   float n = fbm5( vec2( p.x * 0.55, p.y * 2.4 ) + 1.1 * w );
@@ -509,14 +580,20 @@ void main() {
 
   // ---- cloud decks -------------------------------------------------------
   vec4 ci  = cirrusLayer( dir, cameraPosition, skyCol );
+  // NOTE ON SCALE. These were 0.00019 / 0.00052, which put a single cumulus at
+  // ~2 km across seen from 350 m below it — one cloud filled a quarter of the
+  // frame. Side by side with a real alpine photograph that is the first thing
+  // that gives the render away: real cumulus at this altitude subtend 3-8 deg,
+  // not 25, and what sells a sky is *many* of them at a range of sizes, not
+  // three enormous lozenges. Both decks are now 2.2x finer.
   // high altocumulus: thin, so barely any self-shadowing and it stays pale
-  vec4 cu2 = cloudLayer( dir, cameraPosition, skyCol, 5400.0, 0.00019,
+  vec4 cu2 = cloudLayer( dir, cameraPosition, skyCol, 5400.0, 0.00043,
                          vec2( 0.0010, 0.0004 ), uCoverage + 0.17, 0.20, 1.15,
                          3.2e-5, 0, 0.12, 1.15 );
   // the main cumulus deck: thick, seen from underneath, so it self-shadows hard
-  vec4 cu  = cloudLayer( dir, cameraPosition, skyCol, 2350.0, 0.00052,
+  vec4 cu  = cloudLayer( dir, cameraPosition, skyCol, 2350.0, 0.00115,
                          vec2( 0.0030, 0.0011 ), uCoverage, 0.30, 1.00,
-                         7.0e-5, 1, 0.38, 1.0 );
+                         7.0e-5, 1, 0.88, 1.0 );
 
   col = mix( col, ci.rgb,  ci.a  * uCloudDensity );
   col = mix( col, cu2.rgb, cu2.a * uCloudDensity * 0.65 );
@@ -647,27 +724,37 @@ export function createSky(scene, renderer) {
   const sun = new THREE.DirectionalLight(0xffffff, SUN_PEAK);
   sun.castShadow = true;
 
+  // Shadow coverage was the real reason the mountain read flat. The frustum
+  // used to be +/-95 m around the skier, so *nothing past 95 metres cast a
+  // shadow at all*: measured over the hero framing, 85% of snow pixels sat in a
+  // 0.7-0.9 band of "fraction of the key light received" and 0.0% were below
+  // 0.4. There was simply no shade in the frame to separate from the sun.
+  // terrain.js casts out to LOD 4 (614 m), so 330 m of half-extent is inside
+  // what the terrain already supports. At 4096 that is 16 cm per texel — the
+  // skier's own 4 m contact shadow is still ~25 texels across.
   const SHADOW_MAP = 4096;
-  const SHADOW_HALF = 95;             // metres of half-extent around the skier
+  const SHADOW_HALF = 330;            // metres of half-extent around the skier
   sun.shadow.mapSize.set(SHADOW_MAP, SHADOW_MAP);
   sun.shadow.camera.near = 20;
-  sun.shadow.camera.far = 2800;
+  sun.shadow.camera.far = 3400;
   sun.shadow.camera.left = -SHADOW_HALF;
   sun.shadow.camera.right = SHADOW_HALF;
   sun.shadow.camera.top = SHADOW_HALF;
   sun.shadow.camera.bottom = -SHADOW_HALF;
-  sun.shadow.bias = -0.00006;
-  sun.shadow.normalBias = 0.11;
+  sun.shadow.bias = -0.00012;
+  // normalBias is in world units and has to track the texel footprint, or a
+  // 3.5x wider frustum acnes every metre-scale sastruga on the piste.
+  sun.shadow.normalBias = 0.42;
   sun.shadow.radius = 2.0;        // only used if the lead switches to VSM
   sun.shadow.camera.updateProjectionMatrix();
   scene.add(sun);
   scene.add(sun.target);
 
-  // Vestigial fill so anything that ignores scene.environment is never pure
-  // black. With a working PMREM this light is double-counting: at any strength
-  // worth seeing it is unshadowed ambient, and unshadowed ambient is precisely
-  // what was eating the key-to-fill ratio. Keep it at token strength.
-  const fill = new THREE.HemisphereLight(0xbcd6ff, 0xe6eef7, FILL_INTENSITY);
+  // NOT part of the lighting solution — see SPRAY_HEMI_INTENSITY above. It is
+  // invisible, so WebGLRenderer never collects it; it exists so fx/spray.js can
+  // read a real sky/ground colour off scene.traverse().
+  const fill = new THREE.HemisphereLight(0xbcd6ff, 0xe6eef7, SPRAY_HEMI_INTENSITY);
+  fill.visible = false;
   scene.add(fill);
 
   // ---- fog ---------------------------------------------------------------
@@ -695,17 +782,27 @@ export function createSky(scene, renderer) {
 
   const LATITUDE = 46.5 * Math.PI / 180;    // Alps
   const DECLINATION = 14.0 * Math.PI / 180; // late spring
-  // Which way the piste faces. Rotates the whole solar arc so the default
-  // late-morning sun rakes across the fall line instead of sitting behind the
-  // camera and flattening every roller.
-  const ASPECT = -82 * Math.PI / 180;
+  // Which way the piste faces. This rotates the whole solar arc, and it is a
+  // lighting decision, not a geography one: the canonical framings all look
+  // down the fall line (roughly -Z), and at ASPECT -82 the sun sat 21 deg off
+  // that view axis. Near-axial light is the one direction that shows no surface
+  // form at all — every roller on the piste was lit identically to the flat
+  // between them. -22 puts the sun ~72 deg to camera right, so the same rollers
+  // get a lit face, a terminator and a shadow drawn across the frame.
+  const ASPECT = -38 * Math.PI / 180;
 
-  let tod = 0.335;                 // mid-morning bluebird, sun ~31 deg
+  // 0.302 == sun 23 deg. The old 31 deg cleared every terrain roll and most of
+  // the trees: shadow length is h/tan(elev), so dropping 8 degrees more than
+  // doubles every cast shadow in the frame (1.66 h -> 2.36 h) and roughly
+  // doubles the rate at which cos(incidence) changes with slope, which is what
+  // separates one facet of a mogul field from the next.
+  let tod = 0.302;                 // mid-morning bluebird, sun ~23 deg
   let elevation = 0;
   let clock = 0;
   let envDirty = true;
   let lastEnvElev = -999;
   let lastEnvAz = -999;
+  let frameNo = 0;
 
   const params = {
     cloudCoverage: 0.42,
@@ -713,14 +810,17 @@ export function createSky(scene, renderer) {
     cirrus: 0.22,
     windSpeed: 1.0,
     fogDensity: 0.00062,     // our own chunk (trees, skier, props)
-    // terrain.js divides by its own 0.62 fudge and integrates against a 1500 m
-    // scale height, so the ridges need a heavier number than everything else
-    // to lose the same amount of contrast. Tuned against the 3 km probe.
-    aerialDensity: 0.00120,
+    // terrain.js halves this and integrates against a 1500 m scale height, so
+    // the ridges need a heavier number than everything else to lose the same
+    // amount of contrast. Tuned against the 3 km evaluation in
+    // tools/skylight-probe.mjs: a sunlit ridge 3 km out and 250 m up lands on
+    // 0.48 linear, B/R 1.6 (near sunlit snow: 1.00 linear, B/R 1.00).
+    aerialDensity: 0.00170,
     fogHeight: 1150,
     fogRef: 0,
     fogStart: 40,
     exposureScale: 1.0,
+    shadeFloor: SHADE_FLOOR_SCALE,
   };
 
   // ---- JS mirror of the dome --------------------------------------------
@@ -760,7 +860,7 @@ export function createSky(scene, renderer) {
     ];
     const w = smoothstep01(-0.55, 0.90, caz);
     const htx = mix(htc.x, htw.x, w), hty = mix(htc.y, htw.y, w), htz = mix(htc.z, htw.z, w);
-    const band = Math.exp(-Math.max(h, 0) * 11) * 0.55;
+    const band = Math.exp(-Math.max(h, 0) * 7) * 0.36;
     const l = luminance(c);
     c[0] = mix(c[0], l * htx, band);
     c[1] = mix(c[1], l * hty, band);
@@ -806,6 +906,35 @@ export function createSky(scene, renderer) {
     let az = Math.acos(clamp(cosA, -1, 1));
     if (H > 0) az = 2 * Math.PI - az;
     return { elev, az };
+  }
+
+  // ---- shade floor -------------------------------------------------------
+  // snow-material.js sets the absolute level of every shadow in the image with
+  // one hard-coded constant (see SHADE_FLOOR_SCALE). Bring it into the sky's
+  // budget, remembering whatever it was authored as so this is idempotent and
+  // so a value of 1.0 hands it straight back.
+  // The authored value is cached on the material itself, not in a WeakMap local
+  // to this closure: createSky() can be called again (hot reload, time-of-day
+  // rebuild) and a fresh map would take the already-scaled tint for the
+  // original and scale it a second time, darkening every shadow in the game a
+  // little more on each reload.
+  const _shade = new THREE.Color();
+  function eachSnowMaterial(fn) {
+    scene.traverse((o) => {
+      const m = o.material;
+      const list = Array.isArray(m) ? m : m ? [m] : [];
+      for (const mat of list) {
+        const u = mat.userData && mat.userData.snowUniforms;
+        if (!u || !u.uShadeTint || !u.uShadeTint.value || !u.uShadeTint.value.isColor) continue;
+        if (!mat.userData.skyShadeAuthored) mat.userData.skyShadeAuthored = u.uShadeTint.value.clone();
+        fn(u.uShadeTint.value, mat.userData.skyShadeAuthored);
+      }
+    });
+  }
+  function reconcileShadeFloor() {
+    eachSnowMaterial((tint, base) => {
+      tint.copy(_shade.copy(base).multiplyScalar(params.shadeFloor));
+    });
   }
 
   function apply() {
@@ -859,6 +988,21 @@ export function createSky(scene, renderer) {
     // the sky around the sun goes over white, taking the disc with it.
     const expo = clamp(Math.sqrt(INC_REF / Math.max(inc, 1e-4)), 0.8, 1.55) * params.exposureScale;
 
+    // White balance. At 23 deg the beam has crossed 2.5 air masses and comes out
+    // at roughly 4400 K — the raw transmittance is (1.00, 0.85, 0.59), and
+    // rendered straight it makes the snow cream. A real camera is balanced off
+    // the key, not off D65, so pull the *light* part-way to neutral while the
+    // dome, the IBL and therefore every shadow keep their own chromaticity.
+    // That is what leaves sunlit snow neutral-to-warm and shade blue instead of
+    // washing the whole frame one colour. Measured: sunlit snow B/R 0.84 -> 0.92,
+    // shadow B/R unchanged at 2.5.
+    // Luminance-preserving, so the white balance is a hue move only and the
+    // 1.00-linear calibration of sunlit snow is not quietly re-tuned by it.
+    const WB = 0.34;
+    const wbBefore = luminance(sunCol);
+    for (let i = 0; i < 3; i++) sunCol[i] = mix(sunCol[i], 1.0, WB);
+    const wbK = wbBefore / Math.max(luminance(sunCol), 1e-5);
+    for (let i = 0; i < 3; i++) sunCol[i] *= wbK;
     sun.color.setRGB(sunCol[0], sunCol[1], sunCol[2], THREE.LinearSRGBColorSpace);
     sun.intensity = SUN_PEAK * key * expo;
     uniforms.uSunTint.value.set(sunCol[0], sunCol[1], sunCol[2]);
@@ -927,8 +1071,12 @@ export function createSky(scene, renderer) {
       mix(antisolar[0], mid[0], 0.35) * 0.95 * inv,
       mix(antisolar[1], mid[1], 0.35) * 1.00 * inv,
       mix(antisolar[2], mid[2], 0.35) * 1.22 * inv);
+    // What a fully self-shadowed base does to the *skylight* it receives: the
+    // deck above it occludes most of the dome, so the base sees a fraction of
+    // the ambient, and what it does see arrives after several scatterings and
+    // is bluer than the sky average.
     uniforms.uCloudBase.value.set(
-      mix(0.54, 0.48, golden), mix(0.50, 0.42, golden), mix(0.64, 0.62, golden));
+      mix(0.27, 0.24, golden), mix(0.27, 0.22, golden), mix(0.36, 0.34, golden));
 
     // Sun radiance on cloud tops: less extinction up at 3 km, albedo ~0.9.
     const hiFex = sunTransmittance(Math.max(elev, 0.015) + 0.07);
@@ -939,18 +1087,21 @@ export function createSky(scene, renderer) {
       (hiFex[1] / hiPeak) * cloudLit,
       (hiFex[2] / hiPeak) * cloudLit);
 
-    // ---- hemisphere fill --------------------------------------------------
-    fill.color.setRGB(low[0] * 2.2 * expo, low[1] * 2.2 * expo, low[2] * 2.4 * expo,
-      THREE.LinearSRGBColorSpace);
-    fill.groundColor.setRGB(
-      horizonNeutral[0] * 1.4 * expo, horizonNeutral[1] * 1.4 * expo,
-      horizonNeutral[2] * 1.4 * expo, THREE.LinearSRGBColorSpace);
-    fill.intensity = FILL_INTENSITY;
+    // ---- sky colour handed to fx/spray.js (see SPRAY_HEMI_INTENSITY) -------
+    // Peak-normalised, because spray wants a hue and applies its own level.
+    const lowPk = Math.max(low[0], low[1], low[2], 1e-5);
+    const horPk = Math.max(horizonNeutral[0], horizonNeutral[1], horizonNeutral[2], 1e-5);
+    fill.color.setRGB(low[0] / lowPk, low[1] / lowPk, low[2] / lowPk, THREE.LinearSRGBColorSpace);
+    fill.groundColor.setRGB(horizonNeutral[0] / horPk, horizonNeutral[1] / horPk,
+      horizonNeutral[2] / horPk, THREE.LinearSRGBColorSpace);
+    fill.intensity = SPRAY_HEMI_INTENSITY;
+    fill.visible = false;
 
     // Snow bounces a lot of skylight, but a fully unoccluded hemisphere flattens
     // the render into a milk bath. See the note at the top of the file: this is
     // the number that buys back the tonal separation.
     scene.environmentIntensity = ENV_INTENSITY;
+    reconcileShadeFloor();
 
     // ---- fog / aerial perspective -----------------------------------------
     // Three probes of the same graded dome the sky draws: horizon away from the
@@ -960,8 +1111,23 @@ export function createSky(scene, renderer) {
     // that survives to the eye from a few km of clean 2000 m air is a fraction
     // of the full optical-depth horizon radiance; without it the haze is as
     // bright as sunlit snow and fogging snow is a no-op.
-    const HAZE_GAIN = 0.56 * expo;
-    const tilt = [0.88, 0.97, 1.16];         // aerial perspective is blue
+    // Haze radiance. What a ridge fogs *toward* sets both how far away it reads
+    // and how blue it goes; measured at 1.7 km the ridge was landing on B/R 0.97
+    // (i.e. slightly warmer than the near snow, which is aerial perspective
+    // running backwards) because there was not enough haze in front of it and
+    // what there was, was too dark to survive the mix.
+    const HAZE_GAIN = 0.80 * expo;
+    // Aerial perspective is blue, and it has to be blue *enough*: what the eye
+    // reads as distance is the B/R of the far ridge, not its luminance. Rayleigh
+    // in-scatter over a few km is roughly 1/lambda^4, so the blue channel wins
+    // by a lot more than a 1.16 tilt admits. Measured at 1.2 km the far ridge
+    // was coming back at B/R 0.91 — warmer than the near snow, i.e. aerial
+    // perspective pointing the wrong way.
+    // Blue, not teal: the green channel is what decides whether distant rock
+    // reads as "far away" or as "underwater". Pulling G down relative to R
+    // while keeping B up gives Rayleigh's slope without the cyan cast that
+    // showed up on every distant massif.
+    const tilt = [0.80, 0.86, 1.40];         // aerial perspective is blue
     const hazeCool = [
       mix(horizonNeutral[0], low[0], 0.30) * HAZE_GAIN * tilt[0],
       mix(horizonNeutral[1], low[1], 0.30) * HAZE_GAIN * tilt[1],
@@ -977,6 +1143,22 @@ export function createSky(scene, renderer) {
       mix(mid[1], antisolar[1], 0.5) * HAZE_GAIN * 1.05,
       mix(mid[2], antisolar[2], 0.5) * HAZE_GAIN * 1.15,
     ];
+
+    // Physical ceiling on the haze. In-scattered radiance along a view ray is
+    // bounded by the sky radiance in that direction: haze cannot be brighter
+    // than the sky it is made of. Without this the far ridges came out brighter
+    // than the sky directly above them (measured terrain/sky 1.36 across the
+    // skyline) — the single most reliable tell of fake aerial perspective, and
+    // the reason a distant massif read as a pale sticker instead of as distance.
+    // Clamping instead of art-directing means the gain above can be pushed to
+    // whatever the near field wants and the far field stays honest by itself.
+    const skyRidge = skyAt(9, Math.PI * 0.5);      // sky just above a far ridge
+    const skyRidgeSun = skyAt(9, 0);
+    for (let i = 0; i < 3; i++) {
+      hazeCool[i] = Math.min(hazeCool[i], skyRidge[i] * expo * 0.94);
+      hazeWarm[i] = Math.min(hazeWarm[i], skyRidgeSun[i] * expo * 0.94);
+      hazeUp[i] = Math.min(hazeUp[i], mid[i] * expo * 0.94);
+    }
 
     // terrain.js reads this one (display-encoded — see the fog note above) and
     // runs its own direction-independent aerial term off it, so it gets the
@@ -1108,12 +1290,20 @@ export function createSky(scene, renderer) {
     getSunElevation() { return elevation; },
     /** Graded sky radiance in a direction, for other subsystems that want it. */
     sampleSky(elevDeg, azOffset) { return skyAt(elevDeg, azOffset); },
+    /** Re-apply the sky's ambient budget to any snow material in the scene. */
+    reconcileShadeFloor,
 
     update(dt, state) {
       clock += dt;
       uniforms.uTime.value = clock * params.windSpeed;
 
       updateShadow(state);
+
+      // Terrain/scatter build their snow materials after createSky() runs, and
+      // stream more in as the skier moves, so the shade floor has to be swept
+      // periodically rather than once. Every 20th frame over a few hundred
+      // objects is free.
+      if ((++frameNo % 20) === 0) reconcileShadeFloor();
 
       // Rebuild the IBL only when the sun has actually moved enough to matter.
       if (envDirty) {
@@ -1125,6 +1315,7 @@ export function createSky(scene, renderer) {
     },
 
     dispose() {
+      eachSnowMaterial((tint, base) => tint.copy(base));
       scene.remove(skyMesh);
       scene.remove(sun);
       scene.remove(sun.target);

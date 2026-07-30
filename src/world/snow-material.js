@@ -208,19 +208,41 @@ vec3 snRidged( vec2 p, int oct, float gain ) {
   return vec3( s / nrm, g / nrm );
 }
 
+/**
+ * Triplanar weights from |N|.
+ *
+ * The exponent is the whole ball game. A *high* exponent (4, 8) collapses the
+ * blend to a single plane, and on a 60-degree face that plane is XZ — which
+ * foreshortens the world-space sample by cos(theta) along the fall line and
+ * therefore stretches every feature 2:1 down the slope. Stack five such layers
+ * and the face comes out combed, which is exactly the "brushed metal" smear.
+ * Weighting by |N| itself (exponent ~1) is the geometrically honest blend: at 45
+ * degrees the two planes contribute equally, and the plane that contains Y
+ * carries un-stretched detail.
+ *
+ * The cutoff is what keeps this affordable: on the near-flat piste the side
+ * planes weigh < 3% and are skipped entirely, so the expensive near field still
+ * costs one fbm per layer.
+ */
+vec3 snTriW( vec3 N, float e ) {
+  vec3 w = pow( abs( N ), vec3( e ) );
+  return w / ( w.x + w.y + w.z );
+}
+#define SN_TRI_CUT 0.028
+
 /** Triplanar version of snRidged, for rock fracture relief. */
 void fractureLayer( vec3 P, vec3 W, float freq, float amp, int oct, inout vec3 grad, inout float hgt ) {
   if ( amp < 1e-5 ) return;
   float k = amp * freq;
-  if ( W.y > 0.004 ) {
+  if ( W.y > SN_TRI_CUT ) {
     vec3 n = snRidged( P.xz * freq, oct, 0.5 );
     grad.x += W.y * k * n.y; grad.z += W.y * k * n.z; hgt += W.y * amp * n.x;
   }
-  if ( W.z > 0.004 ) {
+  if ( W.z > SN_TRI_CUT ) {
     vec3 n = snRidged( P.xy * freq, oct, 0.5 );
     grad.x += W.z * k * n.y; grad.y += W.z * k * n.z; hgt += W.z * amp * n.x;
   }
-  if ( W.x > 0.004 ) {
+  if ( W.x > SN_TRI_CUT ) {
     vec3 n = snRidged( P.zy * freq, oct, 0.5 );
     grad.z += W.x * k * n.y; grad.y += W.x * k * n.z; hgt += W.x * amp * n.x;
   }
@@ -228,16 +250,25 @@ void fractureLayer( vec3 P, vec3 W, float freq, float amp, int oct, inout vec3 g
 
 /**
  * Triplanar detail layer. Accumulates the world-space gradient of a scalar
- * height field of amplitude 'amp' at spatial frequency 'freq'. 'aniso' squashes
- * the noise across the wind so features streak downwind (sastrugi).
+ * height field of amplitude 'amp' at spatial frequency 'freq'.
+ *
+ * 'aniso' squashes the noise across the local wind so features streak downwind
+ * (sastrugi); 'rot' turns that frame by a fixed angle. Every band gets a
+ * *different* rot, so the bands cannot conspire into one global grain — which is
+ * what turned the whole snowfield into brushed metal. Real sastrugi, barchans
+ * and wind ripples are not co-aligned either: the ripples answer to the surface
+ * wind of the last hour, the drifts to the storm that built them.
+ *
+ * aniso is also clamped well away from the old 0.22 (a 4.5:1 stretch). Past
+ * about 1.8:1 a lattice fbm stops reading as a wind feature and starts reading
+ * as a brush stroke.
  */
 vec2 snWind;   // local wind direction; set per fragment before the layers run
 
-void detailLayer( vec3 P, vec3 W, float freq, float amp, float aniso, int oct, inout vec3 grad, inout float hgt ) {
+void detailLayer( vec3 P, vec3 W, float freq, float amp, float aniso, float rot, int oct, inout vec3 grad, inout float hgt ) {
   if ( amp < 1e-5 ) return;
   float k = amp * freq;
-  vec2 w = snWind;
-  if ( W.y > 0.004 ) {
+  if ( W.y > SN_TRI_CUT ) {
     vec2 p = P.xz * freq;
     if ( aniso > 0.98 ) {
       // Isotropic: do NOT route through the wind frame. It is only a rotation,
@@ -249,6 +280,8 @@ void detailLayer( vec3 P, vec3 W, float freq, float amp, float aniso, int oct, i
     } else {
       // Compress *along* the wind so features stretch out downwind. Sastrugi
       // are long in the direction the wind blew, not across it.
+      float cr = cos( rot ), sr = sin( rot );
+      vec2 w = vec2( snWind.x * cr - snWind.y * sr, snWind.x * sr + snWind.y * cr );
       vec2 q = vec2( dot( p, w ) * aniso, dot( p, vec2( -w.y, w.x ) ) );
       vec3 n = snFbm( q, oct, 0.55 );
       vec2 gg = vec2( n.y * aniso, n.z );
@@ -257,12 +290,12 @@ void detailLayer( vec3 P, vec3 W, float freq, float amp, float aniso, int oct, i
       hgt += W.y * amp * n.x;
     }
   }
-  if ( W.z > 0.004 ) {
+  if ( W.z > SN_TRI_CUT ) {
     vec3 n = snFbm( P.xy * freq, oct, 0.55 );
     grad.x += W.z * k * n.y;  grad.y += W.z * k * n.z;
     hgt += W.z * amp * n.x;
   }
-  if ( W.x > 0.004 ) {
+  if ( W.x > SN_TRI_CUT ) {
     vec3 n = snFbm( P.zy * freq, oct, 0.55 );
     grad.z += W.x * k * n.y;  grad.y += W.x * k * n.z;
     hgt += W.x * amp * n.x;
@@ -343,8 +376,16 @@ float snSpecTint = 1.0;
 
   // Wind is not a constant: it wraps round spurs and pours through cols. A
   // slow rotation field keeps the sastrugi from looking combed with a rake.
-  vec3 wv = snFbm( P.xz * 0.0011, 2, 0.5 );
-  float wa = wv.x * 0.55;
+  //
+  // The old field turned by +-0.55 rad over a ~900 m period, which is far too
+  // lazy: inside one screenful of near-field snow it is effectively constant, so
+  // every wind-aligned band came out parallel and the piste read as brushed
+  // metal. Two octaves — a synoptic one and a 130 m terrain-scale one — and a
+  // full +-1.2 rad swing mean the grain has visibly turned by the time you have
+  // crossed a drift, which is what it does on real wind-packed snow.
+  vec3 wv  = snFbm( P.xz * 0.0011, 2, 0.5 );
+  vec3 wv2 = snFbm( P.xz * 0.0077 + vec2( 19.3, -7.1 ), 2, 0.5 );
+  float wa = wv.x * 0.80 + wv2.x * 0.44;
   float wc = cos( wa ), ws = sin( wa );
   snWind = normalize( vec2( uWindDir.x * wc - uWindDir.y * ws,
                             uWindDir.x * ws + uWindDir.y * wc ) );
@@ -371,16 +412,25 @@ float snSpecTint = 1.0;
 
   vec3 rGrad = vec3( 0.0 );
   float rLedge = 0.0, rFrac = 0.0, rB0 = 0.0, rB1 = 0.0;
-  vec3 rw = pow( abs( Ng ), vec3( 3.0 ) );
-  rw /= ( rw.x + rw.y + rw.z );
+  // Rock lives on 50-80 degree faces, where a planar XZ projection stretches
+  // every crack 2-5:1 down the fall line. This is the layer that was combing the
+  // valley walls, so it gets the most honest weighting of all.
+  vec3 rw = snTriW( Ng, 1.15 );
   // Buttress and ledge scales — the two bands allowed to steer the snowline.
   // Their amplitudes are metres, sized so that amp*freq matches the finer bands
   // and the face keeps the same apparent roughness at every range. That is far
   // too much *height* for the snowline blend, though, so only a scaled fraction
   // is handed on to it.
-  fractureLayer( P, rw, 0.0125, 7.0 * fRk0, 2, rGrad, rB0 );
-  fractureLayer( P, rw, 0.048,  1.6 * fRk1, 3, rGrad, rB1 );
-  rLedge = rB0 * 0.030 + rB1 * 0.24;
+  // These two are the only *un-stretched* structure a steep face gets. A
+  // heightfield displaced in XZ smears its own detail by 1/cos(theta) down the
+  // fall line — 2.4:1 on a 65 degree wall — and no amount of triplanar weighting
+  // in the shader can un-do geometry. What it can do is out-vote it: the
+  // triplanar bands at 80 m and 20 m sit exactly on the scales that were combed,
+  // and carrying more of the relief here and less in the vertex program is what
+  // turns the wall from corduroy back into rock.
+  fractureLayer( P, rw, 0.0125, 10.5 * fRk0, 2, rGrad, rB0 );
+  fractureLayer( P, rw, 0.048,  2.7 * fRk1, 3, rGrad, rB1 );
+  rLedge = rB0 * 0.020 + rB1 * 0.145;
   // Structure scale — slabs, joints, cracks. Pure appearance.
   fractureLayer( P, rw, 0.23,   0.105 * fRk2, 3, rGrad, rFrac );
   fractureLayer( P, rw, 1.10,   0.024 * fRk3, 3, rGrad, rFrac );
@@ -409,7 +459,7 @@ float snSpecTint = 1.0;
   // reads as folded sedimentary rock rather than as a contour map. Granite units
   // get almost none of it — they are massive, and their structure is the joints.
   vec3 gu  = snFbm( P.xz * 0.00082, 3, 0.5 );
-  float unit = clamp( gu.x * 1.7 + 0.5, 0.0, 1.0 );        // 0 granite .. 1 limestone
+  float unit = clamp( gu.x * 1.9 + 0.58, 0.0, 1.0 );       // 0 granite .. 1 limestone
   vec3 bw  = snFbm( P.xz * 0.0016, 2, 0.5 );
   vec3 dipN = normalize( uBedding + vec3( gu.y * 0.26, gu.z * 0.14, -gu.y * 0.22 ) );
   // Folded: the beds undulate over hundreds of metres, so they cross a face as
@@ -444,8 +494,10 @@ float snSpecTint = 1.0;
   // stripes running down the gullies between the ribs.
   vec2 dHill = normalize( Ng.xz + vec2( 1e-5, 1e-5 ) );
   vec2 dCross = vec2( -dHill.y, dHill.x );
+  // 3:1, not the 7:1 it used to be — past about 4:1 the snow stripes stop
+  // reading as gullies full of snow and start reading as rake marks.
   vec3 strk = snFbm( vec2( dot( P.xz, dCross ) * 0.055,
-                           dot( P.xz, dHill ) * 0.0075 ), 3, 0.5 );
+                           dot( P.xz, dHill ) * 0.018 ), 3, 0.5 );
 
   // Budget matters here: every one of these terms lowers the angle at which the
   // mountain stops being white, and if their swings add up the snowline walks
@@ -455,6 +507,10 @@ float snSpecTint = 1.0;
   talus += clamp( curvR, -1.0, 1.0 ) * 0.045;                      // snow wedges into hollows/ledges
   talus += clamp( flow * 1.4 - 0.15, 0.0, 1.0 ) * 0.055;           // gullies fill in
   talus += ( lee - wind ) * 0.045;                                 // windward blows clear, lee loads up
+  // The fracture field itself has to move the snowline, or snow sits on a face
+  // in smooth lobes instead of wedging into every ledge and ramp the way it does
+  // on a real wall. Small, high-frequency, and signed: ledges hold, slabs shed.
+  talus += clamp( rFrac * 3.2 + rB1 * 0.10, -0.09, 0.13 );
   float rockRaw = ( steep - talus ) * 4.2;
 
   // Height-blend: snow settles into the low spots of the rock, so the boundary
@@ -466,21 +522,44 @@ float snSpecTint = 1.0;
   snRockMask = smoothstep( -rEdge, rEdge, rockRaw + rLedge * 1.5 ) * uRockAmount;
 
   // --------------------------------------------------------------- snow ----
-  // Multi-scale relief. Everything is faded by view distance so the far field
-  // never carries sub-pixel noise (that is where moire comes from).
-  vec3 sw = pow( abs( Ng ), vec3( 4.0 ) );
-  sw /= ( sw.x + sw.y + sw.z );
+  // Multi-scale relief.
+  vec3 sw = snTriW( Ng, 2.0 );
+
+  // --- the LOD metric --------------------------------------------------------
+  // World metres spanned by one pixel, worst screen axis. This, and not view
+  // distance, is the honest cut-off for a detail band, and getting it wrong is
+  // what produced the "brushed metal" smear:
+  //
+  //   ground 25 m ahead of a chase camera 6 m up is seen 13 degrees off grazing,
+  //   so it is foreshortened about 4:1 vertically. The 16 cm wind-ripple band
+  //   there is 6 px wide and 1.3 px tall — comfortably sub-Nyquist on one axis —
+  //   and every frame it resolves to a different set of samples. TAA then drags
+  //   that into long horizontal wipes. Distance-based fades cannot see this at
+  //   all: the same band at the same distance is perfectly well resolved if you
+  //   are looking straight down at it.
+  //
+  // So every band is now gated on how many pixels its wavelength actually spans.
+  // The footprint is an *ellipse*, not a disc, and taking its long axis would
+  // throw away everything a 16x anisotropic sampler would happily have kept: a
+  // band that is ten pixels wide and one pixel tall still carries real
+  // information along the wide axis. So the ratio is capped at 3:1 the way a
+  // hardware aniso filter caps it, and the band is gated on what survives that.
+  float snPxA = length( dFdx( P ) ), snPxB = length( dFdy( P ) );
+  float snPxHi = max( snPxA, snPxB ), snPxLo = max( min( snPxA, snPxB ), 1e-5 );
+  float snPx = snPxHi / min( snPxHi / snPxLo, 3.0 );
+  #define SN_BAND( lambda ) smoothstep( 1.9, 4.4, ( lambda ) / snPx )
 
   // The 35 m band is a *mid-field* band: close up the piste already has the 12 m
   // drifts and the sastrugi, and stacking a third metre-scale wave on top of
   // them just combs the near snow into stripes.
   float fDeca   = snFade( 4600.0, 1000.0, snViewDist )
                 * smoothstep( 70.0, 280.0, snViewDist );     // ~35 m
-  float fDrift  = snFade( 2600.0,  500.0, snViewDist );      // ~12 m
-  float fSastr  = snFade(  800.0,  160.0, snViewDist );      // ~2.4 m
-  float fDune   = snFade(  380.0,   90.0, snViewDist );
-  float fRipple = snFade(  110.0,   18.0, snViewDist );
-  float fGrain  = snFade(   18.0,    2.5, snViewDist ) * uGrainFade;
+  float fDrift  = snFade( 2600.0,  500.0, snViewDist ) * SN_BAND( 11.8 );
+  float fRoll   = snFade( 1500.0,  260.0, snViewDist ) * SN_BAND( 5.3 );
+  float fSastr  = snFade(  800.0,  160.0, snViewDist ) * SN_BAND( 2.4 );
+  float fDune   = snFade(  380.0,   90.0, snViewDist ) * SN_BAND( 0.65 );
+  float fRipple = snFade(  110.0,   18.0, snViewDist ) * SN_BAND( 0.16 );
+  float fGrain  = snFade(   18.0,    2.5, snViewDist ) * uGrainFade * SN_BAND( 0.033 );
 
   // Wind loading: pillows on the lee, hard scoured ripple on the windward side.
   float loadA = 0.55 + 0.85 * lee;
@@ -492,19 +571,129 @@ float snSpecTint = 1.0;
   // next coarser one as it drops under a few pixels, so a snowfield at 1-3 km
   // still has hectometre wind rolls and decametre drifts on it instead of the
   // flat white wash you get when the last band simply expires.
+  //
+  // Note the rot column: 0, 0, 0, +1.05, -0.72, +2.25, 0. The three bands that
+  // are allowed to be anisotropic point in three different directions, so the
+  // eye reads "wind-worked snow" rather than "one brush dragged across the
+  // whole mountain".
   float fFar = smoothstep( 280.0, 900.0, snViewDist );
-  detailLayer( P, sw, 0.0085, 6.0 * fFar, 1.0, 3, grad, relief );
-  detailLayer( P, sw, 0.030,  2.1 * fDeca, 1.0, 3, grad, relief );
-  detailLayer( P, sw, 0.085,  1.25 * fDrift * loadA, 1.0, 4, grad, relief );
-  detailLayer( P, sw, 0.42,   0.27 * fSastr * loadA, 0.86, 3, grad, relief );
+  detailLayer( P, sw, 0.0085, 6.0 * fFar, 1.0, 0.0, 3, grad, relief );
+  detailLayer( P, sw, 0.030,  2.1 * fDeca, 1.0, 0.0, 3, grad, relief );
+  detailLayer( P, sw, 0.085,  1.18 * fDrift * loadA, 1.0, 0.0, 4, grad, relief );
+  // 5 m rollers. This is the band the mid field was missing: between 50 and 400 m
+  // the 12 m drifts are too big to read as texture and the 2.4 m sastrugi are
+  // already sub-pixel, so the surface went to a blank wash. Deliberately
+  // isotropic — it is the layer carrying the "this is a surface" signal.
+  detailLayer( P, sw, 0.19,   0.115 * fRoll, 1.0, 0.0, 3, grad, relief );
+  detailLayer( P, sw, 0.42,   0.24 * fSastr * loadA, 0.72, 1.05, 3, grad, relief );
   // The sub-metre bands are tracked separately: their pits are what carry the
   // micro-occlusion that stops snow reading as a painted surface.
-  detailLayer( P, sw, 1.55,  0.072 * fDune * scour, 0.56, 3, grad, fine );
-  detailLayer( P, sw, 6.20,  0.0190 * fRipple * scour, 0.22, 3, grad, fine );
-  detailLayer( P, sw, 30.0,  0.0026 * fGrain, 0.8, 2, grad, fine );
+  detailLayer( P, sw, 1.55,  0.072 * fDune * scour, 0.66, -0.72, 3, grad, fine );
+  detailLayer( P, sw, 6.20,  0.0190 * fRipple * scour, 0.60, 2.25, 3, grad, fine );
+  detailLayer( P, sw, 30.0,  0.0026 * fGrain, 1.0, 0.0, 2, grad, fine );
   float fineNorm = fine / max( 0.072 * fDune + 0.0190 * fRipple + 0.0026 * fGrain, 1e-4 );
+
+  // --- LOD-locked micro grain ------------------------------------------------
+  // Every band above is defined in *world* units, and a world-scale band on
+  // ground seen at grazing incidence foreshortens into a horizontal smear: that,
+  // not the detail normals, is why the 50-400 m field read as wet paint and why
+  // its structure-tensor coherence sat at 0.65 with the streak dead horizontal.
+  // The cure is a band whose *screen* size is fixed. Frequency tracks 1/distance
+  // in power-of-two steps, two neighbouring steps cross-fade, and the result is
+  // a 4-8 px snow tooth at any range from 40 m to the horizon, with no aliasing
+  // because the feature size never crosses the sampling limit.
+  //
+  // It also has to arrive as *occlusion*, not only as a normal. Sunlit snow sits
+  // on the shoulder of the tone curve: tilting the normal a few degrees there
+  // moves the encoded pixel by well under one code value, which is precisely why
+  // adding yet more relief never fixed the wash. Shadowing the pits — and
+  // tinting them towards the sky — is multiplicative and survives the shoulder.
+  float gGrain = 0.0;
+  {
+    // Wavelength locked to 7 px of the worst screen axis, quantised to powers of
+    // two with a cross-fade between neighbours so it never pops and never
+    // aliases. Two decades of it — a 7 px tooth and a 28 px roll — which is the
+    // sugar-on-ripple double scale real snow reads at.
+    float gL  = log2( max( snPx, 1e-4 ) );
+    float gLf = floor( gL ), gLt = gL - gLf;
+    float gF0 = 1.0 / ( 7.0 * exp2( gLf ) );
+    float gS  = smoothstep( 2.5, 8.0, snViewDist );
+    float gK  = 0.255 * gS;
+    float gH  = 0.0;
+    float a0 = gK * ( 1.0 - gLt ) / gF0, a1 = gK * gLt * 2.0 / gF0;
+    detailLayer( P, sw, gF0,       a0, 1.0, 0.0, 1, grad, gH );
+    detailLayer( P, sw, gF0 * 0.5, a1, 1.0, 0.0, 1, grad, gH );
+    gGrain = gH / max( a0 + a1, 1e-6 );
+    float gK2 = 0.205 * gS;
+    float gH2 = 0.0;
+    float b0 = gK2 * ( 1.0 - gLt ) * 4.0 / gF0, b1 = gK2 * gLt * 8.0 / gF0;
+    detailLayer( P, sw, gF0 * 0.25,  b0, 1.0, 0.0, 1, grad, gH2 );
+    detailLayer( P, sw, gF0 * 0.125, b1, 1.0, 0.0, 1, grad, gH2 );
+    gGrain = clamp( gGrain + gH2 / max( b0 + b1, 1e-6 ), -1.6, 1.6 ) * gS;
+  }
+
+  // --- traffic ---------------------------------------------------------------
+  // A worked piste is not a smooth white field, it is covered in the tracks of
+  // everyone who came down it today: long thin grooves running broadly with the
+  // fall line, arcing where people turned. Side by side with a photograph of a
+  // real ski area this is the most conspicuous single thing we did not have, and
+  // its absence is most of why our snow read as an untouched render.
+  //
+  // Yes, it is anisotropic — deliberately so. What made the old surface look
+  // brushed was *low-frequency* directional smear with no edges. Tracks are the
+  // opposite: narrow, high-contrast, and they arc. The eye reads them as traffic.
+  // The frame must not *rotate* with position. Steering a 50:1 anisotropic noise
+  // through a direction field that turns — the surface normal, a flow field,
+  // anything — displaces the domain by (track length) x (rotation) across the
+  // grain, and since the grain is 30 cm wide the tracks close on themselves into
+  // concentric wood-grain whorls. So the lines run along a *fixed* world axis
+  // (the corridor's fall line) and are curved by a pure shear instead: the cross
+  // coordinate is offset by a smooth function of the along coordinate. A shear
+  // is invertible and orientation-preserving, so the lines arc like skier turns
+  // and can never close a loop.
+  float trackA = 0.0;
+  {
+    // Traffic is patchy: the fall line and the inside of the turns get hammered,
+    // the edges of the piste stay smooth for days. Without this the tracks read
+    // as a machine finish laid over the whole mountain.
+    float tp = clamp( snFbm( P.xz * 0.0068 + vec2( -3.4, 8.8 ), 3, 0.55 ).x * 1.5 + 0.62, 0.0, 1.0 );
+    float g = smoothstep( 0.46, 0.20, steep ) * ( 1.0 - snRockMask ) * tp;
+    float w0 = SN_BAND( 0.34 ) * snFade( 300.0, 14.0, snViewDist );
+    float w1 = SN_BAND( 1.30 ) * snFade( 1800.0, 45.0, snViewDist );
+    float a0 = 0.060 * g * w0, a1 = 0.100 * g * w1;
+    if ( a0 + a1 > 1e-4 ) {
+      // Two traffic lines crossing at a shallow angle: nobody skis a piste in
+      // single file, and one direction alone reads as a machine finish.
+      const vec2 eA = vec2(  0.242, -0.970 ), eB = vec2( -0.276, -0.961 );
+      const vec2 xA = vec2(  0.970,  0.242 ), xB = vec2(  0.961, -0.276 );
+      float uA = dot( P.xz, eA ), uB = dot( P.xz, eB );
+      // Bend: one smooth 1-D wave per set. dBend is its exact derivative, so the
+      // shear stays analytic and the normal never lies about the geometry.
+      float bA = 7.0 * sin( uA * 0.031 ) + 3.1 * sin( uA * 0.084 + 2.1 );
+      float dA = 7.0 * 0.031 * cos( uA * 0.031 ) + 3.1 * 0.084 * cos( uA * 0.084 + 2.1 );
+      float bB = 5.4 * sin( uB * 0.024 + 1.7 ) + 2.6 * sin( uB * 0.067 - 0.6 );
+      float dB = 5.4 * 0.024 * cos( uB * 0.024 + 1.7 ) + 2.6 * 0.067 * cos( uB * 0.067 - 0.6 );
+      float vA = dot( P.xz, xA ) + bA, vB = dot( P.xz, xB ) + bB;
+
+      float fx0 = 2.9, fy0 = 0.070, fx1 = 0.77, fy1 = 0.030;
+      vec3 t0 = snFbm( vec2( vA * fx0, uA * fy0 ), 3, 0.62 );
+      vec3 t1 = snFbm( vec2( vB * fx1, uB * fy1 ), 2, 0.60 );
+      // Ridged: a track is a groove with a lip each side, not a lump.
+      float s0 = t0.x < 0.0 ? -1.0 : 1.0, s1 = t1.x < 0.0 ? -1.0 : 1.0;
+      float k0 = s0 * a0, k1 = s1 * a1;
+      // world gradient of ( vA * fx0 ) is fx0 * ( xA + dA * eA ); of ( uA * fy0 ) is fy0 * eA
+      vec2 gw = k0 * ( t0.y * fx0 * ( xA + dA * eA ) + t0.z * fy0 * eA )
+              + k1 * ( t1.y * fx1 * ( xB + dB * eB ) + t1.z * fy1 * eB );
+      grad += vec3( gw.x, 0.0, gw.y ) * sw.y;
+      trackA = clamp( ( 0.5 - abs( t0.x ) ) * a0 * 26.0
+                    + ( 0.5 - abs( t1.x ) ) * a1 * 11.0, 0.0, 1.0 ) * sw.y;
+    }
+  }
+
   snMicroAO = clamp( 1.0 - 0.30 * clamp( 0.45 - fineNorm * 0.75, 0.0, 1.0 )
-                       - 0.16 * clamp( -relief * 1.6, 0.0, 1.0 ), 0.55, 1.0 );
+                       - 0.16 * clamp( -relief * 1.6, 0.0, 1.0 )
+                       - 0.15 * clamp( -gGrain, 0.0, 1.0 )
+                       - 0.26 * trackA, 0.42, 1.0 );
   relief += fine;
 
   // Convex wind lips get scoured to ice; hollows collect powder.
@@ -517,7 +706,7 @@ float snSpecTint = 1.0;
   snPowder = clamp( -curv * 1.9 + lee * 0.5 + flow * 0.45, 0.0, 1.0 );
 
   // Surface-gradient normal perturbation (correct on steeps, no UV stretch).
-  vec3 g = mix( grad, rGrad * 2.1, snRockMask );
+  vec3 g = mix( grad, rGrad * 2.7, snRockMask );
   g -= Ng * dot( g, Ng );
   float ds = uDetailStrength * mix( 1.0, 0.72, snIce );
   snNormalW = normalize( Ng - g * ds );
@@ -547,10 +736,20 @@ float snSpecTint = 1.0;
   // what separates rock from clay. The *coarse* bands are in this sum as well,
   // so a face four kilometres away still has dark chimneys and pale buttresses
   // on it long after the metre-scale crack field has been retired.
-  rockAlb *= 0.34 + 1.00 * clamp( rFrac * 5.5 + rLedge * 1.15 + 0.62, 0.0, 1.0 );
+  //
+  // The floor used to be 0.34 of the face value. Photographs of a real limestone
+  // wall run from near black in the chimneys to bright buff on the sunlit
+  // buttresses — a good four stops — and compressing that into a single stop is
+  // most of what made ours read as grey modelling clay.
+  rockAlb *= 0.14 + 1.20 * clamp( rFrac * 6.5 + rLedge * 1.30 + 0.58, 0.0, 1.0 );
   // The facet tilt doubles as a per-plate lightness jitter — freshly split faces
   // are pale, weathered ones are not.
-  rockAlb *= 1.0 + facet.y * 0.30;
+  rockAlb *= 1.0 + facet.y * 0.55;
+  // Whole-buttress value variation. A real massif is not one rock: bands of
+  // darker, wetter, more shattered ground alternate with pale slabs on a
+  // hectometre scale, and that big-scale mottling is what reads as "made of
+  // something" from three kilometres away, where every crack is sub-pixel.
+  rockAlb *= 0.55 + 0.85 * clamp( rn2.x * 0.9 + gu.x * 0.7 + 0.55, 0.0, 1.0 );
 
   // Iron oxide bleeds out of the bedding and runs down the wet lines.
   float iron = clamp( rn2.x * 1.6 + 0.18, 0.0, 1.0 )
@@ -567,8 +766,10 @@ float snSpecTint = 1.0;
   rockAlb *= mix( 1.0, 0.42, wetRock );
 
   // Cavity occlusion from the crack field — the cheapest thing that stops a
-  // rock face reading as a decal on a smooth surface.
-  snRockAO = mix( 1.0, clamp( 0.58 + rFrac * 3.0 + rLedge * 0.35, 0.42, 1.0 ), snRockMask );
+  // rock face reading as a decal on a smooth surface. A broken face sees a small
+  // fraction of the sky; sitting in a snow bowl it was picking up as much bounce
+  // as the snow around it, which flattened it to a uniform pale grey.
+  snRockAO = mix( 1.0, clamp( 0.30 + rFrac * 3.4 + rLedge * 0.45, 0.16, 0.92 ), snRockMask );
 
   diffuseColor.rgb = mix( snowAlb, rockAlb, snRockMask );
 
@@ -633,14 +834,21 @@ const SNOW_SCATTER = /* glsl */`
   reflectedLight.directDiffuse += ( sss + retro + wrapL ) * diffuseColor.rgb;
 
   // Anisotropic wind-packed sheen.
-  vec3 Wt = normalize( vec3( uWindDir.x, 0.0, uWindDir.y ) );
+  //
+  // Two things about this term used to be wrong and between them they produced
+  // most of the "brushed metal" read. It was aligned to uWindDir, a *global
+  // constant*, so the satin streak ran in one identical screen direction over
+  // the entire mountain; and its lobe was 5.7:1, which is a hairline brush, not
+  // wind-packed snow. It now follows the same per-fragment wind field the relief
+  // does, at a 1.9:1 lobe — enough to see the grain, not enough to lacquer it.
+  vec3 Wt = normalize( vec3( snWind.x, 0.0, snWind.y ) );
   vec3 Tw = normalize( ( viewMatrix * vec4( Wt, 0.0 ) ).xyz );
   vec3 Tr = Tw - N * dot( Tw, N );
   vec3 T = dot( Tr, Tr ) > 1e-6 ? normalize( Tr ) : vec3( 0.0 );
   vec3 B = cross( N, T );
   vec3 H = normalize( L + V );
-  float ar = mix( 0.30, 0.09, snIce );
-  float d = min( snAnisoGGX( N, T, B, H, ar * 2.4, ar * 0.42 ), 60.0 );
+  float ar = mix( 0.34, 0.13, snIce );
+  float d = min( snAnisoGGX( N, T, B, H, ar * 1.38, ar * 0.72 ), 60.0 );
   float fres = 0.028 + 0.972 * pow( 1.0 - max( dot( V, H ), 0.0 ), 5.0 );
   reflectedLight.directSpecular += C * shd * max( ndl, 0.0 ) * d * fres * 0.55 * snowness;
 
@@ -787,9 +995,13 @@ export function createSnowMaterial(opts = {}) {
     uSnowTint: { value: new THREE.Color(0.64, 0.675, 0.745) },
     uShadeTint: { value: new THREE.Color(0.60, 0.71, 1.14) },
     uSSSTint: { value: new THREE.Color(0.86, 0.92, 1.0) },
-    uRockLo: { value: new THREE.Color(0.026, 0.026, 0.030) },
-    uRockHi: { value: new THREE.Color(0.114, 0.120, 0.138) },     // cool grey granite
-    uRockWarm: { value: new THREE.Color(0.205, 0.168, 0.114) },   // buff limestone
+    // Measured alpine rock is dark: dry limestone sits around 20% reflectance,
+    // wet or shattered granite nearer 8%. Against 85%-albedo snow that is a
+    // three-stop drop, and holding it is what makes the massif read as stone
+    // instead of as grey putty.
+    uRockLo: { value: new THREE.Color(0.014, 0.013, 0.016) },
+    uRockHi: { value: new THREE.Color(0.082, 0.080, 0.086) },     // cool grey granite
+    uRockWarm: { value: new THREE.Color(0.212, 0.158, 0.093) },   // buff limestone
     uRockIron: { value: new THREE.Color(0.104, 0.052, 0.022) },   // oxide staining
     uRockLichen: { value: new THREE.Color(0.066, 0.074, 0.048) },
     // A near-horizontal bedding plane makes contour terraces out of every face.

@@ -62,10 +62,12 @@ export function createChaseCam(camera) {
   const tmp2 = new THREE.Vector3();
   const probe = new THREE.Vector3();
   const camUp = new THREE.Vector3(0, 1, 0);
+  const side = new THREE.Vector3();
 
-  const v = { yaw: 0, fov: 0, roll: 0, lift: 0, shake: 0 };
+  const v = { yaw: 0, fov: 0, roll: 0, lift: 0, shake: 0, lat: 0, susp: 0, boom: 0 };
   let yaw = null, fov = FOV_BASE, roll = 0, lift = 0, shakeAmp = 0;
   let airLift = 0, kick = 0, kickV = 0, t = 0;
+  let lat = 0, susp = 0, boom = 0, pump = 0;
   let init = false;
 
   return {
@@ -77,14 +79,32 @@ export function createChaseCam(camera) {
       const spd = state.speed || 0;
       // Linear speed ramp: smoothstep is too flat at the low end and normal
       // play speeds (12-30 m/s) would barely widen the FOV.
-      const sT = clamp((spd - 7) / 27, 0, 1);
+      const sT = clamp((spd - 4) / 24, 0, 1);
       const m = state.motion || {};
+
+      // ---- breathing ----------------------------------------------------------
+      // Two slow incommensurate sines per channel: never repeats, never reads as a
+      // wobble, and it is the difference between a camera and a tripod. Amplitude
+      // is sub-degree and scales with speed, so a stationary rider is rock steady.
+      const brY = Math.sin(t * 0.53) * 0.6 + Math.sin(t * 0.83 + 2.1) * 0.4;
+      const brX = Math.sin(t * 0.41 + 1.3) * 0.6 + Math.sin(t * 0.67 + 0.5) * 0.4;
+      const brZ = Math.sin(t * 0.37 + 4.0) * 0.6 + Math.sin(t * 0.61 + 1.9) * 0.4;
+
+      // ---- suspension: the boom shares the rider's legs ------------------------
+      // physics publishes how far the legs are extended over a roller (suspension)
+      // and how hard the snow is pushing back up through them (squash). Feeding
+      // that straight into the boom length + height is what makes a compression
+      // read as weight rather than as a bump in the heightfield.
+      const suspT = clamp((m.suspension || 0) - (m.squash || 0) * 1.2
+                          - clamp(m.compression || 0, 0, 1.4) * 0.55, -1, 1);
+      susp = smoothDampS(susp, suspT, v, 'susp', 0.16, dt);
 
       // ---- boom yaw: behind the skis, biased towards where he is actually going
       const headYaw = state.heading;
       let travelYaw = headYaw;
       if (spd > 2.5) travelYaw = Math.atan2(-state.vel.x, -state.vel.z);
-      const yawTarget = headYaw + wrapPi(travelYaw - headYaw) * 0.35;
+      const yawTarget = headYaw + wrapPi(travelYaw - headYaw) * 0.35
+                        + brX * 0.014 * (0.25 + 0.75 * sT);
 
       if (yaw === null) { yaw = yawTarget; v.yaw = 0; }
       // unwrap so the spring never takes the long way round
@@ -102,8 +122,17 @@ export function createChaseCam(camera) {
       // ---- boom geometry ------------------------------------------------------
       airLift += ((state.airborne ? smoothstep(state.airTime, 0.15, 0.9) : 0) - airLift)
                  * Math.min(1, dt * 3.5);
-      const dist = 5.6 + 2.6 * sT + 2.2 * airLift;
-      const height = 2.05 + 0.85 * sT + 2.4 * airLift;
+      // Pull back AND drop with speed: a low boom rakes the snow past the lens and
+      // reads far faster than a high one, while the extra distance keeps the rider
+      // whole in frame. Big air backs off and climbs so the landing stays framed.
+      // Wide AND close. Widening the lens alone just shrinks the rider and makes
+      // the frame feel empty; the look every shipped snow game uses is a short
+      // boom on a wide lens, which keeps him the same size on screen while the
+      // world stretches out around him and the snow rakes past the edges.
+      const dist = 4.45 + 1.55 * sT + 2.6 * airLift - 0.55 * susp
+                   + brZ * (0.05 + 0.16 * sT);
+      const height = 1.62 - 0.28 * sT + 2.6 * airLift + 0.45 * susp
+                     + brY * (0.05 + 0.14 * sT);
 
       // Tilt the boom with the slope so a steep pitch still shows the run ahead.
       const gn = state.groundNormal;
@@ -150,6 +179,43 @@ export function createChaseCam(camera) {
         }
       }
 
+      // ---- composition: get the rider off the crosshair -----------------------
+      // A chase cam that keeps the subject nailed to the centre of frame is what
+      // makes a game read as a tech demo. Look *into* the turn: the aim point
+      // swings towards the inside of the arc, which slides the rider out to the
+      // outside third and shows the snow he is about to cut. Yaw rate drives it,
+      // so it is zero on a straight run and unwinds by itself on the exit.
+      side.set(Math.cos(yaw), 0, -Math.sin(yaw));      // camera right, world xz
+      side.addScaledVector(up, -side.dot(up)).normalize();
+
+      // (a) look into the arc
+      let latT = clamp((m.yawRate || 0) / 1.15, -1, 1) * (state.airborne ? 0.25 : 1);
+      // (b) and follow the run: where the fall line goes a lead-distance ahead.
+      // On a straight schuss (a) is zero and this is the only thing keeping the
+      // rider off the exact centre line — which is why the framing reads as a
+      // camera operator following a run rather than a rig bolted to his back.
+      if (terrain) {
+        const n2 = terrain.normal(state.pos.x + travel.x * lead,
+                                  state.pos.z + travel.z * lead, 14);
+        const dl = Math.hypot(n2.x, n2.z);
+        if (dl > 1e-4) latT -= clamp((n2.x * side.x + n2.z * side.z) / dl, -1, 1) * 0.95;
+      }
+      lat = smoothDampS(lat, clamp(latT, -1.05, 1.05), v, 'lat', 0.34, dt);
+      wantLook.addScaledVector(side, -lat * 6.5 * (0.35 + 0.65 * sT));
+
+      // ---- horizon guard ------------------------------------------------------
+      // Aiming at the snow ahead is right on a mellow pitch and disastrous on a
+      // steep one: the camera ends up staring at its own shadow with the sky gone.
+      // Clamp the aim pitch so the ridgeline is always in frame and the rider
+      // always sits low-centre, never dead-centre.
+      tmp.copy(wantLook).sub(want);
+      const horizD = Math.hypot(tmp.x, tmp.z);
+      if (horizD > 0.5) {
+        const aim = Math.atan2(tmp.y, horizD);
+        const aimC = clamp(aim, -0.24, 0.06);
+        if (aimC !== aim) wantLook.y = want.y + Math.tan(aimC) * horizD;
+      }
+
       // ---- snap on teleport, otherwise spring ---------------------------------
       const teleport = !init || dt >= 0.5 || pos.distanceToSquared(want) > 3600;
       if (teleport) {
@@ -175,7 +241,7 @@ export function createChaseCam(camera) {
           const px = state.pos.x + (pos.x - state.pos.x) * f;
           const pz = state.pos.z + (pos.z - state.pos.z) * f;
           const py = state.pos.y + 1.2 + (pos.y - (state.pos.y + 1.2)) * f;
-          const clear = terrain.height(px, pz) + 1.1 + 0.6 * f;
+          const clear = terrain.height(px, pz) + 0.85 + 0.5 * f;
           if (clear > py) need = Math.max(need, clear - py);
         }
         const liftT = Math.min(need, 12);
@@ -186,11 +252,11 @@ export function createChaseCam(camera) {
       // ---- shake: felt, not noticed ------------------------------------------
       const g = Math.abs(state.gForce || 0);
       const rough = clamp(m.roughness || 0, 0, 1);
-      const ampT = clamp(0.055 * g + 0.10 * rough * sT + 0.05 * sT, 0, 0.30) * (state.airborne ? 0.25 : 1);
+      const ampT = clamp(0.050 * g + 0.13 * rough * sT + 0.06 * sT, 0, 0.34) * (state.airborne ? 0.22 : 1);
       shakeAmp += (ampT - shakeAmp) * Math.min(1, dt * 6);
 
       // landing kick (impulse into a damped spring, so it settles, never rings)
-      if (m.landImpact > 0.5 && !state.airborne) kickV -= Math.min(9, m.landImpact * 0.55);
+      if (m.landImpact > 0.5 && !state.airborne) kickV -= Math.min(9, m.landImpact * 0.70);
       kickV += (-kick * 260 - kickV * 22) * dt;
       kick += kickV * dt;
       kick = clamp(kick, -0.9, 0.9);
@@ -202,23 +268,43 @@ export function createChaseCam(camera) {
       camera.position.y += lift + kick * 0.35;
 
       // ---- orient -------------------------------------------------------------
-      camUp.set(0, 1, 0).lerp(gn, 0.14).normalize();
+      // Rake with the hill. A chase cam pinned to world-up on a cross-slope is the
+      // single most "engine demo" thing a snow game can do — every shipped one
+      // rolls into the face. 0.32 keeps ~1/3 of the slope tilt, which on a 30 deg
+      // traverse is a 10 deg dutch angle: unmistakably alive, well short of the
+      // horizon-tumbling that makes people put the pad down.
+      camUp.set(0, 1, 0).lerp(gn, 0.32).normalize();
       camera.up.copy(camUp);
       camera.lookAt(look.x, look.y + kick * 0.15, look.z);
 
       // shake as a rotation in camera space (translation-free = no nausea)
-      camera.rotateX(sy * shakeAmp * 0.055);
-      camera.rotateY(sx * shakeAmp * 0.055);
+      // Rotation-only shake: no translation, so it reads as a hand on the rig
+      // rather than as the world sloshing — which is the thing that makes people
+      // ill. Peak amplitude here is ~1.4 deg.
+      camera.rotateX(sy * shakeAmp * 0.072);
+      camera.rotateY(sx * shakeAmp * 0.072);
 
-      // bank into the carve
-      const rollT = clamp(-(state.edge || 0) * 0.14 * (0.35 + 0.65 * sT)
-                          - clamp((m.aLat || 0) / 30, -1, 1) * 0.045, -0.10, 0.10);
-      roll = smoothDampS(roll, rollT, v, 'roll', 0.28, dt);
+      // ---- bank into the carve ------------------------------------------------
+      // Track the rider's true inclination (physics publishes the angle he is
+      // actually balancing at) rather than the edge input, so the camera leans
+      // with the LOAD: heavy at the belly of the turn, unwound at the transition.
+      // A third of his lean, capped at 8 deg — enough to feel the g, far short of
+      // the horizon-rolling that makes people queasy.
+      const rollT = clamp(-(m.inclination || 0) * 0.30 * (0.30 + 0.70 * sT)
+                          - (state.edge || 0) * 0.030 * sT
+                          + lat * 0.055 * (0.3 + 0.7 * sT), -0.16, 0.16);
+      roll = smoothDampS(roll, rollT, v, 'roll', 0.26, dt);
       camera.rotateZ(roll + sx * shakeAmp * 0.03);
 
       // ---- speed FOV ----------------------------------------------------------
-      const fovT = FOV_BASE + 16 * sT + 3.5 * airLift + clamp(Math.abs(kick) * 3, 0, 3);
-      fov = smoothDampS(fov, fovT, v, 'fov', 0.35, dt);
+      // Speed sets the base; ACCELERATION pumps it. Standing on the gas widens the
+      // lens a couple of degrees and scrubbing speed pulls it back in, which is
+      // what actually sells "gaining speed" — a constant 30 m/s cruise and a
+      // 30 m/s deceleration should not look identical.
+      pump += (clamp((m.aLong || 0) / 7, -1, 1) - pump) * Math.min(1, dt * 3.5);
+      const fovT = FOV_BASE + 21 * sT + 3.0 * pump + 3.5 * airLift
+                   + clamp(Math.abs(kick) * 3, 0, 3);
+      fov = smoothDampS(fov, fovT, v, 'fov', 0.30, dt);
       if (Math.abs(camera.fov - fov) > 0.02) {
         camera.fov = fov;
         camera.updateProjectionMatrix();
@@ -234,6 +320,12 @@ export function createChaseCam(camera) {
         d.dist = camera.position.distanceTo(state.pos);
         d.boom = dist; d.height = height; d.fov = fov; d.lift = lift;
         d.roll = roll; d.yawLag = wrapPi(yaw - headYaw); d.shake = shakeAmp; d.kick = kick;
+        d.lat = lat; d.susp = susp; d.pump = pump;
+        const q = camera.quaternion;
+        const fy = -2 * (q.y * q.z - q.w * q.x);
+        const fx = -2 * (q.x * q.z + q.w * q.y);
+        const fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+        d.aimDeg = Math.atan2(fy, Math.hypot(fx, fz)) * 180 / Math.PI;
       }
     },
   };

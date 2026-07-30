@@ -16,6 +16,7 @@
  * the bases on the snow at any edge angle on any slope.
  */
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const clamp = THREE.MathUtils.clamp;
 const lerp = THREE.MathUtils.lerp;
@@ -45,55 +46,210 @@ function fbm(x, y, p, s, oct = 4) {
   return sum;
 }
 
-/** Tileable technical-fabric normal + roughness maps (weave + wrinkle noise). */
-function makeFabricMaps(size = 256) {
-  const h = new Float32Array(size * size);
-  const P = 8;
+// --- material-surface baker --------------------------------------------------
+//
+// One generic baker turns a per-texel field function into the three maps that
+// actually kill the "untextured plastic" read: a normal map (micro relief), a
+// roughness map (never uniform — that is the single biggest tell) and a colour
+// map carrying baked cavity darkening plus the pale edge highlight that a real
+// stitched seam throws. `sample(u, v, out)` writes [height, roughness, tint].
+
+const _sOut = [0, 0, 1];
+
+/**
+ * @param {number} size            texture resolution
+ * @param {(u:number,v:number,out:number[])=>void} sample
+ * @param {object} o  { nScale, sRGB }  nScale scales the normal slope
+ */
+function bakeMaps(size, sample, o = {}) {
+  const nScale = o.nScale ?? 2.4;
+  const H = new Float32Array(size * size);
+  const R = new Float32Array(size * size);
+  const T = new Float32Array(size * size);
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const u = (x / size) * P, v = (y / size) * P;
-      // ripstop weave: fine grid + coarse thread bundles
-      const weave =
-        0.5 + 0.5 * Math.sin(x * Math.PI * 2 * 16 / size * (size / size)) * 0.0;
-      const thread =
-        Math.sin((x / size) * Math.PI * 2 * 64) * 0.5 +
-        Math.sin((y / size) * Math.PI * 2 * 64) * 0.5;
-      const rip =
-        (Math.abs(((x / size) * 16) % 1 - 0.5) < 0.06 ? 1 : 0) +
-        (Math.abs(((y / size) * 16) % 1 - 0.5) < 0.06 ? 1 : 0);
-      const wrinkle = fbm(u * 1.4, v * 1.4, P * 1.4, 3, 4);
-      h[y * size + x] = wrinkle * 0.7 + thread * 0.06 + rip * 0.09 + weave;
+      sample((x + 0.5) / size, (y + 0.5) / size, _sOut);
+      const i = y * size + x;
+      H[i] = _sOut[0]; R[i] = _sOut[1]; T[i] = _sOut[2];
     }
   }
   const nData = new Uint8Array(size * size * 4);
   const rData = new Uint8Array(size * size * 4);
-  const at = (x, y) => h[(((y % size) + size) % size) * size + (((x % size) + size) % size)];
+  const cData = new Uint8Array(size * size * 4);
+  const wrap = (v) => ((v % size) + size) % size;
+  const at = (x, y) => H[wrap(y) * size + wrap(x)];
+  // cavity term: height minus a blurred height => darkens grooves, lifts ridges
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const dx = (at(x + 1, y) - at(x - 1, y)) * 2.6;
-      const dy = (at(x, y + 1) - at(x, y - 1)) * 2.6;
-      const n = new THREE.Vector3(-dx, -dy, 1).normalize();
-      const i = (y * size + x) * 4;
-      nData[i] = (n.x * 0.5 + 0.5) * 255;
-      nData[i + 1] = (n.y * 0.5 + 0.5) * 255;
-      nData[i + 2] = (n.z * 0.5 + 0.5) * 255;
-      nData[i + 3] = 255;
-      const r = clamp(0.62 + (at(x, y) - 0.5) * 0.55, 0.25, 1) * 255;
-      rData[i] = rData[i + 1] = rData[i + 2] = r;
-      rData[i + 3] = 255;
+      const i = y * size + x;
+      const dx = (at(x + 1, y) - at(x - 1, y)) * nScale;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * nScale;
+      const inv = 1 / Math.sqrt(dx * dx + dy * dy + 1);
+      const j = i * 4;
+      nData[j] = (-dx * inv * 0.5 + 0.5) * 255;
+      nData[j + 1] = (-dy * inv * 0.5 + 0.5) * 255;
+      nData[j + 2] = (inv * 0.5 + 0.5) * 255;
+      nData[j + 3] = 255;
+      const r = clamp(R[i], 0.02, 1) * 255;
+      rData[j] = rData[j + 1] = rData[j + 2] = r;
+      rData[j + 3] = 255;
+      // tint is authored in linear-ish terms; store it sRGB-encoded
+      const t = clamp(T[i], 0, 2);
+      const enc = Math.pow(t > 1 ? 1 : t, 1 / 2.2) * (t > 1 ? t : 1);
+      const c = clamp(enc, 0, 1) * 255;
+      cData[j] = cData[j + 1] = cData[j + 2] = c;
+      cData[j + 3] = 255;
     }
   }
-  const mk = (data) => {
+  const mk = (data, srgb) => {
     const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     t.minFilter = THREE.LinearMipmapLinearFilter;
     t.magFilter = THREE.LinearFilter;
     t.generateMipmaps = true;
-    t.anisotropy = 4;
+    t.anisotropy = 8;
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
     t.needsUpdate = true;
     return t;
   };
-  return { normal: mk(nData), rough: mk(rData) };
+  return { normal: mk(nData, false), rough: mk(rData, false), tint: mk(cData, true) };
+}
+
+/** micro ripstop weave, tileable, shared by every fabric on the character. */
+function weaveField(u, v, freq) {
+  const f = freq;
+  // two thread systems, one slightly finer => faint anisotropy in the sheen
+  const warp = Math.sin(u * Math.PI * 2 * f) * 0.5 + 0.5;
+  const weft = Math.sin(v * Math.PI * 2 * f * 0.92) * 0.5 + 0.5;
+  const w = warp * 0.55 + weft * 0.45;
+  // ripstop reinforcement grid every 1/14 of the tile
+  const gu = Math.abs(((u * 14) % 1) - 0.5), gv = Math.abs(((v * 14) % 1) - 0.5);
+  const rip = (gu > 0.455 ? 1 : 0) * 0.55 + (gv > 0.455 ? 1 : 0) * 0.55;
+  return w * 0.11 + rip * 0.030;
+}
+
+/** technical shell: weave + soft wrinkle field + dye unevenness. */
+function makeShellMaps(size = 256) {
+  return bakeMaps(size, (u, v, out) => {
+    const wr = fbm(u * 7, v * 7, 7, 11, 4);            // slack-fabric wrinkles
+    const cr = Math.abs(fbm(u * 3.5, v * 3.5, 4, 3, 3) - 0.5); // crease ridges
+    const w = weaveField(u, v, 58);
+    const h = wr * 0.30 + (0.5 - cr) * 0.16 + w;
+    out[0] = h;
+    out[1] = 0.70 + (wr - 0.5) * 0.20 - w * 0.35;      // ridges catch light
+    out[2] = 0.93 + (wr - 0.5) * 0.10 + w * 0.10;
+  }, { nScale: 2.2 });
+}
+
+/**
+ * Quilted / baffled insulation. v runs down the garment: horizontal channels,
+ * a stitched seam trench between them with visible needle dimples, and a pale
+ * lip just above each seam where the fabric turns into the light.
+ */
+function makeQuiltMaps(size = 512, nBaffle = 6, stitches = 52) {
+  return bakeMaps(size, (u, v0, out) => {
+    // seams are sewn by a human, not a plotter: let each channel wander a little
+    const v = v0 + 0.010 * Math.sin(u * Math.PI * 2 * 2 + 0.7)
+      + 0.006 * Math.sin(u * Math.PI * 2 * 5 + 2.1);
+    const p = ((v * nBaffle) % 1 + 1) % 1;
+    const d = Math.min(p, 1 - p);                       // 0 at a seam, .5 mid-baffle
+    const q = Math.min(1, d * 2);
+    // pillow: full at the channel centre, pinched to nothing at the stitch line
+    let h = Math.pow(Math.sin(q * Math.PI * 0.5), 0.55) * 0.36;
+    const trench = Math.exp(-Math.pow(d / 0.026, 2));
+    h -= trench * 0.26;
+    // needle dimples marching along the seam
+    const st = 0.5 + 0.5 * Math.sin(u * Math.PI * 2 * stitches);
+    h -= trench * Math.pow(st, 6) * 0.13;
+    h += Math.exp(-Math.pow((d - 0.070) / 0.042, 2)) * 0.05;   // seam lip
+    // the baffles are not machine-perfect: puff varies along the channel
+    const puff = fbm(u * 5, v * 2.5, 5, 21, 3);
+    h += (puff - 0.5) * 0.13 * q;
+    const w = weaveField(u, v, 96);
+    h += w * 0.30;
+    out[0] = h;
+    // seam trench is compressed and shinier; the puffed centre is matte
+    out[1] = 0.74 - trench * 0.22 - q * 0.05 - w * 0.5 + (puff - 0.5) * 0.10;
+    // baked cavity + edge highlight: this is what makes it read as sewn cloth
+    out[2] = 0.97 - trench * 0.30
+      + Math.exp(-Math.pow((d - 0.080) / 0.05, 2)) * 0.10
+      + (puff - 0.5) * 0.07;
+  }, { nScale: 2.1 });
+}
+
+/** matte rubberised palm / glove: fine pebble grain, no specular hotspots. */
+function makeRubberMaps(size = 256) {
+  return bakeMaps(size, (u, v, out) => {
+    const cell = 26;
+    const fx = u * cell, fy = v * cell;
+    const ix = Math.floor(fx), iy = Math.floor(fy);
+    let best = 9;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const cx = ix + ox + hash2(ix + ox, iy + oy, cell, 3) * 0.9 + 0.05;
+        const cy = iy + oy + hash2(ix + ox, iy + oy, cell, 7) * 0.9 + 0.05;
+        const dd = (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy);
+        if (dd < best) best = dd;
+      }
+    }
+    const pebble = clamp(1 - Math.sqrt(best) * 2.1, 0, 1);
+    const h = Math.pow(pebble, 0.6) * 0.5 + fbm(u * 9, v * 9, 9, 5, 3) * 0.1;
+    out[0] = h;
+    out[1] = 0.86 - pebble * 0.16;
+    out[2] = 0.88 + pebble * 0.16;
+  }, { nScale: 2.0 });
+}
+
+/** injection-moulded hard shell: orange peel + faint tool marks. */
+function makeShellPlasticMaps(size = 256) {
+  return bakeMaps(size, (u, v, out) => {
+    const peel = fbm(u * 26, v * 26, 26, 31, 3);
+    const flow = fbm(u * 4, v * 14, 4, 13, 3);
+    out[0] = peel * 0.16 + flow * 0.06;
+    out[1] = 0.30 + (peel - 0.5) * 0.20 + (flow - 0.5) * 0.08;
+    out[2] = 0.97 + (peel - 0.5) * 0.05;
+  }, { nScale: 1.5 });
+}
+
+/**
+ * Mirrored goggle lens. The colour map is the whole trick: a vertical gradient
+ * from a cold blue chrome across the top to a warm bronze at the bottom rim,
+ * with a bright specular band where a real spherical lens catches the sky.
+ */
+function makeLensMaps(size = 128) {
+  return bakeMaps(size, (u, v, out) => {
+    out[0] = 0;
+    out[1] = 0.035 + v * 0.02;
+    out[2] = 1;
+  }, { nScale: 0.2 });
+}
+function makeLensColor(size = 128) {
+  const d = new Uint8Array(size * size * 4);
+  const top = new THREE.Color(0x8fc6ff), mid = new THREE.Color(0x6f8fe0), bot = new THREE.Color(0xd8a06a);
+  const c = new THREE.Color();
+  for (let y = 0; y < size; y++) {
+    const v = (y + 0.5) / size;
+    for (let x = 0; x < size; x++) {
+      const u = (x + 0.5) / size;
+      if (v < 0.55) c.copy(top).lerp(mid, THREE.MathUtils.smoothstep(v, 0.0, 0.55));
+      else c.copy(mid).lerp(bot, THREE.MathUtils.smoothstep(v, 0.55, 1.0));
+      // horizon band a real spherical mirror lens always shows
+      const band = Math.exp(-Math.pow((v - 0.42) / 0.07, 2)) * 0.35;
+      const k = 1 + band + Math.exp(-Math.pow((u - 0.5) / 0.34, 2)) * 0.06;
+      const i = (y * size + x) * 4;
+      d[i] = clamp(Math.pow(c.r * k, 1 / 2.2), 0, 1) * 255;
+      d[i + 1] = clamp(Math.pow(c.g * k, 1 / 2.2), 0, 1) * 255;
+      d[i + 2] = clamp(Math.pow(c.b * k, 1 / 2.2), 0, 1) * 255;
+      d[i + 3] = 255;
+    }
+  }
+  const t = new THREE.DataTexture(d, size, size, THREE.RGBAFormat);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.generateMipmaps = true;
+  t.needsUpdate = true;
+  return t;
 }
 
 /** Ski topsheet graphic. u runs tail->tip, v across the ski. */
@@ -238,6 +394,187 @@ function limbProfile(len, rTop, rMid, rBot, t0 = 0, t1 = 1, n = 8) {
   return pts;
 }
 
+// ---------------------------------------------------------------------------
+// lofted surfaces
+//
+// A stack of separate lathes is exactly what made the old body read as blocks:
+// every joint between two lathes is a hard step, and every lathe is a solid of
+// revolution so nothing can be deeper than it is wide. Everything soft on the
+// character is now ONE parametric surface instead — continuous from hem to
+// collar, elliptical, offset-able, and free to carry fabric folds. Normals come
+// from central differences on the surface itself, so the phi seam never creases.
+// ---------------------------------------------------------------------------
+
+const _psP = new THREE.Vector3(), _psA = new THREE.Vector3(), _psB = new THREE.Vector3();
+const _psC = new THREE.Vector3(), _psD = new THREE.Vector3();
+const _psU = new THREE.Vector3(), _psV = new THREE.Vector3(), _psN = new THREE.Vector3();
+
+/**
+ * @param {(u:number,v:number,out:THREE.Vector3)=>void} fn  u wraps around, v runs along
+ * @param {object} o { nu, nv, capA, capB, matFn, vScale }
+ */
+function paramSurface(fn, o = {}) {
+  const nu = o.nu ?? 28, nv = o.nv ?? 24;
+  const eu = 0.35 / nu, ev = 0.35 / nv;
+  const pos = [], nrm = [], uvs = [];
+  const rows = nv + 1, cols = nu + 1;
+  for (let j = 0; j <= nv; j++) {
+    const v = j / nv;
+    for (let i = 0; i <= nu; i++) {
+      const u = i / nu;
+      fn(u, v, _psP);
+      fn(u + eu, v, _psA); fn(u - eu, v, _psB);
+      fn(u, Math.min(1, v + ev), _psC); fn(u, Math.max(0, v - ev), _psD);
+      _psU.subVectors(_psA, _psB);
+      _psV.subVectors(_psC, _psD);
+      _psN.crossVectors(_psV, _psU);
+      if (_psN.lengthSq() < 1e-12) _psN.set(0, 1, 0); else _psN.normalize();
+      pos.push(_psP.x, _psP.y, _psP.z);
+      nrm.push(_psN.x, _psN.y, _psN.z);
+      uvs.push(u, v * (o.vScale ?? 1));
+    }
+  }
+  // Which way is out? Depends on whether the caller authored v running up or
+  // down the part, so decide it from the geometry instead of from a convention
+  // nobody will remember: compare a mid-belt normal against the ray from the
+  // solid's centroid. Everything — normals AND winding — follows that one bit.
+  const cen = new THREE.Vector3();
+  const nVerts = pos.length / 3;
+  for (let k = 0; k < pos.length; k += 3) { cen.x += pos[k]; cen.y += pos[k + 1]; cen.z += pos[k + 2]; }
+  cen.multiplyScalar(1 / nVerts);
+  let dotSum = 0;
+  for (let i = 0; i < nu; i += 2) {
+    const k = ((nv >> 1) * cols + i) * 3;
+    dotSum += (pos[k] - cen.x) * nrm[k] + (pos[k + 1] - cen.y) * nrm[k + 1] + (pos[k + 2] - cen.z) * nrm[k + 2];
+  }
+  // open strips have no meaningful centroid test, so the caller can override
+  const flip = o.flip !== undefined ? o.flip : dotSum < 0;
+  if (flip) for (let k = 0; k < nrm.length; k++) nrm[k] = -nrm[k];
+
+  // triangles, bucketed by material group so panels can share exact vertices
+  const buckets = new Map();
+  const push = (m, a, b, c) => {
+    let arr = buckets.get(m); if (!arr) buckets.set(m, arr = []);
+    if (flip) arr.push(a, c, b); else arr.push(a, b, c);
+  };
+  for (let j = 0; j < nv; j++) {
+    const v = (j + 0.5) / nv;
+    const m = o.matFn ? o.matFn(v) : 0;
+    for (let i = 0; i < nu; i++) {
+      const a = j * cols + i, b = a + 1, c = a + cols, d = c + 1;
+      push(m, a, c, d); push(m, a, d, b);
+    }
+  }
+  // caps: a fan to the ring centroid, normal taken along the ring's own axis
+  const _cn = new THREE.Vector3(), _cx = new THREE.Vector3(), _cq = new THREE.Vector3();
+  const addCap = (end) => {
+    const row = end ? nv : 0;
+    const near = end ? nv - 1 : 1;
+    _cx.set(0, 0, 0); _cq.set(0, 0, 0);
+    for (let i = 0; i < nu; i++) {
+      let k = (row * cols + i) * 3;
+      _cx.x += pos[k]; _cx.y += pos[k + 1]; _cx.z += pos[k + 2];
+      k = (near * cols + i) * 3;
+      _cq.x += pos[k]; _cq.y += pos[k + 1]; _cq.z += pos[k + 2];
+    }
+    _cx.multiplyScalar(1 / nu); _cq.multiplyScalar(1 / nu);
+    _cn.subVectors(_cx, _cq);
+    if (_cn.lengthSq() < 1e-10) _cn.set(0, end ? 1 : -1, 0); else _cn.normalize();
+    const ci = pos.length / 3;
+    pos.push(_cx.x, _cx.y, _cx.z);
+    nrm.push(_cn.x, _cn.y, _cn.z);
+    uvs.push(0.5, end ? 1 : 0);
+    const m = o.matFn ? o.matFn(end ? 1 : 0) : 0;
+    // wind the fan so it actually faces _cn — measured from a real triangle,
+    // not inferred from an authoring convention
+    const va = new THREE.Vector3(pos[(row * cols) * 3], pos[(row * cols) * 3 + 1], pos[(row * cols) * 3 + 2]);
+    const vb = new THREE.Vector3(pos[(row * cols + 1) * 3], pos[(row * cols + 1) * 3 + 1], pos[(row * cols + 1) * 3 + 2]);
+    const tn = new THREE.Vector3().subVectors(va, _cx).cross(new THREE.Vector3().subVectors(vb, _cx));
+    const fwd = tn.dot(_cn) > 0;   // (ci, a, b) already faces outward
+    let arr = buckets.get(m); if (!arr) buckets.set(m, arr = []);
+    for (let i = 0; i < nu; i++) {
+      const a = row * cols + i, b = a + 1;
+      if (fwd) arr.push(ci, a, b); else arr.push(ci, b, a);
+    }
+  };
+  if (o.capA) addCap(false);
+  if (o.capB) addCap(true);
+
+  const idx = [];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  const keys = [...buckets.keys()].sort((a, b) => a - b);
+  const ranges = [];
+  for (const k of keys) {
+    const arr = buckets.get(k);
+    ranges.push([idx.length, arr.length, k]);
+    for (const t of arr) idx.push(t);
+  }
+  g.setIndex(idx);
+  g.clearGroups();
+  if (keys.length > 1) for (const [s, c, m] of ranges) g.addGroup(s, c, m);
+  return g;
+}
+
+/**
+ * Sample a ring stack: rings are [v, halfWidth, halfDepth, xOffset, zOffset].
+ * Interpolation is Catmull-Rom in the profile so ten authored rings become a
+ * genuinely smooth garment instead of ten visible steps.
+ */
+function ringSampler(rings) {
+  const n = rings.length;
+  const cr = (p0, p1, p2, p3, t) => {
+    const t2 = t * t, t3 = t2 * t;
+    return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+  };
+  return (v, out) => {
+    const vv = clamp(v, 0, 1);
+    // locate the segment by the rings' own v coordinate
+    let i = 0;
+    while (i < n - 2 && rings[i + 1][0] < vv) i++;
+    const a = rings[i], b = rings[i + 1];
+    const t = clamp((vv - a[0]) / Math.max(1e-6, b[0] - a[0]), 0, 1);
+    const p0 = rings[Math.max(0, i - 1)], p3 = rings[Math.min(n - 1, i + 2)];
+    out[0] = cr(p0[1], a[1], b[1], p3[1], t);
+    out[1] = cr(p0[2], a[2], b[2], p3[2], t);
+    out[2] = cr(p0[3] ?? 0, a[3] ?? 0, b[3] ?? 0, p3[3] ?? 0, t);
+    out[3] = cr(p0[4] ?? 0, a[4] ?? 0, b[4] ?? 0, p3[4] ?? 0, t);
+    // y is linear between the authored ring heights, not splined, so the ends
+    // land exactly where they were authored
+    out[4] = lerp(a[5], b[5], t);
+    return out;
+  };
+}
+
+const _rs = [0, 0, 0, 0, 0];
+
+/**
+ * Garment tube. `rings` = [v, halfWidth, halfDepth, xOff, zOff, y].
+ * `fold(u, v)` adds a radial offset in metres — this is where the bulk, the
+ * gathered creases and the slack of real clothing come from.
+ */
+function garment(rings, o = {}) {
+  const sample = ringSampler(rings);
+  const fold = o.fold;
+  const flat = o.flatBack ?? 0;   // squashes the back into a flatter panel
+  return paramSurface((u, v, out) => {
+    sample(v, _rs);
+    const a = u * Math.PI * 2;
+    let ca = Math.cos(a), sa = Math.sin(a);
+    let rx = _rs[0], rz = _rs[1];
+    if (flat) {
+      // back of the garment (sa < 0) is flattened toward a panel
+      const k = 1 - flat * clamp(-sa, 0, 1);
+      rz *= k;
+    }
+    const f = fold ? fold(u, v) : 0;    // metres of slack, added radially
+    const dy = o.drop ? o.drop(u, v) : 0;
+    out.set(_rs[2] + ca * (rx + f), _rs[4] + dy, _rs[3] + sa * (rz + f));
+  }, o);
+}
+
 /**
  * Lofted alpine ski: sidecut, camber, tip rocker, shaped tail, sidewall
  * construction and a metal edge wrap. Returns a geometry with 4 material
@@ -378,62 +715,124 @@ const C = {
   shell: 0xf0501c,      // jacket main — vermilion, reads hot against snow
   shellDark: 0x1d2129,  // graphite panels
   accent: 0x2fd0e8,     // cyan piping / ski accent
-  pant: 0x272c35,
-  pantPanel: 0x171b21,
+  pant: 0x353d4a,       // graphite salopette — light enough to read shape
+  pantPanel: 0x1e232c,  // scuff / knee / seat reinforcement, near-black
   helmet: 0x14171d,
   lens: 0xbfd6ee,
   skin: 0xc79a76,
   boot: 0x191d24,
-  bootCuff: 0x333941,
-  bootAccent: 0x555c66,
+  bootCuff: 0x424a55,
+  bootAccent: 0x6f7885,
   metal: 0xb9c2cc,
   glove: 0x15181e,
 };
 
 function makeMaterials(env) {
-  const fab = makeFabricMaps(256);
-  const rep = (t, r) => { const c = t.clone(); c.repeat.set(r, r); c.needsUpdate = true; return c; };
+  const shellM = makeShellMaps(256);
+  const quiltM = makeQuiltMaps(512, 6, 52);
+  const rubberM = makeRubberMaps(256);
+  const plasticM = makeShellPlasticMaps(256);
+  const lensM = makeLensMaps(64);
+  const rep = (t, rx, ry) => { const c = t.clone(); c.repeat.set(rx, ry ?? rx); c.needsUpdate = true; return c; };
 
-  const fabric = (color, { rough = 0.72, repeat = 3, sheen = 0.35, sheenColor = 0xffffff, metal = 0 } = {}) =>
+  /**
+   * The fabric recipe. Three things separate cloth from vinyl and all three are
+   * here: a *low* dielectric specular lobe (specularIntensity 0.28 — plastic's
+   * broad white highlight is the main tell), a strong sheen layer with a tight
+   * sheenRoughness so the grazing rim goes velvety, and roughness that is never
+   * constant across the surface.
+   */
+  const fabric = (color, o = {}) => {
+    const src = o.quilt ? quiltM : o.rubber ? rubberM : shellM;
+    const rx = o.repeat ?? 3, ry = o.repeatV ?? rx;
+    // Sheen colour is derived from the base, not set to white. A near-white
+    // sheen over a bright snow environment is an additive lobe strong enough to
+    // wash a dark garment out to grey — which is exactly what "vinyl" looks
+    // like. Real cloth scatters its own colour back at grazing angles.
+    const base = new THREE.Color(color);
+    const sc = o.sheenColor !== undefined
+      ? new THREE.Color(o.sheenColor)
+      : base.clone().lerp(new THREE.Color(0xffffff), 0.42).multiplyScalar(0.55 + 0.9 * Math.sqrt(base.r * 0.3 + base.g * 0.5 + base.b * 0.2));
+    return new THREE.MeshPhysicalMaterial({
+      color, roughness: o.rough ?? 0.70, metalness: 0,
+      map: o.tint === false ? null : rep(src.tint, rx, ry),
+      roughnessMap: rep(src.rough, rx, ry),
+      normalMap: rep(src.normal, rx, ry),
+      normalScale: new THREE.Vector2(o.nrm ?? 0.85, o.nrm ?? 0.85),
+      specularIntensity: o.spec ?? 0.26,
+      specularColor: new THREE.Color(0xffffff),
+      sheen: o.sheen ?? 0.9,
+      // broad, not tight: a tight sheen lobe is a specular ring, and a specular
+      // ring is the plastic look we are trying to delete
+      sheenRoughness: o.sheenRough ?? 0.72,
+      sheenColor: sc,
+      envMapIntensity: o.env ?? 0.42,
+    });
+  };
+
+  const hardShell = (color, o = {}) =>
     new THREE.MeshPhysicalMaterial({
-      color, roughness: rough, metalness: metal,
-      roughnessMap: rep(fab.rough, repeat),
-      normalMap: rep(fab.normal, repeat),
-      normalScale: new THREE.Vector2(0.5, 0.5),
-      sheen, sheenRoughness: 0.55, sheenColor: new THREE.Color(sheenColor),
-      envMapIntensity: 1.0,
+      color, roughness: o.rough ?? 0.30, metalness: 0,
+      roughnessMap: rep(plasticM.rough, o.repeat ?? 2),
+      normalMap: rep(plasticM.normal, o.repeat ?? 2),
+      normalScale: new THREE.Vector2(o.nrm ?? 0.45, o.nrm ?? 0.45),
+      clearcoat: o.cc ?? 0.85, clearcoatRoughness: o.ccr ?? 0.14,
+      envMapIntensity: o.env ?? 0.9,
     });
 
   const m = {
-    jacket: fabric(C.shell, { rough: 0.56, repeat: 3.2, sheen: 0.5, sheenColor: 0xffd9c4 }),
-    jacketDark: fabric(C.shellDark, { rough: 0.62, repeat: 3.2, sheen: 0.4, sheenColor: 0x9fb6d8 }),
-    accent: new THREE.MeshPhysicalMaterial({ color: C.accent, roughness: 0.4, metalness: 0.0, sheen: 0.6 }),
-    pant: fabric(C.pant, { rough: 0.78, repeat: 4.0, sheen: 0.3, sheenColor: 0xa8bcd8 }),
-    pantPanel: fabric(C.pantPanel, { rough: 0.68, repeat: 5.0, sheen: 0.25 }),
-    glove: fabric(C.glove, { rough: 0.6, repeat: 6, sheen: 0.2 }),
-    skin: new THREE.MeshPhysicalMaterial({ color: C.skin, roughness: 0.62, metalness: 0, sheen: 0.2 }),
-    helmet: new THREE.MeshPhysicalMaterial({
-      color: C.helmet, roughness: 0.22, metalness: 0.05,
-      clearcoat: 1.0, clearcoatRoughness: 0.06, envMapIntensity: 1.1,
+    // main jacket body: quilted baffles. repeatV 1 because the torso loft's v
+    // already runs hem->collar exactly once, so the baffle count is authored.
+    jacket: fabric(C.shell, { quilt: true, rough: 0.66, repeat: 1, repeatV: 1, nrm: 1.15, sheen: 1.0 }),
+    // same cloth, unquilted, for sleeves / yoke / hem band
+    jacketPlain: fabric(C.shell, { rough: 0.64, repeat: 2.2, nrm: 0.9, sheen: 1.0 }),
+    jacketDark: fabric(C.shellDark, { rough: 0.68, repeat: 2.4, nrm: 0.9, sheen: 0.9 }),
+    jacketDarkQuilt: fabric(C.shellDark, { quilt: true, rough: 0.70, repeat: 1, repeatV: 1, nrm: 1.1, sheen: 0.9 }),
+    accent: fabric(C.accent, { rough: 0.48, repeat: 4, nrm: 0.6, sheen: 0.7, spec: 0.4 }),
+    // a muted version for anything larger than piping — full cyan at biceps
+    // scale reads as a toy, and every reference photo keeps accents tiny
+    accentDim: fabric(0x1d6f80, { rough: 0.62, repeat: 5, nrm: 0.8, sheen: 0.8 }),
+    // knitted fleece gaiter: coarse loops, very high sheen, no specular at all
+    gaiter: fabric(0x232833, { rubber: true, rough: 0.92, repeat: 5, nrm: 1.4, sheen: 1.0, sheenRough: 0.85, sheenColor: 0x5a6474, spec: 0.10 }),
+    helmetAccent: hardShell(C.shell, { rough: 0.30, cc: 0.85, ccr: 0.12, env: 0.50, repeat: 2, nrm: 0.4 }),
+    pant: fabric(C.pant, { rough: 0.76, repeat: 2.6, nrm: 1.0, sheen: 0.75, sheenRough: 0.80, spec: 0.22 }),
+    pantQuilt: fabric(C.pant, { quilt: true, rough: 0.74, repeat: 1, repeatV: 1, nrm: 1.0, sheen: 0.9 }),
+    pantPanel: fabric(C.pantPanel, { rough: 0.60, repeat: 3.6, nrm: 1.0, sheen: 0.7, sheenRough: 0.78, spec: 0.30 }),
+    glove: fabric(C.glove, { rubber: true, rough: 0.88, repeat: 3.4, nrm: 1.0, sheen: 0.35, spec: 0.20 }),
+    gloveBack: fabric(0x424a56, { rough: 0.70, repeat: 4.5, nrm: 1.0, sheen: 0.9 }),
+    skin: new THREE.MeshPhysicalMaterial({
+      color: C.skin, roughness: 0.55, metalness: 0,
+      normalMap: rep(shellM.normal, 6), normalScale: new THREE.Vector2(0.25, 0.25),
+      specularIntensity: 0.55, sheen: 0.3, sheenRoughness: 0.6,
+      clearcoat: 0.18, clearcoatRoughness: 0.6,
     }),
-    helmetMatte: new THREE.MeshPhysicalMaterial({ color: 0x0d1014, roughness: 0.85, metalness: 0 }),
+    helmet: hardShell(C.helmet, { rough: 0.27, cc: 0.9, ccr: 0.11, env: 0.50, repeat: 1.6, nrm: 0.35 }),
+    helmetMatte: fabric(0x0d1014, { rubber: true, rough: 0.86, repeat: 3, nrm: 0.7, sheen: 0.4 }),
     lens: new THREE.MeshPhysicalMaterial({
-      color: C.lens, roughness: 0.045, metalness: 1.0,
-      clearcoat: 1, clearcoatRoughness: 0.02,
-      iridescence: 0.85, iridescenceIOR: 1.6, iridescenceThicknessRange: [180, 520],
-      envMapIntensity: 1.6,
+      color: 0xffffff, map: makeLensColor(128),
+      roughness: 0.03, metalness: 1.0,
+      roughnessMap: rep(lensM.rough, 1),
+      clearcoat: 1, clearcoatRoughness: 0.015,
+      iridescence: 0.55, iridescenceIOR: 1.45, iridescenceThicknessRange: [240, 620],
+      envMapIntensity: 2.1,
     }),
-    boot: new THREE.MeshPhysicalMaterial({ color: C.boot, roughness: 0.42, metalness: 0.0, clearcoat: 0.55, clearcoatRoughness: 0.22, envMapIntensity: 0.6 }),
-    bootCuff: new THREE.MeshPhysicalMaterial({ color: C.bootCuff, roughness: 0.5, metalness: 0.0, clearcoat: 0.4, clearcoatRoughness: 0.3, envMapIntensity: 0.6 }),
+    boot: hardShell(0x22262e, { rough: 0.30, cc: 0.8, ccr: 0.13, env: 0.6, repeat: 2.4, nrm: 0.5 }),
+    bootCuff: hardShell(C.bootCuff, { rough: 0.36, cc: 0.7, ccr: 0.18, env: 0.7, repeat: 2.4, nrm: 0.5 }),
     bootSole: new THREE.MeshStandardMaterial({ color: C.bootAccent, roughness: 0.55, metalness: 0.05, envMapIntensity: 0.5 }),
+    bootAccent: hardShell(0x8b939e, { rough: 0.32, cc: 0.6, ccr: 0.2, env: 0.7, repeat: 3, nrm: 0.5 }),
     metal: new THREE.MeshStandardMaterial({ color: 0x7d858f, roughness: 0.34, metalness: 1.0, envMapIntensity: 0.75, flatShading: true }),
     binding: new THREE.MeshStandardMaterial({ color: 0x1b1f26, roughness: 0.35, metalness: 0.25, flatShading: true }),
     poleShaft: new THREE.MeshStandardMaterial({ color: 0x2a3038, roughness: 0.28, metalness: 0.85, envMapIntensity: 1.1 }),
     poleGrip: new THREE.MeshStandardMaterial({ color: 0x101318, roughness: 0.85, metalness: 0 }),
     basket: new THREE.MeshStandardMaterial({ color: 0x14171c, roughness: 0.6, metalness: 0, flatShading: true }),
-    strap: new THREE.MeshStandardMaterial({ color: 0x3a4048, roughness: 0.9, metalness: 0 }),
-    strapDark: new THREE.MeshStandardMaterial({ color: 0x101318, roughness: 0.8, metalness: 0 }),
-    goggleFrame: new THREE.MeshPhysicalMaterial({ color: 0x0e1116, roughness: 0.55, metalness: 0, sheen: 0.3 }),
+    strap: fabric(0x3a4048, { rough: 0.85, repeat: 5, nrm: 0.8, sheen: 0.8 }),
+    strapDark: fabric(0x121620, { rough: 0.80, repeat: 5, nrm: 0.8, sheen: 0.85 }),
+    webbing: fabric(0x1a1f28, { rough: 0.82, repeat: 8, nrm: 1.1, sheen: 0.7 }),
+    // moulded TPU goggle frame — rubbery, not glossy
+    goggleFrame: fabric(0x0e1116, { rubber: true, rough: 0.62, repeat: 4, nrm: 0.7, sheen: 0.5, spec: 0.35 }),
+    foam: fabric(0x2a2f38, { rubber: true, rough: 0.92, repeat: 6, nrm: 0.8, sheen: 0.5 }),
+    pass: new THREE.MeshPhysicalMaterial({ color: 0xf2f4f7, roughness: 0.25, metalness: 0, clearcoat: 0.9, clearcoatRoughness: 0.08, side: THREE.DoubleSide }),
+    zip: new THREE.MeshStandardMaterial({ color: 0x9aa4b0, roughness: 0.30, metalness: 0.9, envMapIntensity: 1.0 }),
     skiTop: new THREE.MeshPhysicalMaterial({
       map: makeTopsheetTexture({ base: '#171b22', accent: '#f0501c', line: '#e8eef6' }),
       roughness: 0.38, metalness: 0.05, clearcoat: 0.4, clearcoatRoughness: 0.22,
@@ -445,7 +844,8 @@ function makeMaterials(env) {
   };
 
   // materials that must reflect something to read correctly
-  m._reflective = [m.lens, m.helmet, m.metal, m.skiEdge, m.poleShaft, m.skiTop, m.boot];
+  m._reflective = [m.lens, m.helmet, m.metal, m.skiEdge, m.poleShaft, m.skiTop, m.boot,
+    m.bootCuff, m.zip, m.pass];
   for (const mm of m._reflective) mm.envMap = env;
   return m;
 }
@@ -479,7 +879,7 @@ const D = {
   chest: 0.185,      // lumbar -> chest
   neck: 0.255,       // chest -> neck base
   head: 0.115,       // neck -> head centre
-  shoulderHalf: 0.185,
+  shoulderHalf: 0.152,   // deltoid centre: the joint, not the outside of the arm
   shoulderY: 0.175,
   upperArm: 0.295,
   foreArm: 0.265,
@@ -549,21 +949,51 @@ function buildBoot(mats, side) {
   const sp = mesh(lathe([[0.026, 0.02], [0.038, 0.06], [0.040, 0.105], [0.028, 0.142]], 14, 1.15, 0.75),
     mats.bootCuff, cuff, 0, 0, -0.040);
   sp.rotation.x = -0.10;
-  // buckles: bail + ladder + lever, both on the outside of the boot
-  for (let i = 0; i < 2; i++) {
-    const yy = 0.018 + i * 0.062;
-    const b = mesh(new THREE.BoxGeometry(0.104, 0.013, 0.022), mats.metal, cuff, 0, yy, 0.030);
-    b.rotation.x = -0.08;
-    const lever = mesh(new THREE.BoxGeometry(0.016, 0.052, 0.020), mats.bootCuff, cuff, side * 0.052, yy + 0.008, 0.020);
-    lever.rotation.z = side * 0.12;
-  }
-  // power strap
-  const strap = mesh(lathe([[0.058, 0.110], [0.0625, 0.121], [0.058, 0.132]], 20, 0.98, 1.22, false), mats.jacket, cuff);
-  // lower-shell buckles
-  for (let i = 0; i < 2; i++) {
-    const yy = y0 + 0.042 + i * 0.038;
-    mesh(new THREE.BoxGeometry(0.098, 0.011, 0.020), mats.metal, root, 0, yy, 0.030 - i * 0.014);
-    mesh(new THREE.BoxGeometry(0.014, 0.040, 0.016), mats.bootCuff, root, side * 0.048, yy + 0.006, 0.022 - i * 0.014);
+  // --- buckle hardware -------------------------------------------------------
+  // A real alpine buckle is four readable parts: a toothed ladder screwed to the
+  // inboard shell, an aluminium bail that hooks it, a throw lever, and a
+  // micro-adjust barrel. Modelling all four is what makes a boot look like a
+  // boot at 2 m instead of a black wellington.
+  const buckle = (parent, y, z, w, tilt) => {
+    const lad = mesh(new THREE.BoxGeometry(0.013, 0.058, 0.010), mats.bootCuff, parent, -side * (w * 0.5 - 0.004), y, z);
+    lad.rotation.x = tilt;
+    for (let k = 0; k < 4; k++) {
+      mesh(new THREE.BoxGeometry(0.017, 0.0035, 0.0075), mats.bootCuff, lad, 0, -0.020 + k * 0.0135, 0.006);
+    }
+    // bail wire: two straight legs plus a crossbar, hooked over a ladder tooth
+    const bail = node(parent, 0, y, z);
+    bail.rotation.x = tilt;
+    mesh(new THREE.BoxGeometry(w, 0.0055, 0.0055), mats.metal, bail, 0, 0.006, 0.004);
+    mesh(new THREE.BoxGeometry(0.0055, 0.0055, 0.020), mats.metal, bail, -side * w * 0.5, 0.006, -0.006);
+    mesh(new THREE.BoxGeometry(0.0055, 0.0055, 0.020), mats.metal, bail, side * w * 0.5, 0.006, -0.006);
+    // throw lever + micro-adjust barrel, on the outboard side
+    const lev = mesh(new THREE.BoxGeometry(0.015, 0.056, 0.021), mats.bootCuff, parent, side * (w * 0.5 + 0.004), y + 0.006, z - 0.006);
+    lev.rotation.set(tilt, 0, side * 0.10);
+    mesh(new THREE.BoxGeometry(0.017, 0.016, 0.024), mats.bootAccent, lev, 0, 0.028, 0.001);
+    mesh(new THREE.CylinderGeometry(0.0055, 0.0055, 0.019, 8), mats.metal, lev, 0, -0.020, 0.003)
+      .rotation.z = Math.PI * 0.5;
+  };
+  buckle(cuff, 0.022, 0.036, 0.100, -0.10);
+  buckle(cuff, 0.086, 0.030, 0.096, -0.04);
+
+  // power strap: woven webbing with a cam buckle, in the jacket colour
+  mesh(lathe([[0.0585, 0.112], [0.0635, 0.1225], [0.0585, 0.133]], 20, 0.98, 1.22, false), mats.jacketPlain, cuff);
+  const cam = mesh(new THREE.BoxGeometry(0.030, 0.026, 0.016), mats.bootAccent, cuff, side * 0.050, 0.123, 0.028);
+  cam.rotation.z = side * 0.15;
+  mesh(new THREE.BoxGeometry(0.020, 0.008, 0.014), mats.metal, cam, 0, 0.012, 0.004);
+
+  // lower-shell buckles over the instep
+  buckle(root, y0 + 0.048, 0.036, 0.094, -0.22);
+  buckle(root, y0 + 0.090, 0.026, 0.098, -0.14);
+
+  // walk/ride lever on the heel + a brand block on the outboard cuff
+  const wl = mesh(new THREE.BoxGeometry(0.020, 0.048, 0.014), mats.bootAccent, cuff, 0, 0.030, -0.052);
+  wl.rotation.x = 0.12;
+  mesh(new THREE.BoxGeometry(0.004, 0.020, 0.052), mats.jacketPlain, cuff, side * 0.058, 0.062, 0.006);
+  // rivet at the cuff hinge — the detail every ski boot has and no toy does
+  for (const s of [1, -1]) {
+    mesh(new THREE.CylinderGeometry(0.0085, 0.0085, 0.008, 10), mats.metal, cuff, s * 0.058, -0.006, -0.010)
+      .rotation.z = Math.PI * 0.5;
   }
   return { root, cuff };
 }
@@ -596,61 +1026,127 @@ function buildHead(mats, parent, env) {
     [0.089, -0.020], [0.078, -0.060], [0.055, -0.086], [0.005, -0.095],
   ], 20, 1.0, 1.06), mats.helmetMatte, head);
 
-  // face: cheeks + nose bridge, mostly hidden by goggles + gaiter
+  // face: cheeks + nose bridge. The strip of skin between the goggle foam and
+  // the gaiter is small but it is the only warm value on the whole head — with
+  // it missing the face is a black hole and the character reads as a helmet on
+  // a stick.
   const face = mesh(lathe([
-    [0.004, 0.03], [0.045, 0.02], [0.058, -0.01], [0.055, -0.045], [0.038, -0.07], [0.004, -0.08],
-  ], 16, 1.05, 0.95), mats.skin, head, 0, 0.0, 0.042);
-  const nose = mesh(lathe([[0.006, 0.020], [0.016, -0.004], [0.014, -0.022]], 10, 1.0, 1.5), mats.skin, head, 0, -0.008, 0.074);
+    [0.004, 0.03], [0.046, 0.02], [0.060, -0.01], [0.057, -0.045], [0.039, -0.07], [0.004, -0.08],
+  ], 16, 1.05, 0.95), mats.skin, head, 0, 0.0, 0.044);
+  const nose = mesh(lathe([[0.006, 0.020], [0.017, -0.004], [0.015, -0.024]], 10, 1.0, 1.5), mats.skin, head, 0, -0.010, 0.077);
   nose.rotation.x = -0.35;
-
-  // neck gaiter pulled up over the chin and mouth
-  mesh(lathe([
-    [0.052, 0.012], [0.066, -0.020], [0.072, -0.055], [0.074, -0.098],
-    [0.068, -0.142], [0.056, -0.170],
-  ], 18, 1.0, 1.04), mats.jacketDark, head, 0, 0, 0.006);
-
-  // helmet shell
-  const helmetPts = [
-    [0.004, 0.132], [0.050, 0.126], [0.086, 0.100], [0.104, 0.056],
-    [0.109, 0.010], [0.108, -0.030], [0.101, -0.062],
-  ];
-  const helm = mesh(lathe(helmetPts, 26, 1.0, 1.08), mats.helmet, head, 0, 0.004, -0.004);
-  // ear pads
+  // cheekbones catching light just under the goggle frame
   for (const s of [1, -1]) {
-    const ear = mesh(lathe([[0.004, 0.03], [0.028, 0.024], [0.036, -0.005], [0.030, -0.038], [0.004, -0.05]], 12, 1, 1.35),
-      mats.helmetMatte, head, s * 0.095, -0.045, -0.012);
+    mesh(lathe([[0.006, 0.014], [0.020, 0.002], [0.022, -0.018], [0.006, -0.032]], 10, 1.1, 1.0),
+      mats.skin, head, s * 0.036, -0.028, 0.058);
+  }
+
+  // Neck gaiter — a lofted tube, not a lathe, so it can be flat at the back and
+  // bulge over the chin at the front, with a rolled-over top edge.
+  const gaiter = mesh(garment([
+    //  v     rx     rz     ox     oz     y
+    [0.00, 0.056, 0.058, 0, 0.004, 0.030],
+    [0.18, 0.070, 0.072, 0, 0.006, -0.006],
+    [0.42, 0.076, 0.078, 0, 0.006, -0.056],
+    [0.70, 0.079, 0.079, 0, 0.004, -0.116],
+    [1.00, 0.070, 0.070, 0, 0.000, -0.174],
+  ], {
+    nu: 22, nv: 18, capB: false,
+    fold: (u, v) => 0.0026 * Math.sin(u * Math.PI * 2 * 9 + v * 3)
+      + 0.004 * (fbm(u * 5, v * 4, 5, 41, 3) - 0.5)
+      + 0.004 * Math.exp(-Math.pow((v - 0.14) / 0.09, 2)),   // rolled top edge
+  }), mats.jacketDark, head, 0, 0, 0.006);
+  gaiter.material = mats.gaiter || mats.jacketDark;
+
+  // --- helmet ---------------------------------------------------------------
+  // A moulded in-mould shell: one continuous surface, slightly egg-shaped
+  // (deeper than wide), with a proper occipital bulge at the back. The old
+  // version wore a torus over the crown that read as a roll bar.
+  const helm = mesh(garment([
+    [0.00, 0.106, 0.113, 0, -0.004, -0.064],
+    [0.14, 0.112, 0.120, 0, -0.006, -0.030],
+    [0.34, 0.113, 0.121, 0, -0.006, 0.014],
+    [0.56, 0.104, 0.111, 0, -0.004, 0.060],
+    [0.78, 0.076, 0.081, 0, -0.002, 0.104],
+    [0.92, 0.044, 0.047, 0, 0.000, 0.128],
+    [1.00, 0.010, 0.011, 0, 0.000, 0.136],
+  ], {
+    nu: 30, nv: 22, capB: true,
+    // occipital bulge at the back, slight flat over the brow
+    fold: (u, v) => {
+      const back = clamp(-Math.sin(u * Math.PI * 2), 0, 1);
+      const front = clamp(Math.sin(u * Math.PI * 2), 0, 1);
+      return 0.006 * back * THREE.MathUtils.smoothstep(v, 0.0, 0.45)
+        - 0.004 * front * THREE.MathUtils.smoothstep(v, 0.25, 0.6) * (1 - v);
+    },
+  }), mats.helmet, head, 0, 0.004, 0);
+
+  // Moulded accent: a circumferential band low on the shell plus a side flash.
+  // Both are rings of the helmet's own profile, so they sit exactly on it.
+  mesh(garment([
+    [0.00, 0.1130, 0.1205, 0, -0.006, -0.020],
+    [0.45, 0.1148, 0.1223, 0, -0.006, 0.002],
+    [1.00, 0.1128, 0.1203, 0, -0.006, 0.024],
+  ], { nu: 30, nv: 6 }), mats.helmetAccent, head, 0, 0.004, 0);
+
+  // ear pads: soft, tucked under the shell edge
+  for (const s of [1, -1]) {
+    const ear = mesh(lathe([[0.004, 0.03], [0.030, 0.024], [0.038, -0.008], [0.031, -0.042], [0.004, -0.054]], 12, 1, 1.35),
+      mats.foam, head, s * 0.098, -0.048, -0.010);
     ear.rotation.z = s * -0.25;
   }
-  // brow ridge above the goggles (sits high enough to never cross the lens)
-  const brim = mesh(new THREE.TorusGeometry(0.096, 0.010, 6, 20, Math.PI * 0.62), mats.helmet, head, 0, 0.062, 0.014);
-  brim.rotation.set(Math.PI * 0.5 - 0.55, 0, -Math.PI * 0.5 + 0.31);
+  // chin strap: webbing from each ear pad down under the jaw, with a buckle
+  for (const s of [1, -1]) {
+    const st = mesh(new THREE.BoxGeometry(0.008, 0.085, 0.020), mats.webbing, head, s * 0.086, -0.090, 0.006);
+    st.rotation.set(0.06, 0, s * 0.30);
+  }
+  const chinB = mesh(new THREE.BoxGeometry(0.030, 0.016, 0.022), mats.helmetMatte, head, 0, -0.126, 0.014);
+  chinB.rotation.x = 0.18;
+
+  // brow ridge / visor lip above the goggles
+  const brim = mesh(new THREE.TorusGeometry(0.099, 0.0095, 6, 22, Math.PI * 0.64), mats.helmet, head, 0, 0.060, 0.012);
+  brim.rotation.set(Math.PI * 0.5 - 0.55, 0, -Math.PI * 0.5 + 0.30);
   brim.scale.set(1.06, 1.0, 0.62);
-  // accent stripe over the crown, front to back
-  const stripe = mesh(new THREE.TorusGeometry(0.108, 0.0075, 5, 26, 1.9), mats.jacket, head, 0, 0.006, -0.006);
-  stripe.rotation.set(0, -Math.PI * 0.5, 0.80);
-  stripe.scale.set(1, 1, 1);
-  // vents
+  // vents — recessed slots, front and crown
   for (let i = -1; i <= 1; i++) {
-    const v = mesh(new THREE.BoxGeometry(0.013, 0.010, 0.042), mats.helmetMatte, head, i * 0.034, 0.119, 0.030 - Math.abs(i) * 0.012);
+    const v = mesh(new THREE.BoxGeometry(0.014, 0.011, 0.046), mats.helmetMatte, head, i * 0.036, 0.117, 0.028 - Math.abs(i) * 0.014);
     v.rotation.x = -0.35;
   }
+  for (const s of [1, -1]) {
+    mesh(new THREE.BoxGeometry(0.010, 0.030, 0.013), mats.helmetMatte, head, s * 0.070, 0.084, -0.086).rotation.x = 0.5;
+  }
 
-  // goggle strap — an arc around the back of the helmet only, so it never
-  // crosses the lens
-  const strap = mesh(new THREE.TorusGeometry(0.109, 0.014, 6, 22, Math.PI * 1.30), mats.strapDark, head, 0, 0.020, -0.006);
+  // goggle strap — arc around the back of the helmet, with the silicone grip
+  // stripe and the adjuster clip that every real strap has
+  const strap = mesh(new THREE.TorusGeometry(0.111, 0.015, 8, 24, Math.PI * 1.30), mats.strapDark, head, 0, 0.020, -0.006);
   strap.rotation.set(Math.PI * 0.5 - 0.20, 0, Math.PI * 0.5 + Math.PI * 0.35);
   strap.scale.set(1.0, 1.0, 0.46);
+  const gripStripe = mesh(new THREE.TorusGeometry(0.1128, 0.0045, 6, 24, Math.PI * 1.24), mats.jacketPlain, head, 0, 0.020, -0.006);
+  gripStripe.rotation.copy(strap.rotation);
+  gripStripe.scale.set(1.0, 1.0, 0.465);
+  const clip = mesh(new THREE.BoxGeometry(0.016, 0.030, 0.026), mats.helmetMatte, head, 0.102, 0.030, -0.052);
+  clip.rotation.y = -0.5;
 
-  // goggle frame + mirrored lens
-  const lensGeo = new THREE.SphereGeometry(0.098, 32, 16, Math.PI * 0.5 - 1.00, 2.00, Math.PI * 0.5 - 0.50, 0.88);
+  // --- goggles --------------------------------------------------------------
+  // frame, closed-cell face foam, cylindrical mirrored lens
+  const lensGeo = new THREE.SphereGeometry(0.098, 40, 20, Math.PI * 0.5 - 1.00, 2.00, Math.PI * 0.5 - 0.50, 0.88);
   lensGeo.scale(1.15, 0.94, 0.84);
-  const frameGeo = new THREE.SphereGeometry(0.100, 32, 16, Math.PI * 0.5 - 1.08, 2.16, Math.PI * 0.5 - 0.62, 1.14);
+  const frameGeo = new THREE.SphereGeometry(0.100, 36, 18, Math.PI * 0.5 - 1.08, 2.16, Math.PI * 0.5 - 0.62, 1.14);
   frameGeo.scale(1.16, 0.96, 0.85);
+  const foamGeo = new THREE.SphereGeometry(0.0965, 30, 16, Math.PI * 0.5 - 1.06, 2.12, Math.PI * 0.5 - 0.60, 1.10);
+  foamGeo.scale(1.14, 0.95, 0.80);
   const frame = mesh(frameGeo, mats.goggleFrame, head, 0, 0.016, 0.012);
   frame.material.side = THREE.DoubleSide;
+  const foamR = mesh(foamGeo, mats.foam, head, 0, 0.016, 0.004);
+  foamR.material.side = THREE.DoubleSide;
   const lens = mesh(lensGeo, mats.lens, head, 0, 0.016, 0.016);
   lens.castShadow = false;
   if (env) lens.material.envMap = env;
+  // frame outriggers where the strap anchors
+  for (const s of [1, -1]) {
+    const og = mesh(new THREE.BoxGeometry(0.014, 0.038, 0.020), mats.goggleFrame, head, s * 0.107, 0.020, -0.020);
+    og.rotation.y = s * 0.5;
+  }
   return { head, lens };
 }
 
@@ -685,89 +1181,571 @@ export function createSkier(scene) {
 
   // ---- pelvis / spine / chest ---------------------------------------------
   const pelvis = node(bodyRoot, 0, 0.98, 0);
-  mesh(lathe([
-    [0.075, 0.118], [0.114, 0.085], [0.128, 0.030], [0.130, -0.020],
-    [0.121, -0.062], [0.101, -0.092], [0.076, -0.108],
-  ], 20, 1.0, 0.90), mats.pant, pelvis);
+  // Salopette seat. Kept deliberately narrow: it lives *inside* the jacket hem
+  // and only the bit below the hem is ever seen, so it can never punch out of
+  // the jacket when the pelvis and chest counter-rotate against each other.
+  mesh(garment([
+    [0.00, 0.084, 0.078, 0, 0.000, 0.118],
+    [0.22, 0.116, 0.104, 0, -0.004, 0.056],
+    [0.48, 0.128, 0.115, 0, -0.012, -0.020],
+    [0.76, 0.121, 0.108, 0, -0.010, -0.086],
+    [1.00, 0.101, 0.092, 0, -0.004, -0.126],
+  ], {
+    nu: 24, nv: 20, capA: true, capB: true,
+    fold: (u, v) => {
+      const back = clamp(-Math.sin(u * Math.PI * 2), 0, 1);
+      // seat panel: a soft rise over each buttock with a shallow centre seam
+      const cleft = Math.exp(-Math.pow(((u % 0.5) - 0.25) / 0.06, 2));
+      return 0.010 * back * back * THREE.MathUtils.smoothstep(v, 0.2, 0.62) * (1 - THREE.MathUtils.smoothstep(v, 0.7, 1))
+        - 0.007 * back * cleft * THREE.MathUtils.smoothstep(v, 0.3, 0.6)
+        + 0.003 * (fbm(u * 5, v * 4, 5, 61, 3) - 0.5);
+    },
+  }), mats.pant, pelvis);
+  // salopette bib + waist webbing, visible in the gap under the jacket hem
+  mesh(garment([
+    [0.00, 0.1230, 0.1105, 0, -0.004, 0.070],
+    [0.50, 0.1255, 0.1130, 0, -0.004, 0.056],
+    [1.00, 0.1230, 0.1105, 0, -0.004, 0.042],
+  ], { nu: 24, nv: 5 }), mats.webbing, pelvis);
 
   const spine = node(pelvis, 0, D.spine, 0);
-  mesh(lathe([
-    [0.098, 0.00], [0.122, 0.05], [0.136, 0.12], [0.144, 0.175],
-  ], 20, 1.0, 0.74), mats.jacket, spine, 0, -0.02, 0);
 
+  // =========================================================================
+  // JACKET — one continuous lofted garment from hem to collar.
+  //
+  // The old torso was four stacked lathes and every junction between them was
+  // a hard step: that is what read as "detached geometric blocks". This is a
+  // single surface with an authored waist nip, a chest bulge, a flatter back
+  // panel, a flared hem and radial slack that gathers into vertical drape
+  // folds low down — plus quilted baffles from the texture, so the mass has
+  // internal structure instead of being one unbroken field of orange.
+  // =========================================================================
   const chest = node(spine, 0, D.chest, 0);
-  const torso = mesh(lathe([
-    [0.124, -0.03], [0.148, 0.03], [0.166, 0.105], [0.175, 0.175],
-    [0.171, 0.225], [0.149, 0.262], [0.112, 0.282], [0.070, 0.29],
-  ], 22, 1.0, 0.72), mats.jacket, chest);
-  // dark shoulder yoke — narrow, so the jacket still reads orange in silhouette
-  mesh(lathe([
-    [0.174, 0.212], [0.170, 0.238], [0.150, 0.266], [0.113, 0.285], [0.072, 0.293],
-  ], 22, 1.008, 0.728, false), mats.jacketDark, chest);
-  // cyan piping under the yoke
-  mesh(lathe([[0.176, 0.196], [0.179, 0.206], [0.176, 0.216]], 22, 1.01, 0.73, false), mats.accent, chest);
-  // front placket (partial lathe hugging the chest) + hem band
-  mesh(lathe([[0.128, -0.02], [0.150, 0.04], [0.168, 0.12], [0.176, 0.20], [0.168, 0.252]],
-    8, 1.012, 0.735, false, -0.11, 0.22), mats.jacketDark, chest);
-  mesh(lathe([[0.126, -0.048], [0.138, -0.032], [0.130, -0.016]], 20, 1.0, 0.75, false), mats.jacketDark, chest);
+  const JACKET = [
+    //  v     rx     rz     ox      oz      y
+    [0.000, 0.148, 0.113, 0, 0.004, -0.300],   // hem underside, turned in
+    [0.060, 0.172, 0.132, 0, 0.006, -0.276],   // hem band, widest
+    [0.145, 0.165, 0.126, 0, 0.008, -0.236],
+    [0.275, 0.152, 0.116, 0, 0.012, -0.170],   // waist
+    [0.410, 0.160, 0.122, 0, 0.014, -0.096],
+    [0.550, 0.176, 0.133, 0, 0.014, -0.012],
+    [0.680, 0.194, 0.140, 0, 0.010, 0.070],    // chest
+    [0.800, 0.196, 0.136, 0, 0.004, 0.146],
+    [0.868, 0.196, 0.130, 0, 0.000, 0.196],    // shoulder stays square
+    [0.908, 0.186, 0.122, 0, -0.004, 0.226],   // acromion
+    [0.948, 0.150, 0.106, 0, -0.006, 0.258],
+    [0.978, 0.112, 0.090, 0, -0.002, 0.290],
+    [1.000, 0.100, 0.086, 0, 0.002, 0.322],    // collar top
+  ];
+  const jacketFold = (u, v) => {
+    const a = u * Math.PI * 2;
+    const front = clamp(Math.sin(a), 0, 1), back = clamp(-Math.sin(a), 0, 1);
+    let f = 0.0045 * (fbm(u * 4, v * 3.2, 4, 17, 3) - 0.5) * 2;
+    // vertical drape folds, gathering toward the hem
+    f += 0.0040 * Math.sin(a * 7 + v * 2.4) * (1 - THREE.MathUtils.smoothstep(v, 0.15, 0.62));
+    // slack across the back between the shoulder blades
+    f += 0.0060 * back * Math.exp(-Math.pow((v - 0.62) / 0.22, 2));
+    // chest fills forward
+    f += 0.0070 * front * Math.exp(-Math.pow((v - 0.70) / 0.17, 2));
+    // the belt of the jacket cinches
+    f -= 0.0055 * Math.exp(-Math.pow((v - 0.275) / 0.055, 2));
+    return f;
+  };
+  // the hem is not a machined ring: it hangs 2 cm lower at the back and lifts
+  // where it breaks over the hip bones
+  const jacketDrop = (u, v) => {
+    const back = clamp(-Math.sin(u * Math.PI * 2), 0, 1);
+    const hip = Math.exp(-Math.pow((Math.abs(Math.cos(u * Math.PI * 2)) - 1) / 0.45, 2));
+    return (1 - THREE.MathUtils.smoothstep(v, 0.0, 0.30))
+      * (-0.020 * back * back + 0.010 * hip + 0.004 * Math.sin(u * Math.PI * 2 * 3));
+  };
+  const torso = mesh(garment(JACKET, {
+    nu: 34, nv: 44, capA: true, flatBack: 0.10, fold: jacketFold, drop: jacketDrop,
+    // 0 = quilted body, 1 = plain shell hem band + collar
+    matFn: (v) => (v < 0.128 || v > 0.952 ? 1 : 0),
+  }), [mats.jacket, mats.jacketDark], chest);
+
+  // Raglan yoke: a real overlapping panel with its own edge, not a colour band.
+  // Riding 6 mm proud of the body means it throws its own shadow line.
+  mesh(garment(JACKET.filter((r) => r[0] >= 0.78).map((r) => {
+    const t = (r[0] - 0.78) / 0.22;
+    const off = 0.0026 * THREE.MathUtils.smoothstep(t, 0.0, 0.55);
+    return [t, r[1] + off, r[2] + off, r[3], r[4], r[5]];
+  }), {
+    nu: 44, nv: 18, flatBack: 0.10,
+    fold: (u, v) => jacketFold(u, 0.78 + v * 0.22),
+    drop: (u, v) => jacketDrop(u, 0.78 + v * 0.22),
+  }), mats.jacketPlain, chest);
+  // cyan piping welt sewn along the yoke seam
+  mesh(garment([
+    [0.00, 0.1968, 0.1374, 0, 0.005, 0.1405],
+    [0.50, 0.1986, 0.1390, 0, 0.005, 0.1440],
+    [1.00, 0.1968, 0.1374, 0, 0.004, 0.1475],
+  ], {
+    nu: 36, nv: 5, flatBack: 0.10,
+    drop: (u) => jacketDrop(u, 0.83),
+    // ride the low-frequency part of the fold field only: following every
+    // wrinkle made the piping wobble like a neon squiggle
+    fold: (u) => 0.0060 * clamp(-Math.sin(u * Math.PI * 2), 0, 1)
+      * Math.exp(-Math.pow((0.83 - 0.62) / 0.22, 2)) + 0.0012,
+  }), mats.accentDim, chest);
+  // hem band welt + drawcord channel
+  mesh(garment([
+    [0.00, 0.1665, 0.1265, 0, 0.008, -0.232],
+    [0.50, 0.1700, 0.1300, 0, 0.008, -0.226],
+    [1.00, 0.1665, 0.1265, 0, 0.008, -0.220],
+  ], {
+    nu: 34, nv: 5, flatBack: 0.10,
+    drop: (u) => jacketDrop(u, 0.145),
+    fold: (u) => jacketFold(u, 0.145) + 0.0015,
+  }), mats.jacketDark, chest);
+
+  // --- front zip, garage, chest pocket, pit vent ----------------------------
+  // The zip follows the jacket's own front profile so it never floats off it.
+  const jSample = ringSampler(JACKET);
+  const jRow = [0, 0, 0, 0, 0];
+  const zipAt = (v, out, dz = 0.005) => {
+    jSample(v, jRow);
+    out.set(jRow[2], jRow[4], jRow[3] + jRow[1] + jacketFold(0.25, v) + dz);
+  };
+  const zipStrip = (v0, v1, halfW, dz) => paramSurface((u, v, out) => {
+    zipAt(lerp(v0, v1, v), out, dz);
+    const a = (u - 0.5) * Math.PI;          // wrap the strip around the body
+    const r = out.z;
+    out.set(Math.sin(a) * halfW, out.y, r - (1 - Math.cos(a)) * halfW * 0.55);
+  }, { nu: 8, nv: 22, flip: true });
+  mesh(zipStrip(0.10, 0.965, 0.0135, 0.0026), mats.jacketPlain, chest);
+  // the coil itself is dark webbing with a fine tooth relief — a bright metal
+  // stripe down the chest reads as a seam bug, not a zip
+  mesh(zipStrip(0.12, 0.955, 0.0032, 0.0058), mats.webbing, chest);
+  // zip pull: a metal slider with a fabric tab, hanging under gravity-ish
+  const zipPull = node(chest);
+  const _zp = new THREE.Vector3();
+  zipAt(0.60, _zp, 0.013);
+  zipPull.position.copy(_zp);
+  mesh(new THREE.BoxGeometry(0.013, 0.020, 0.008), mats.zip, zipPull, 0, 0, 0);
+  mesh(new THREE.BoxGeometry(0.007, 0.030, 0.004), mats.webbing, zipPull, 0, -0.024, 0.001);
+  mesh(new THREE.BoxGeometry(0.011, 0.012, 0.005), mats.accent, zipPull, 0, -0.042, 0.001);
+  // chest pocket zip, off-centre — asymmetry the eye reads as "designed".
+  // A 6 mm tape, not a panel: at this scale a zip is a line, and the slider is
+  // the only thing on the whole jacket allowed to be shiny metal.
+  const tape = (u0, u1, v0, dv, halfH, out3, mat) => {
+    const g = paramSurface((u, v, o2) => {
+      const uu = lerp(u0, u1, u);
+      const vv = v0 + uu * dv;
+      jSample(vv, jRow);
+      const a = uu * Math.PI * 2;
+      const f = jacketFold(uu, vv) + out3;
+      const r = (v - 0.5) * 2;
+      o2.set(jRow[2] + Math.cos(a) * (jRow[0] + f * (1 - r * r * 0.5)),
+        jRow[4] + r * halfH,
+        jRow[3] + Math.sin(a) * (jRow[1] + f * (1 - r * r * 0.5)));
+    }, { nu: 16, nv: 3, flip: false });
+    return mesh(g, mat, chest);
+  };
+  tape(0.155, 0.300, 0.760, -0.020, 0.0055, 0.005, mats.webbing);
+  const slider = mesh(new THREE.BoxGeometry(0.010, 0.015, 0.007), mats.zip, chest);
+  {
+    jSample(0.752, jRow);
+    const a = 0.285 * Math.PI * 2;
+    const f = jacketFold(0.285, 0.752) + 0.010;
+    slider.position.set(jRow[2] + Math.cos(a) * (jRow[0] + f), jRow[4], jRow[3] + Math.sin(a) * (jRow[1] + f));
+    slider.rotation.y = -a + Math.PI * 0.5;
+    mesh(new THREE.BoxGeometry(0.005, 0.020, 0.003), mats.webbing, slider, 0, -0.016, 0.002);
+  }
+  // a second, hip-level hand-warmer pocket on the other side
+  tape(0.640, 0.760, 0.330, 0.045, 0.0050, 0.004, mats.webbing);
+
+  // Panel seams. A garment is cut from flat pieces and sewn: without seams the
+  // back is one uninterrupted 40 cm field of colour, which is exactly what the
+  // eye files under "plastic". These are welts on the jacket's own surface.
+  const seam = (uc, v0, v1, halfW, out3, mat, bow = 0) => mesh(paramSurface((u, v, o2) => {
+    const vv = lerp(v0, v1, v);
+    const uu = uc + bow * Math.sin(v * Math.PI);
+    jSample(vv, jRow);
+    const a = (uu + (u - 0.5) * 2 * halfW) * Math.PI * 2;
+    const bump = out3 * Math.cos((u - 0.5) * Math.PI)
+      * Math.pow(Math.sin(clamp(v, 0, 1) * Math.PI), 0.35);
+    o2.set(jRow[2] + Math.cos(a) * (jRow[0] + jacketFold(uu, vv) + bump),
+      jRow[4] + jacketDrop(uu, vv),
+      jRow[3] + Math.sin(a) * (jRow[1] * (1 - 0.10 * clamp(-Math.sin(a), 0, 1)) + jacketFold(uu, vv) + bump));
+  }, { nu: 8, nv: 22, flip: false }), mat, chest);
+  seam(0.750, 0.150, 0.905, 0.0060, 0.0014, mats.jacketPlain);          // centre back
+  seam(0.632, 0.470, 0.880, 0.0055, 0.0012, mats.jacketPlain, 0.030);   // shoulder blade
+  seam(0.868, 0.470, 0.880, 0.0055, 0.0012, mats.jacketPlain, -0.030);
+  seam(0.068, 0.180, 0.700, 0.0055, 0.0011, mats.jacketPlain);          // side panels
+  seam(0.432, 0.180, 0.700, 0.0055, 0.0011, mats.jacketPlain);
 
   const neck = node(chest, 0, D.neck, 0.008);
   const { head, lens } = buildHead(mats, neck, env);
 
+  // stowed hood, rolled behind the collar — a big silhouette win from behind
+  // Stowed hood. Every reference photo of a shell jacket shows the same thing:
+  // a soft collar volume that wraps the sides of the neck and piles up behind
+  // it, tapering to nothing at the zip. That mass is the single biggest reason
+  // a real jacket has a shoulder line and a mannequin does not.
+  mesh(garment([
+    [0.00, 0.106, 0.092, 0, -0.006, 0.186],
+    [0.20, 0.116, 0.100, 0, -0.010, 0.216],
+    [0.46, 0.118, 0.102, 0, -0.014, 0.254],
+    [0.72, 0.108, 0.094, 0, -0.014, 0.290],
+    [0.90, 0.090, 0.080, 0, -0.010, 0.316],
+    [1.00, 0.074, 0.068, 0, -0.006, 0.330],
+  ], {
+    nu: 30, nv: 22, capB: true,
+    fold: (u, v) => {
+      const a = u * Math.PI * 2;
+      const back = clamp(-Math.sin(a), 0, 1);
+      const side = Math.abs(Math.cos(a));
+      // bulk piles up behind the neck and thins out to the zip at the front
+      const bulk = 0.008 + 0.056 * Math.pow(back, 0.7) + 0.013 * Math.pow(side, 3);
+      return bulk * (0.35 + 0.65 * Math.sin(clamp(v, 0, 1) * Math.PI * 0.92))
+        + 0.004 * Math.sin(a * 5 + v * 4) * back
+        + 0.003 * (fbm(u * 4, v * 4, 4, 91, 3) - 0.5);
+    },
+  }), mats.jacketDark, chest);
+  // drawcord + toggle running round the hood's face opening
+  mesh(garment([
+    [0.00, 0.0785, 0.0715, 0, -0.006, 0.3235],
+    [0.50, 0.0810, 0.0740, 0, -0.006, 0.3300],
+    [1.00, 0.0785, 0.0715, 0, -0.006, 0.3365],
+  ], {
+    nu: 26, nv: 5,
+    fold: (u) => (0.008 + 0.056 * Math.pow(clamp(-Math.sin(u * Math.PI * 2), 0, 1), 0.7)
+      + 0.013 * Math.pow(Math.abs(Math.cos(u * Math.PI * 2)), 3)) * 0.35,
+  }), mats.webbing, chest);
+
+  // lift pass on a lanyard, clipped to the hem D-ring
+  {
+    const lan = node(chest, -0.128, -0.212, 0.086);
+    lan.rotation.set(0.18, -0.35, 0.22);
+    mesh(new THREE.BoxGeometry(0.006, 0.052, 0.002), mats.webbing, lan, 0, -0.024, 0);
+    const card = mesh(new THREE.PlaneGeometry(0.056, 0.084), mats.pass, lan, 0, -0.086, 0.001);
+    card.castShadow = false;
+    mesh(new THREE.PlaneGeometry(0.050, 0.020), mats.accent, lan, 0, -0.112, 0.0025).castShadow = false;
+    mesh(new THREE.CylinderGeometry(0.005, 0.005, 0.003, 8), mats.zip, lan, 0, -0.049, 0);
+  }
+
   // ---- arms ----------------------------------------------------------------
   const arms = [];
   for (const side of [1, -1]) {
-    const shoulder = node(chest, side * D.shoulderHalf, D.shoulderY, 0.005);
-    // deltoid cap in the dark panel colour, tying into the yoke
-    mesh(lathe([[0.055, 0.048], [0.073, 0.012], [0.074, -0.030], [0.066, -0.056], [0.058, -0.070]], 16, 1.0, 0.95, 'a'),
-      mats.jacketDark, shoulder);
-    mesh(lathe(limbProfile(D.upperArm, 0.069, 0.061, 0.053), 16, 1.0, 0.95), mats.jacket, shoulder, 0, -0.02, 0);
-    // thin accent ring above the elbow
-    mesh(lathe([[0.0545, -0.176], [0.0600, -0.187], [0.0545, -0.198]], 16, 1.0, 0.96, false), mats.accent, shoulder);
+    const shoulder = node(chest, side * D.shoulderHalf, D.shoulderY, 0.004);
+    // Sleeve: one loft from a deltoid cap that is buried inside the jacket
+    // right down past the elbow, so there is no floating cone and no seam at
+    // the armhole. Creases gather on the inside of the elbow.
+    const sleeveFold = (u, v) => {
+      const a = u * Math.PI * 2;
+      let f = 0.0030 * (fbm(u * 5, v * 5, 5, 29 + side, 3) - 0.5) * 2;
+      // wrinkle rings that bunch toward the elbow
+      f += 0.0022 * Math.sin(v * 34 + Math.sin(a * 3) * 0.6) * THREE.MathUtils.smoothstep(v, 0.45, 0.95);
+      f += 0.0026 * Math.sin(a * 6 + v * 3);
+      return f;
+    };
+    mesh(garment([
+      [0.00, 0.020, 0.020, 0, 0, 0.054],
+      [0.07, 0.052, 0.051, 0, 0.001, 0.042],
+      [0.18, 0.076, 0.074, 0, 0.002, 0.012],
+      [0.30, 0.084, 0.082, 0, 0.002, -0.024],
+      [0.46, 0.0815, 0.0795, 0, 0.001, -0.092],
+      [0.66, 0.0730, 0.0718, 0, 0, -0.174],
+      [0.84, 0.0662, 0.0652, 0, 0, -0.244],
+      [1.00, 0.062, 0.062, 0, 0, -0.302],
+    ], { nu: 22, nv: 30, capA: true, fold: sleeveFold }), mats.jacketPlain, shoulder);
+    // shoulder-cap panel in the yoke colour, tying the arm into the torso
+    mesh(garment([
+      [0.00, 0.0180, 0.0180, 0, 0, 0.056],
+      [0.18, 0.0560, 0.0550, 0, 0.001, 0.040],
+      [0.50, 0.0830, 0.0810, 0, 0.002, 0.006],
+      [0.80, 0.0862, 0.0838, 0, 0.002, -0.032],
+      [1.00, 0.0796, 0.0776, 0, 0.001, -0.070],
+    ], { nu: 22, nv: 12, capA: true, fold: (u, v) => sleeveFold(u, v * 0.22) }),
+      mats.jacketPlain, shoulder);
+    // reflective accent welt above the elbow — a full ring, not two dots
+    mesh(garment([
+      [0.00, 0.0710, 0.0700, 0, 0, -0.1965],
+      [0.50, 0.0722, 0.0712, 0, 0, -0.1910],
+      [1.00, 0.0710, 0.0700, 0, 0, -0.1855],
+    ], { nu: 26, nv: 5, fold: (u, v) => sleeveFold(u, 0.63) }), mats.accentDim, shoulder);
 
     const elbow = node(shoulder, 0, -D.upperArm, 0);
-    mesh(lathe(limbProfile(D.foreArm, 0.057, 0.051, 0.050), 16, 1.0, 0.95), mats.jacketDark, elbow);
-    // gauntlet cuff flare
-    mesh(lathe([[0.053, -0.218], [0.063, -0.242], [0.061, -0.262], [0.050, -0.272]], 16, 1.0, 0.98, 'b'),
-      mats.jacket, elbow);
+    // A joint that bends needs geometry ON the joint: this barrel is driven at
+    // half the elbow angle, so the sleeve creases instead of hinging like a
+    // doll's arm.
+    const elbowMid = node(shoulder, 0, -D.upperArm, 0);
+    mesh(garment([
+      [0.00, 0.0605, 0.0605, 0, 0, 0.052],
+      [0.30, 0.0655, 0.0645, 0, 0.002, 0.014],
+      [0.62, 0.0665, 0.0655, 0, 0.003, -0.030],
+      [1.00, 0.0600, 0.0600, 0, 0.001, -0.070],
+    ], {
+      nu: 20, nv: 16,
+      // hard gather ridges on the outside of the joint
+      // fabric bunches hard on the outside of a bent elbow and pulls tight
+      // across the inside — that asymmetry is what sells an articulated joint
+      fold: (u, v) => 0.0055 * Math.sin(v * 17 + 1.2) * clamp(Math.sin(u * Math.PI * 2), 0, 1)
+        + 0.0022 * Math.sin(u * Math.PI * 2 * 7)
+        - 0.0030 * clamp(-Math.sin(u * Math.PI * 2), 0, 1) * Math.exp(-Math.pow((v - 0.5) / 0.3, 2)),
+    }), mats.jacketPlain, elbowMid);
+
+    mesh(garment([
+      [0.00, 0.0605, 0.0600, 0, 0, 0.030],
+      [0.18, 0.0605, 0.0595, 0, 0, -0.022],
+      [0.48, 0.0570, 0.0560, 0, 0, -0.112],
+      [0.78, 0.0505, 0.0500, 0, 0, -0.198],
+      [0.92, 0.0545, 0.0535, 0, 0.001, -0.242],   // gauntlet flare
+      [1.00, 0.0520, 0.0510, 0, 0.001, -0.274],
+    ], {
+      nu: 22, nv: 26, capB: true,
+      fold: (u, v) => 0.0038 * (fbm(u * 4, v * 4, 4, 37 + side, 3) - 0.5) * 2
+        + 0.0030 * Math.sin(u * Math.PI * 2 * 5 + v * 1.6)
+        + 0.0034 * Math.sin(v * 12.5) * (1 - THREE.MathUtils.smoothstep(v, 0.55, 0.95)),
+    }), mats.jacketDark, elbow);
+    // gauntlet: cinch strap with a webbing tab and a slider
+    mesh(garment([
+      [0.00, 0.0558, 0.0548, 0, 0.001, -0.228],
+      [0.50, 0.0578, 0.0568, 0, 0.001, -0.219],
+      [1.00, 0.0558, 0.0548, 0, 0.001, -0.210],
+    ], { nu: 20, nv: 5 }), mats.webbing, elbow);
+    const tab = mesh(new THREE.BoxGeometry(0.026, 0.014, 0.005), mats.accent, elbow,
+      side * 0.053, -0.219, 0.017);
+    tab.rotation.y = side * 0.5;
+    // sleeve creases where the cuff is pushed back up the forearm
+    mesh(garment([
+      [0.00, 0.0545, 0.0538, 0, 0, -0.150],
+      [0.35, 0.0562, 0.0555, 0, 0, -0.166],
+      [0.70, 0.0552, 0.0545, 0, 0, -0.182],
+      [1.00, 0.0538, 0.0531, 0, 0, -0.196],
+    ], {
+      nu: 20, nv: 10,
+      fold: (u, v) => 0.0030 * Math.sin(v * 13 + Math.sin(u * Math.PI * 2 * 3) * 0.7),
+    }), mats.jacketDark, elbow);
 
     const wrist = node(elbow, 0, -D.foreArm, 0);
-    // glove: a closed fist wrapped around the grip
-    const glove = mesh(lathe([
-      [0.030, 0.010], [0.050, -0.014], [0.058, -0.052], [0.056, -0.092], [0.042, -0.122], [0.018, -0.134],
-    ], 16, 1.0, 1.28), mats.glove, wrist);
-    const thumb = mesh(lathe([[0.014, 0.004], [0.020, -0.026], [0.011, -0.052]], 10, 1, 1.2), mats.glove, wrist,
-      side * 0.040, -0.048, 0.030);
-    thumb.rotation.set(-0.45, 0, side * 0.55);
-    // knuckle ridge so the fist reads as a hand, not a blob
-    for (let k = -1; k <= 1; k++) {
-      mesh(new THREE.SphereGeometry(0.016, 8, 6), mats.glove, wrist, side * k * 0.022, -0.058, 0.049)
-        .scale.set(1, 1.5, 0.7);
+    // --- glove: back-of-hand shell, rubberised palm, four fingers, a thumb ---
+    const glove = mesh(garment([
+      [0.00, 0.0435, 0.0360, 0, 0.004, 0.012],
+      [0.22, 0.0495, 0.0420, 0, 0.009, -0.024],
+      [0.52, 0.0510, 0.0455, 0, 0.016, -0.062],
+      [0.80, 0.0440, 0.0405, 0, 0.018, -0.097],
+      [1.00, 0.0265, 0.0265, 0, 0.014, -0.119],
+    ], {
+      nu: 20, nv: 18, capA: true, capB: true,
+      fold: (u, v) => 0.0016 * Math.sin(u * Math.PI * 2 * 5)
+        + 0.002 * (fbm(u * 6, v * 6, 6, 53, 3) - 0.5),
+    }), mats.gloveBack, wrist);
+    // hi-vis knuckle patch — in every reference photo the glove is the second
+    // most readable object on the skier after the boot, never a black lump
+    mesh(garment([
+      [0.00, 0.0310, 0.0220, 0, 0, -0.012],
+      [0.40, 0.0415, 0.0292, 0, 0, -0.034],
+      [0.75, 0.0398, 0.0282, 0, 0, -0.058],
+      [1.00, 0.0288, 0.0206, 0, 0, -0.074],
+    ], { nu: 16, nv: 10, capA: true, capB: true }), mats.accent, wrist, 0, 0, 0.032);
+    // fingers curled round the grip — four rolls, the readable "this is a fist"
+    for (let k = 0; k < 4; k++) {
+      const t = k / 3;
+      const f = mesh(lathe([
+        [0.007, 0.032], [0.0128, 0.023], [0.0138, 0], [0.0128, -0.023], [0.007, -0.032],
+      ], 10, 1, 1.0), mats.glove, wrist,
+        0, -0.027 - t * 0.062, 0.043 - t * 0.009 + Math.sin(t * Math.PI) * 0.004);
+      f.rotation.z = Math.PI * 0.5;
+      f.scale.set(1, 2.1 - t * 0.35, 1);
     }
+    // knuckle ridge across the back of the hand
+    const thumb = mesh(lathe([[0.009, 0.012], [0.017, -0.017], [0.018, -0.040], [0.009, -0.056]], 10, 1, 1.15),
+      mats.glove, wrist, side * 0.037, -0.033, 0.027);
+    thumb.rotation.set(-0.55, 0, side * 0.62);
+    // wrist cinch + pull loop
+    mesh(garment([
+      [0.00, 0.0442, 0.0368, 0, 0.005, 0.004],
+      [0.50, 0.0464, 0.0390, 0, 0.005, -0.006],
+      [1.00, 0.0442, 0.0368, 0, 0.005, -0.016],
+    ], { nu: 18, nv: 5 }), mats.webbing, wrist);
+    mesh(new THREE.TorusGeometry(0.013, 0.0032, 5, 10), mats.webbing, wrist, -side * 0.045, -0.006, -0.014)
+      .rotation.y = Math.PI * 0.5;
 
     const poleGrip = node(wrist, 0, -0.055, 0.012);
     const pole = buildPole(mats, side);
     poleGrip.add(pole);
-    arms.push({ side, shoulder, elbow, wrist, poleGrip, glove, pole });
+    arms.push({ side, shoulder, elbow, elbowMid, wrist, poleGrip, glove, pole });
   }
 
   // ---- leg meshes (driven by IK) -------------------------------------------
   for (const L of legs) {
     const s = L.side;
     L.hip = node(pelvis, s * D.hipHalf, -0.045, 0);
-    // salopette leg split into two panels that share their seam vertices
-    const TH = [D.thigh, 0.107, 0.097, 0.078];
-    mesh(lathe(limbProfile(...TH, 0, 0.62), 16, 1.0, 0.95, 'a'), mats.pant, L.hip, 0, 0.02, 0);
-    mesh(lathe(limbProfile(...TH, 0.62, 1), 16, 1.0, 0.95, 'b'), mats.pantPanel, L.hip, 0, 0.02, 0);
+    // Trouser slack. Photographic reference is unambiguous: a ski pant is loose
+    // enough to throw 10-15 mm folds, gathers into hard horizontal creases just
+    // above the boot, and pinches behind the knee. At 3 mm it reads as a rubber
+    // tube, which is exactly what the old legs looked like.
+    const legFold = (u, v) => {
+      const a = u * Math.PI * 2;
+      const front = clamp(Math.sin(a), 0, 1), back = clamp(-Math.sin(a), 0, 1);
+      return 0.0065 * (fbm(u * 3.4, v * 3.4, 4, 71 + s, 3) - 0.5) * 2
+        + 0.0050 * Math.sin(a * 5 + v * 2.0)
+        + 0.0028 * Math.sin(a * 11 - v * 3.1)
+        // gather rings stacking up toward the boot
+        + 0.0075 * Math.sin(v * 15.5 + Math.sin(a * 2) * 0.8)
+        * THREE.MathUtils.smoothstep(v, 0.50, 0.95) * (0.45 + 0.55 * front)
+        // the fabric is drawn tight behind the knee and bags in front of it
+        - 0.0070 * back * Math.exp(-Math.pow((v - 0.90) / 0.13, 2))
+        + 0.0060 * front * Math.exp(-Math.pow((v - 0.80) / 0.16, 2));
+    };
+    // thigh — one loft from inside the seat down past the knee
+    mesh(garment([
+      [0.00, 0.104, 0.108, 0, 0, 0.072],
+      [0.15, 0.118, 0.122, 0, 0.002, 0.008],
+      [0.36, 0.110, 0.114, 0, 0.002, -0.092],
+      [0.60, 0.099, 0.103, 0, 0.001, -0.206],
+      [0.82, 0.090, 0.094, 0, 0, -0.322],
+      [1.00, 0.086, 0.090, 0, 0, -0.442],
+    ], { nu: 22, nv: 30, capA: true, fold: legFold }), mats.pant, L.hip);
+    // Outseam welt: a real sewn ridge down the outside of the leg. A trouser
+    // with no seam is a rubber tube, and that is what the legs read as before.
+    const thighRing = ringSampler([
+      [0.00, 0.104, 0.108, 0, 0, 0.072],
+      [0.15, 0.118, 0.122, 0, 0.002, 0.008],
+      [0.36, 0.110, 0.114, 0, 0.002, -0.092],
+      [0.60, 0.099, 0.103, 0, 0.001, -0.206],
+      [0.82, 0.090, 0.094, 0, 0, -0.322],
+      [1.00, 0.086, 0.090, 0, 0, -0.442],
+    ]);
+    const tRow = [0, 0, 0, 0, 0];
+    const legSeam = (uc, halfU, v0, v1, out3, mat, parent, ring) => mesh(paramSurface((u, v, o2) => {
+      const uu = uc + (u - 0.5) * 2 * halfU;
+      const vv = lerp(v0, v1, v);
+      ring(vv, tRow);
+      const a = uu * Math.PI * 2;
+      const bump = out3 * Math.cos((u - 0.5) * Math.PI);
+      o2.set(tRow[2] + Math.cos(a) * (tRow[0] + bump), tRow[4], tRow[3] + Math.sin(a) * (tRow[1] + bump));
+    }, { nu: 8, nv: 16, flip: false }), mat, parent);
+    // outside seam (skier's outboard side) and the inseam
+    legSeam(s > 0 ? 0.0 : 0.5, 0.022, 0.06, 0.99, 0.0028, mats.pantPanel, L.hip, thighRing);
+    legSeam(s > 0 ? 0.5 : 0.0, 0.016, 0.14, 0.99, 0.0022, mats.pantPanel, L.hip, thighRing);
+    // thigh cargo pocket with a zip, on the outboard thigh
+    legSeam(s > 0 ? 0.02 : 0.48, 0.075, 0.30, 0.34, 0.0040, mats.pantPanel, L.hip, thighRing);
+    legSeam(s > 0 ? 0.02 : 0.48, 0.070, 0.315, 0.325, 0.0070, mats.webbing, L.hip, thighRing);
+    // hip yoke seam, running round the top of the thigh
+    mesh(garment([
+      [0.00, 0.1145, 0.1185, 0, 0.002, -0.030],
+      [0.50, 0.1175, 0.1215, 0, 0.002, -0.020],
+      [1.00, 0.1145, 0.1185, 0, 0.002, -0.010],
+    ], { nu: 22, nv: 5 }), mats.pantPanel, L.hip);
+
     L.knee = node(L.hip, 0, -D.thigh, 0);
-    // the pant leg stops above the boot cuff; the gaiter drops over it
-    const SH = [D.shin - 0.13, 0.085, 0.079, 0.071];
-    mesh(lathe(limbProfile(...SH, 0, 0.34), 16, 1.0, 0.95, 'a'), mats.pantPanel, L.knee);
-    mesh(lathe(limbProfile(...SH, 0.34, 1), 16, 1.0, 0.95, 'b'), mats.pant, L.knee);
-    L.gaiter = mesh(lathe([
-      [0.074, -0.235], [0.080, -0.265], [0.082, -0.296], [0.076, -0.312],
-    ], 18, 1.0, 1.02, 'b'), mats.pantPanel, L.knee);
+    // knee joint carrier, driven at half the knee angle: articulation, not a hinge
+    L.kneeMid = node(L.hip, 0, -D.thigh, 0);
+    mesh(garment([
+      [0.00, 0.0870, 0.0905, 0, 0, 0.062],
+      [0.34, 0.0905, 0.0945, 0, 0.004, 0.014],
+      [0.68, 0.0895, 0.0935, 0, 0.005, -0.038],
+      [1.00, 0.0830, 0.0865, 0, 0.002, -0.082],
+    ], {
+      nu: 22, nv: 16,
+      // articulated knee: a proud kneecap patch in front, gathers behind
+      fold: (u, v) => {
+        const a = u * Math.PI * 2;
+        const front = clamp(Math.sin(a), 0, 1), back = clamp(-Math.sin(a), 0, 1);
+        return 0.0060 * Math.pow(front, 1.6) * Math.exp(-Math.pow((v - 0.5) / 0.30, 2))
+          + 0.0040 * back * Math.sin(v * 22)
+          + 0.0018 * Math.sin(a * 7);
+      },
+    }), mats.pantPanel, L.kneeMid);
+
+    // shin + gaiter — the pant drops over the boot cuff and cinches under it
+    mesh(garment([
+      [0.00, 0.0855, 0.0890, 0, 0, 0.034],
+      [0.20, 0.0870, 0.0905, 0, -0.003, -0.042],
+      [0.46, 0.0820, 0.0855, 0, -0.002, -0.134],
+      [0.74, 0.0745, 0.0780, 0, 0, -0.226],
+      [0.90, 0.0800, 0.0830, 0, 0.001, -0.268],
+      [1.00, 0.0775, 0.0805, 0, 0.001, -0.298],
+    ], { nu: 22, nv: 26, fold: legFold }), mats.pant, L.knee);
+    L.gaiter = mesh(garment([
+      [0.00, 0.0800, 0.0835, 0, 0.001, -0.240],
+      [0.40, 0.0835, 0.0870, 0, 0.001, -0.266],
+      [0.75, 0.0825, 0.0860, 0, 0.001, -0.292],
+      [1.00, 0.0760, 0.0790, 0, 0.001, -0.308],
+    ], {
+      nu: 22, nv: 12,
+      fold: (u, v) => 0.0035 * Math.sin(u * Math.PI * 2 * 7)
+        + 0.0055 * Math.sin(v * 11.5) * (1 - v * 0.4)
+        + 0.0030 * (fbm(u * 5, v * 4, 5, 83 + s, 3) - 0.5) * 2,
+    }), mats.pantPanel, L.knee);
+    // instep cable + hem hook under the boot
+    mesh(garment([
+      [0.00, 0.0790, 0.0825, 0, 0.001, -0.284],
+      [0.50, 0.0815, 0.0850, 0, 0.001, -0.277],
+      [1.00, 0.0790, 0.0825, 0, 0.001, -0.270],
+    ], { nu: 20, nv: 5 }), mats.webbing, L.knee);
   }
+
+  // -------------------------------------------------------------------------
+  // Bake. All the buckles, rivets, vents, welts and zip hardware are separate
+  // meshes because that is the only sane way to author them — but 250 draw
+  // calls for one character, doubled by the shadow pass, is not free. Every
+  // group of leaf meshes that shares a parent bone AND a material collapses
+  // into one geometry here. Nothing that animates independently is touched.
+  // -------------------------------------------------------------------------
+  for (const o of [torso, lens, ...legs.map((L) => L.ski), ...legs.map((L) => L.gaiter),
+    ...arms.map((a) => a.glove)]) {
+    if (o) o.userData.noMerge = true;
+  }
+  // The bones: every node whose transform the animation writes. Everything
+  // between two bones is rigid, so it can be flattened into the bone above it
+  // no matter how deep it was authored.
+  const BONES = new Set([group, skiRoot, bodyRoot, pelvis, spine, chest, neck, head]);
+  for (const L of legs) for (const b of [L.pivot, L.body, L.ankle, L.boot.root, L.boot.cuff, L.hip, L.knee, L.kneeMid]) BONES.add(b);
+  for (const a of arms) for (const b of [a.shoulder, a.elbow, a.elbowMid, a.wrist, a.poleGrip]) BONES.add(b);
+
+  const _bm = new THREE.Matrix4();
+  const bakeBone = (bone) => {
+    bone.updateMatrixWorld(true);
+    _bm.copy(bone.matrixWorld).invert();
+    // everything under this bone that a deeper bone does not own
+    const region = [], stack = bone.children.slice();
+    while (stack.length) {
+      const o = stack.pop();
+      if (BONES.has(o)) continue;
+      region.push(o);
+      for (const c of o.children) stack.push(c);
+    }
+    const byMat = new Map(), keep = [];
+    for (const o of region) {
+      const g = o.geometry;
+      const ok = o.isMesh && !o.userData.noMerge && !Array.isArray(o.material)
+        && !g.morphAttributes.position
+        && g.attributes.position && g.attributes.normal && g.attributes.uv;
+      if (ok) { let a = byMat.get(o.material); if (!a) byMat.set(o.material, a = []); a.push(o); }
+      else keep.push(o);
+    }
+    const merged = [];
+    for (const [mat, list] of byMat) {
+      const parts = [];
+      for (const c of list) {
+        const g = c.geometry.index ? c.geometry.toNonIndexed() : c.geometry.clone();
+        for (const k of Object.keys(g.attributes)) {
+          if (k !== 'position' && k !== 'normal' && k !== 'uv') g.deleteAttribute(k);
+        }
+        g.applyMatrix4(_bm.clone().multiply(c.matrixWorld));
+        parts.push(g);
+      }
+      const geo = parts.length === 1 ? parts[0] : mergeGeometries(parts, false);
+      if (parts.length > 1) for (const g of parts) g.dispose();
+      if (geo) merged.push([geo, mat, list]);
+    }
+    if (!merged.length) return;
+    // anything that survives (animated scale, morph targets, the lens) keeps
+    // its world transform and simply moves up to the bone
+    for (const o of keep) if (o.parent !== bone) bone.attach(o);
+    for (const [, , list] of merged) for (const c of list) { c.removeFromParent(); c.geometry.dispose(); }
+    for (const [geo, mat] of merged) {
+      const m = new THREE.Mesh(geo, mat);
+      m.castShadow = true; m.receiveShadow = false;
+      bone.add(m);
+    }
+  };
+  for (const b of BONES) bakeBone(b);
 
   group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = true; } });
   scene.add(group);
@@ -1050,10 +2028,19 @@ export function createSkier(scene) {
         ? Math.pow(Math.sin(clamp(A.plantT / 0.55, 0, 1) * Math.PI), 0.6) : 0;
 
       // ---- micro motion -------------------------------------------------------
+      // Nothing alive is ever still. Three uncorrelated periods (breath, a slow
+      // balance wander, a fast terrain chatter) beat against each other so no
+      // two frames of a still capture ever look like the same frozen pose.
       const breath = Math.sin(A.t * 1.75) * 0.5 + 0.5;
       const sway = Math.sin(A.t * 0.63) + 0.4 * Math.sin(A.t * 1.31 + 1.1);
+      const sway2 = Math.sin(A.t * 0.47 + 2.2) + 0.5 * Math.sin(A.t * 0.91 + 0.3);
       const jitter = (Math.sin(A.t * 7.3) + Math.sin(A.t * 11.7 + 2.1)) * 0.5;
       const chatter = clamp(A.spd / 24, 0, 1) * (1 - A.air) * 0.006;
+      // Handedness. A real skier is never bilaterally symmetric: one hand rides
+      // further forward, the same shoulder stays a little open, and the lead
+      // never swaps unless the turn asks it to.
+      const HAND = 1;                       // this skier is right-hand-lead
+      const lean = clamp(A.spd / 14, 0, 1);
 
       // in the air the whole body drifts a little off-axis and the tips come up
       A.airSpin = damp(A.airSpin, airborne ? e * 0.20 : 0, 3.2, dt);
@@ -1171,7 +2158,10 @@ export function createSkier(scene) {
       const spineRoll = es * angul * 0.35;
       const spineYaw = -sgn * 0.11 * load;
       spine.rotation.set(torsoPitch * 0.36, spineYaw, spineRoll);
-      const chestYaw = -sgn * (0.22 * load + 0.06 * gN);
+      // a permanent few degrees of open shoulder toward the lead hand, plus a
+      // slow wander: shoulders square to the fall line but never geometrically so
+      const chestYaw = -sgn * (0.22 * load + 0.06 * gN)
+        - HAND * 0.055 * lean * (1 - A.crouch * 0.5) + sway2 * 0.012;
       // A pitched-forward torso that is also counter-rotated tips its own shoulder
       // line — sin(pitch)*sin(yaw) of unwanted roll, straight back into the bank we
       // just removed. Cancel it explicitly.
@@ -1185,11 +2175,13 @@ export function createSkier(scene) {
 
       // head leads into the turn and keeps its eyes on the horizon
       const chestRoll = -pelvisRoll + spineRoll + chestFlex;
-      const headYaw = sgn * (0.34 * load + 0.16 * ae) + Math.sin(A.t * 0.41) * 0.03;
+      const headYaw = sgn * (0.34 * load + 0.16 * ae)
+        + Math.sin(A.t * 0.41) * 0.045 + Math.sin(A.t * 0.83 + 1.7) * 0.020
+        - chestYaw * 0.45;                 // eyes stay down the fall line
       head.rotation.set(
-        -torsoPitch * 0.80 + 0.14 + Math.sin(A.t * 0.9) * 0.012,
+        -torsoPitch * 0.80 + 0.16 + Math.sin(A.t * 0.9) * 0.020 + Math.sin(A.t * 2.3) * 0.006,
         headYaw,
-        -chestRoll * 0.75 + Math.sin(A.t * 0.7) * 0.012);
+        -chestRoll * 0.75 + Math.sin(A.t * 0.7) * 0.022 + HAND * 0.035);
 
       // =======================================================================
       // ARMS
@@ -1202,20 +2194,35 @@ export function createSkier(scene) {
         // (now almost horizontal) spine — that is what makes an egg read as an egg
         const fwd = 0.34 + 1.08 * A.crouch + 0.14 * load * (inside > 0 ? 1 : 0.3)
           + 0.42 * A.reach - 0.10 * A.retract + 0.30 * torsoPitch * (1 - A.crouch);
-        const out = 0.30 - 0.22 * A.crouch + 0.80 * A.retract + 0.34 * A.reach
-          + 0.26 * A.pop + 0.10 * inside * load;
+        // Elbows OUT. Photographic reference: the hands are carried wide of the
+        // hips with the humerus abducted ~25 deg even in a straight glide — a
+        // skier with their arms tucked to their ribs reads as a shop dummy.
+        const out = 0.43 - 0.26 * A.crouch + 0.80 * A.retract + 0.34 * A.reach
+          + 0.26 * A.pop + 0.26 * inside * load;
         const bend = 1.02 + 0.16 * A.crouch + 0.12 * inside * load
           - 0.55 * A.reach + 0.50 * A.retract - 0.45 * A.pop;
+        // handedness: the lead hand carries higher, further forward and a touch
+        // more open; the trailing hand sits lower and closer to the hip
+        const hnd = side === HAND ? 1 : -1;
+        const asym = (1 - A.crouch * 0.6) * (1 - A.air * 0.5);
+        // each arm also breathes on its own slow period, never in lockstep
+        const drift = Math.sin(A.t * (0.83 + 0.19 * side) + side * 2.1) * 0.026
+          + Math.sin(A.t * 1.9 + side) * 0.010;
 
         arm.shoulder.rotation.set(
-          -(fwd + 0.42 * plantSharp * isPlant) + Math.sin(A.t * 1.1 + side) * 0.02,
-          side * (-0.14 - 0.16 * A.crouch + 0.12 * plantSharp * isPlant),
-          side * (out + 0.12 * plantSharp * isPlant) - chestRoll * 0.10);
+          -(fwd + 0.42 * plantSharp * isPlant + hnd * 0.115 * asym) + drift,
+          side * (-0.14 - 0.16 * A.crouch + 0.12 * plantSharp * isPlant) + hnd * 0.06 * asym,
+          side * (out + 0.12 * plantSharp * isPlant + hnd * 0.075 * asym) - chestRoll * 0.10);
         arm.elbow.rotation.set(
-          -(bend - 0.30 * plantSharp * isPlant) + Math.sin(A.t * 1.3 + side * 2) * 0.02,
+          -(bend - 0.30 * plantSharp * isPlant - hnd * 0.10 * asym)
+          + Math.sin(A.t * (1.21 + 0.17 * side) + side * 2) * 0.028,
           0,
           side * (0.14 + 0.14 * A.crouch));
         arm.wrist.rotation.set(-0.30 + 0.25 * plantSharp * isPlant, side * 0.22, side * -0.18);
+        // the sleeve's elbow barrel turns half as far as the joint: the fabric
+        // creases across the bend instead of the arm hinging like a doll
+        _q.identity().slerp(arm.elbow.quaternion, 0.5);
+        arm.elbowMid.quaternion.copy(_q);
       }
 
       // -----------------------------------------------------------------------
@@ -1232,6 +2239,10 @@ export function createSkier(scene) {
           .normalize();
         const q = solveLeg(L, _p);
         if (q) _shinWorld[i].copy(q);
+        // knee panel splits the joint angle — visible articulation, not a hinge
+        _q.identity().slerp(L.knee.quaternion, 0.5);
+        L.kneeMid.quaternion.copy(_q);
+        L.kneeMid.updateMatrix();
       }
 
       // ---- boot cuffs follow the shins --------------------------------------

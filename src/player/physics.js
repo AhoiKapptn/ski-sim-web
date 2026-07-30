@@ -44,19 +44,25 @@ const K_ALIGN = 7.0;        // 1/s, sideslip recovery rate
 const MU_LAT0 = 0.85;       // flat-ski lateral bite (base edge always cuts a little)
 const MU_LAT_EDGE = 3.20;   // grip per sin(phi): ~2.3 g at 30 deg, ~3.5 g laid over
 const MU_SNOW = 0.045;      // kinetic snow friction, running flat
-const DRAG_UP = 0.0050;     // 1/m, upright (terminal ~25 m/s on a 20 deg pitch)
-const DRAG_TUCK = 0.0024;   // 1/m, tucked  (terminal ~37 m/s on a 20 deg pitch)
+const DRAG_UP = 0.0042;     // 1/m, upright (terminal ~20 m/s on a 12 deg pitch, 28 on 20)
+const DRAG_TUCK = 0.0020;   // 1/m, tucked  (terminal ~29 m/s on a 12 deg pitch, 40 on 20)
 const EDGE_W = 13.0;        // rad/s, edge-angle spring (weight transfer ~0.25 s)
 const EDGE_RATE_MAX = 9.0;  // rad/s
 const AIR_YAW = 2.0;        // rad/s, in-air rotation authority
-const LIFT_ACC = 9.0;       // m/s^2 the snow must fall away faster than g to launch
-                            // (legs actively extend over a roller before you fly)
+const LEG_TRAVEL = 0.45;    // m of leg extension before the skis really leave the snow
 const AIR_REPORT = 0.07;    // s of real flight before `airborne` is published
 const SKI_LEN = 1.7;        // m, contact footprint — a ski bridges sub-metre holes
+const LAT_ARM = 1.2;        // m, cross-ski arm used for the contact-plane gradient
 const SUBSTEP = 1 / 120;
+const MAX_START_TRAVERSE = 0.60;  // rad (34 deg) — a reset points down a mellow run
+const MAX_START_STEEP = 1.22;     // rad (70 deg) — ...but you traverse a steep face
 
 const clamp = THREE.MathUtils.clamp;
 const smoothstep = (x, a, b) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const wrapPi = (a) => {
+  a = (a + Math.PI) % (Math.PI * 2);
+  return (a < 0 ? a + Math.PI * 2 : a) - Math.PI;
+};
 
 /** Terrain handle shared with player/camera.js (which is not handed one by main.js). */
 let activeTerrain = null;
@@ -92,6 +98,11 @@ export class SkiPhysics {
     this.airT = 0;           // real time off the snow (state.airTime is hysteresed)
     this.jumpBuf = 0;
     this.pending = 0;
+    this.vSurf = 0;          // d(contact height)/dt — the rate the snow is dropping
+    this.gap = 0;            // leg extension: body above the ski contact point, m
+    this.yFree = 0;          // shadow ballistic path of the centre of mass
+    this.vFree = 0;
+    this.squash = 0;         // legs compressed by the snow pushing up, 0..1
 
     // --- smoothed / display ---------------------------------------------------
     this.nSmooth = new THREE.Vector3(0, 1, 0);
@@ -110,16 +121,60 @@ export class SkiPhysics {
     this._gt = new THREE.Vector3();
   }
 
+  /**
+   * Heading of the fall line at (x,z) — the direction `f` would have to face to
+   * point straight down the hill. Sampled over a 12 m footprint so a mogul does
+   * not decide which way "down" is.
+   */
+  fallLineHeading(x, z) {
+    const n = this._t.copy(this.terrain.normal(x, z, 12));
+    if (!(Math.abs(n.x) + Math.abs(n.z) > 1e-5)) return null;   // dead flat
+    // downhill in xz is +(n.x, n.z); f = (-sin h, -cos h)  ⇒  h = atan2(-n.x, -n.z)
+    return Math.atan2(-n.x, -n.z);
+  }
+
   // ---------------------------------------------------------------------------
   reset(state, x, z, heading) {
+    // ---- face down the hill ------------------------------------------------
+    // A reset must never drop the rider facing UP the fall line: the start push
+    // then fights gravity, the run "stalls" in the first three seconds, and every
+    // speed-driven system downstream reads a rider that is really climbing.
+    // The requested heading is honoured as a *cross-slope intent*: if it points
+    // uphill it is mirrored through the fall line, which keeps its sideways
+    // component exactly and only flips the along-hill one. Then it is limited to
+    // a sane traverse angle, because a start gate points down the run.
+    // How far off the fall line the start may sit scales with the pitch, because
+    // that is what a skier actually does: point it down a blue, traverse a 40 deg
+    // face. Forcing the fall line everywhere aimed the rider straight off the
+    // cliff band on the ridge framing.
+    const hFall = this.fallLineHeading(x, z);
+    if (hFall !== null) {
+      const pitch = Math.acos(clamp(this.terrain.normal(x, z, 12).y, -1, 1));
+      const lim = MAX_START_TRAVERSE + (MAX_START_STEEP - MAX_START_TRAVERSE) *
+                  smoothstep(pitch, 0.28, 0.62);
+      let d = wrapPi(heading - hFall);
+      if (Math.abs(d) > Math.PI / 2) d = Math.sign(d) * (Math.PI - Math.abs(d));
+      heading = hFall + clamp(d, -lim, lim);
+    }
+
     this._f.set(-Math.sin(heading), 0, -Math.cos(heading));
     state.pos.set(x, this._contact(x, z, this._f), z);
     state.heading = heading;
 
-    // Push off with a little speed so a fresh run is immediately alive.
-    const n = this.terrain.normal(x, z);
+    // ---- flying start ------------------------------------------------------
+    // Drop the rider in at the speed this pitch actually sustains rather than at
+    // a fixed 8 m/s: a reset is "you are already skiing", not "you are standing
+    // on a shelf". Solve the same steady state the sim converges to
+    //     g·sin(theta) = mu·g·cos(theta) + kD·v²
+    // for the along-track slope, and take 80% of it so there is still visible
+    // acceleration in the first seconds.
+    const n = this._n;
+    this._contact(x, z, this._f, n);
     this._f.addScaledVector(n, -this._f.dot(n)).normalize();
-    state.vel.copy(this._f).multiplyScalar(8);
+    const along = Math.max(0, -this._f.y);                       // sin(effective pitch)
+    const net = G * along - MU_SNOW * G * n.y;
+    const vT = Math.sqrt(Math.max(0, net) / DRAG_UP);
+    state.vel.copy(this._f).multiplyScalar(clamp(vT * 0.80, 8, 24));
 
     this.phi = 0; this.phiRate = 0; this.grounded = true;
     this.aLat = 0; this.aLatS = 0; this.aLong = 0; this.omega = 0; this.slip = 0; this.slipAngle = 0;
@@ -127,11 +182,13 @@ export class SkiPhysics {
     this.preload = 0; this.jumpHeld = false; this.reboundCd = 0;
     this.compression = 0; this.landImpact = 0; this.lastAirTime = 0; this.gSpike = 0;
     this.roughness = 0; this.incline = 0; this.airT = 0; this.jumpBuf = 0; this.pending = 0;
+    this.vSurf = state.vel.y; this.gap = 0; this.squash = 0;
+    this.yFree = state.pos.y; this.vFree = state.vel.y;
     this.nSmooth.copy(n);
     this.pitchS = Math.asin(clamp(this._f.y, -1, 1));
     this.rollS = 0; this.crouchS = 0;
 
-    state.speed = 8; state.airTime = 0; state.distance = 0; state.time = 0;
+    state.speed = state.vel.length(); state.airTime = 0; state.distance = 0; state.time = 0;
     state.edge = 0; state.carving = false; state.airborne = false;
     state.groundNormal.copy(n); state.crouch = 0; state.gForce = 0;
     state.pitch = this.pitchS; state.roll = 0;
@@ -150,16 +207,43 @@ export class SkiPhysics {
   }
 
   /**
-   * Contact height under the skis. Averaged over the ski footprint because a
-   * 1.7 m ski bridges sub-metre holes instead of tracing every noise wiggle —
-   * this is the "suspension" that stops metre-scale terrain jittering the body,
-   * while metre-plus rollers still throw the skier into the air.
+   * Contact height under the skis, and — critically — the normal OF THAT SAME
+   * SURFACE.
+   *
+   * A 1.7 m ski bridges sub-metre holes instead of tracing every noise wiggle, so
+   * the height the body rides at is a footprint average. The normal has to be the
+   * gradient of that averaged surface, not an independent finite difference of the
+   * raw heightfield: those are two different surfaces, and mixing them is what
+   * used to wreck the sim. The plane says "descend at vy", the contact height says
+   * "descend at vy + 8 cm/s", and the lip detector reads the 8 cm/s discrepancy
+   * over a 1/120 s step as 10 m/s² of ground falling away — so the skier chattered
+   * into the air several times a second. Each of those micro-flights killed the
+   * lateral force, reset the carve, and threw away the normal component of the
+   * velocity on touchdown. That was the speed leak, not friction.
+   *
+   * Seven height samples (was 5 for the height + 4 for the normal), one basis.
    */
-  _contact(x, z, f) {
+  _contact(x, z, f, outN) {
     const T = this.terrain, a = SKI_LEN * 0.33, b = SKI_LEN * 0.66;
-    return 0.34 * T.height(x, z) +
-           0.22 * (T.height(x + f.x * a, z + f.z * a) + T.height(x - f.x * a, z - f.z * a)) +
-           0.11 * (T.height(x + f.x * b, z + f.z * b) + T.height(x - f.x * b, z - f.z * b));
+    let fx = f.x, fz = f.z;
+    const fl = Math.hypot(fx, fz);
+    if (fl > 1e-6) { fx /= fl; fz /= fl; } else { fx = 0; fz = -1; }
+
+    const hFa = T.height(x + fx * a, z + fz * a), hBa = T.height(x - fx * a, z - fz * a);
+    const hFb = T.height(x + fx * b, z + fz * b), hBb = T.height(x - fx * b, z - fz * b);
+    const h = 0.34 * T.height(x, z) + 0.22 * (hFa + hBa) + 0.11 * (hFb + hBb);
+
+    if (outN) {
+      const rx = -fz, rz = fx;                       // r = f x up  (see header)
+      const c = LAT_ARM;
+      const hR = T.height(x + rx * c, z + rz * c), hL = T.height(x - rx * c, z - rz * c);
+      // Longitudinal slope from both arms — same low-pass width as the height.
+      const sf = 0.35 * (hFa - hBa) / (2 * a) + 0.65 * (hFb - hBb) / (2 * b);
+      const sr = (hR - hL) / (2 * c);
+      outN.set(-sf * fx - sr * rx, 1, -sf * fz - sr * rz).normalize();
+      if (!(outN.y > 0.05)) outN.set(0, 1, 0);
+    }
+    return h;
   }
 
   // ---- one fixed sub-step ---------------------------------------------------
@@ -206,29 +290,45 @@ export class SkiPhysics {
 
     // --- rebound: unloading a loaded turn throws you up ------------------------
     this.reboundCd = Math.max(0, this.reboundCd - dt);
+    // Real cross-over unweights; it does not launch you every turn. Firing this
+    // on any 1 g turn put the rider airborne for ~30% of a linked-carve run and
+    // taxed him a touchdown each time, so it wants a genuinely loaded edge.
     if (this.grounded && !this.jumpHeld && this.reboundCd === 0 &&
-        dPhi < -2.2 && loadPrev > 1.05 && brake < 0.5) {
-      popImpulse += Math.min(1.8, (loadPrev - 1.0) * 1.5);
-      this.reboundCd = 0.35;
+        dPhi < -2.6 && loadPrev > 1.45 && brake < 0.5) {
+      popImpulse += Math.min(1.1, (loadPrev - 1.35) * 1.1);
+      this.reboundCd = 0.45;
     }
 
     // --- ground sample --------------------------------------------------------
-    const n = this._n.copy(T.normal(pos.x, pos.z, 1.6));
-    if (!(n.y > 0.05)) n.set(0, 1, 0);
+    // The plane the skier rides on and the height he rides at come from the SAME
+    // footprint sample, so vy and d(contact)/dt agree and nothing chatters.
+    const f0 = this._f.set(-Math.sin(state.heading), 0, -Math.cos(state.heading));
+    const n = this._n;
+    const ghPrev = this._contact(pos.x, pos.z, f0, n);
 
     const yPrev = pos.y;
-    const vyPrev = vel.y;
 
     if (this.grounded) {
       // ---- ski frame on the slope -------------------------------------------
-      const f = this._f.set(-Math.sin(state.heading), 0, -Math.cos(state.heading));
+      const f = f0;
       f.addScaledVector(n, -f.dot(n));
       if (f.lengthSq() < 1e-8) f.set(-Math.sin(state.heading), 0, -Math.cos(state.heading));
       f.normalize();
       const r = this._r.crossVectors(f, n).normalize();
 
-      // velocity in the slope plane
+      // ---- re-seat the velocity on the slope, WITHOUT eating energy ---------
+      // The ground constraint is workless: it may rotate the velocity into the
+      // surface, never shorten it. Plain projection is a contraction, so doing it
+      // 120x a second over rolling ground is a silent brake — every convexity and
+      // every concavity alike scrubs |v| by cos(theta). That, not friction, is
+      // what used to strangle a coast. Rotate instead: project, then restore the
+      // length. The cap keeps a genuine impact (which the landing branch has
+      // already absorbed) from being laundered into forward speed.
+      const spd0 = vel.length();
       vel.addScaledVector(n, -vel.dot(n));
+      const spd1 = vel.length();
+      if (spd1 > 1e-5) vel.multiplyScalar(Math.min(spd0 / spd1, 1.05));
+
       const u = vel.dot(f);
       const s = vel.dot(r);
       const spd = vel.length();
@@ -309,19 +409,45 @@ export class SkiPhysics {
 
       pos.addScaledVector(vel, dt);
 
-      // ---- lip detection: did the ground fall away faster than ballistic? ----
-      // yFree is where a free body would be; if the snow is below that, following
-      // it would need more than 1 g of downforce, so the skis leave the lip.
-      // Expressed as an acceleration deficit it is dt-independent, and the small
-      // threshold stops micro-bumps chattering the airborne flag.
+      // ---- suspension: the SKIS follow the snow, the BODY does not -----------
+      // vSurf is how fast the contact height is dropping; -d(vSurf)/dt is the
+      // downward acceleration the snow is demanding. Gravity supplies G and legs
+      // cannot pull — but the answer to "the ground fell away faster than g" is
+      // NOT that the skis leave the snow, it is that the legs extend. The skis
+      // stay in contact and the centre of mass floats on a smoother path. You are
+      // only truly airborne when that extension runs out of travel.
+      //
+      // Without this the rider skips like a stone: on a 12 deg piste at 70 km/h
+      // an 8 m ripple needs ~2 g to follow, so an instantaneous >1 g test fires
+      // several times a second. Measured: 64% of a straight coast was "airborne",
+      // and every one of those touchdowns scrubbed the normal component of the
+      // velocity. Modelling the 0.45 m of leg travel takes that to ~0%.
       const ghNew = this._contact(pos.x, pos.z, f);
-      const yFree = yPrev + vyPrev * dt - 0.5 * G * dt * dt;
-      const liftAcc = 2 * (yFree - ghNew) / (dt * dt);
-      if (popImpulse > 0 || liftAcc > LIFT_ACC) {
+      const vSurfPrev = this.vSurf;
+      const vSurf = (ghNew - yPrev) / dt;
+      const need = -(vSurf - vSurfPrev) / dt;
+      this.vSurf = vSurf;
+
+      if (this.gap <= 0 && need <= G) {
+        this.yFree = ghNew; this.vFree = vSurf; this.gap = 0;
+      } else {
+        if (this.gap <= 0) { this.yFree = yPrev; this.vFree = vSurfPrev; }  // separation begins
+        this.vFree -= G * dt;
+        this.yFree += this.vFree * dt;
+        this.gap = this.yFree - ghNew;
+        if (this.gap <= 0) { this.yFree = ghNew; this.vFree = vSurf; this.gap = 0; }
+      }
+      // How hard the snow is pushing UP into the rider — the other half of the
+      // suspension, and what makes a compression feel heavy.
+      this.squash += (clamp(-need / (G * 1.6), 0, 1) - this.squash) * Math.min(1, dt * 12);
+
+      if (popImpulse > 0 || this.gap > LEG_TRAVEL) {
         this.grounded = false;
         this.airT = 0;
-        pos.y = Math.max(yFree, ghNew);
-        if (popImpulse === 0) vel.y = vyPrev - G * dt;
+        // Leave the lip on the path the body was already on.
+        if (popImpulse === 0) { vel.y = this.vFree; pos.y = Math.max(this.yFree, ghNew); }
+        else pos.y = ghNew;
+        this.gap = 0;
       } else {
         pos.y = ghNew;
       }
@@ -342,16 +468,24 @@ export class SkiPhysics {
       this.lastAirTime = this.airT;
 
       const f = this._f.set(-Math.sin(state.heading), 0, -Math.cos(state.heading));
-      const ghNew = this._contact(pos.x, pos.z, f);
+      const nl = this._n;
+      const ghNew = this._contact(pos.x, pos.z, f, nl);
       if (pos.y <= ghNew) {
         // ---- landing: a slope-matched touchdown keeps its speed ---------------
         // Only the velocity INTO the snow is destroyed, so matching the landing
         // angle to the slope costs almost nothing while a flat-deck landing at
         // the same speed compresses hard and scrubs.
         pos.y = ghNew;
-        const nl = this._n.copy(T.normal(pos.x, pos.z, 1.6));
+        const spdIn = vel.length();
         const impact = Math.max(0, -vel.dot(nl));      // normal closing speed
         vel.addScaledVector(nl, -vel.dot(nl));         // absorbed, never bounce
+        // A graze is not a landing. Below ~1.2 m/s of closing speed the skis are
+        // just running over a roller, so re-seat the velocity without eating it —
+        // otherwise every whisper of terrain taxes the run.
+        if (impact < 1.2) {
+          const l = vel.length();
+          if (l > 1e-5) vel.multiplyScalar(Math.min(spdIn / l, 1.05));
+        }
         const hard = clamp((impact - 1.2) / 16, 0, 1.6);   // ignore micro-touches
         vel.multiplyScalar(1 - 0.40 * Math.pow(hard, 1.5));
         this.compression = Math.min(1.4, this.compression + hard * 1.1);
@@ -361,6 +495,8 @@ export class SkiPhysics {
         this.grounded = true;
         this.airT = 0;
         this.phiRate *= 0.3;
+        this.vSurf = vel.y;
+        this.gap = 0; this.yFree = pos.y; this.vFree = vel.y;
       }
     }
 
@@ -376,17 +512,18 @@ export class SkiPhysics {
     const T = this.terrain, pos = state.pos;
     state.speed = state.vel.length();
 
-    // body-scale surface normal: average over the ski footprint so metre-scale
-    // bumps do not shake the skier, then a suspension spring on top.
+    // Body-scale surface normal — the SAME contact plane the sim integrates on,
+    // so the rig, the camera and the spray are never oriented to a surface the
+    // physics does not believe in.
     const f = this._f.set(-Math.sin(state.heading), 0, -Math.cos(state.heading));
-    const nw = this._nw.copy(T.normal(pos.x, pos.z, 2.2));
-    this._t.copy(T.normal(pos.x + f.x * 0.9, pos.z + f.z * 0.9, 1.8));
-    nw.add(this._t);
-    this._t.copy(T.normal(pos.x - f.x * 0.9, pos.z - f.z * 0.9, 1.8));
-    nw.add(this._t).normalize();
+    const nw = this._nw;
+    this._contact(pos.x, pos.z, f, nw);
 
-    const rough = 1 - clamp(nw.dot(this._n), -1, 1);
-    this.roughness += (Math.min(1, rough * 26) - this.roughness) * Math.min(1, dt * 4);
+    // Roughness = how far the ground under the skis departs from the macro face.
+    // That is what actually rattles a rider: bumps, ripples, a chopped-up piste.
+    this._t.copy(T.normal(pos.x, pos.z, 5.0));
+    const rough = 1 - clamp(nw.dot(this._t), -1, 1);
+    this.roughness += (Math.min(1, rough * 40) - this.roughness) * Math.min(1, dt * 4);
 
     const target = state.airborne
       ? this._t2.set(0, 1, 0).lerp(nw, 0.35).normalize()
@@ -442,8 +579,10 @@ export class SkiPhysics {
       (state.input?.crouch || 0) * 0.85 +
       this.preload * 0.55 +
       this.compression * 0.7 +
+      this.squash * 0.30 +                       // snow pushing up through the legs
       load * 0.16 +
-      (state.airborne ? 0.18 : 0), 0, 1);
+      (state.airborne ? 0.18 : 0)
+      - (this.gap / LEG_TRAVEL) * 0.22, 0, 1);   // ...and extending over a roller
     this.crouchS += (crouchT - this.crouchS) * Math.min(1, 10 * dt);
     state.crouch = this.crouchS;
 
@@ -463,6 +602,8 @@ export class SkiPhysics {
     m.lastAirTime = this.lastAirTime;
     m.landImpact = this.landImpact;
     m.compression = this.compression;
+    m.suspension = this.gap / LEG_TRAVEL;
+    m.squash = this.squash;
     m.roughness = this.roughness;
     m.preload = this.preload;
     m.aLat = this.aLatS;
