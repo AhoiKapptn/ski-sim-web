@@ -180,106 +180,399 @@ const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
 // =============================================================================
 // The massif skeleton
 // =============================================================================
+// A range is not a row of peaks, it is a *hierarchy*, and that is what the old
+// skeleton was missing. Every summit was an isolated cone standing on the
+// valley floor, all of them roughly the same size, so there was no way to tell
+// which mountain any given peak belonged to — the skyline read as a spike
+// generator because that is exactly what it was.
+//
+// Four scales now, evaluated in this order:
+//
+//   BULKS   massif bodies. Broad elliptical pedestals carrying the mass and the
+//           shoulders, and — via `shape` — the *profile family*: a shouldered
+//           massif, a flat-topped table, a rounded dome. A summit is a detail
+//           on top of a mountain, not the mountain.
+//   RIDGES  crest polylines. Ridge systems, aretes, buttresses, and above all
+//           cols: the saddle between two summits of a real massif is 150-350 m
+//           below them, not 500.
+//   PEAKS   summits sitting on those crests, authored as *relief over radius*
+//           rather than as absolute height, because (top-base)/radius is the
+//           one number that decides whether a peak reads as a mountain or as a
+//           paper spike. Tier 1 massifs get 1 dominant + 1-2 subordinate tops
+//           at 0.78-0.85 of the parent + minor tops and gendarmes at 0.55-0.7.
+//   CIRQUES glacial bowls scooped back into the upper faces. The arete between
+//           two adjacent cirques is not authored — it is what is left standing
+//           when both are cut, which is how a real arete is made.
+//
+// Couloirs (traced by steepest descent through the cirque system, see
+// `_carveCouloirs`) and bedding planes (`_beddingPlanes`) are bake passes, not
+// skeleton data, because both have to follow the surface that actually results.
 const SUMMIT_X = 430, SUMMIT_Z = 2560;
 const CONE_H = 1300, CONE_R = 4300, CONE_KX = 0.62;
 
-/** Ridge polylines: [x, z, crestElevation] control points plus a flank width. */
+/**
+ * Massif bodies: `[x, z, height, rx, rz, rotation, shape]`.
+ *
+ * shape 0 — shouldered. Smoothstep in radius: rounded crown, steepest at
+ *           mid-flank (1.5·h/r), gentle toe. The default alpine massif.
+ * shape 1 — plateau. Flat top out to 0.4·r with a cliff band around it. Table
+ *           mountains; the top holds snow, the walls shed it.
+ * shape 2 — dome. Raised cosine, no crown at all. Reads as a snow dome and is
+ *           the one profile in the set with no rock on its skyline.
+ */
+const BULK_DATA = [
+  // -- across the valley: the wall the player descends towards ---------------
+  [-1150, -3150, 800, 2550, 1800, -0.18, 0],   // M1  Grande Aiguille — tier 1
+  [1950, -3050, 1000, 1950, 1450, 0.12, 1],    // M2  the Table — tier 1
+  [520, -2760, 620, 1550, 1150, 0.05, 2],      // M3  the Dome — tier 2, in front
+  [-2950, -2790, 660, 1750, 1250, 0.25, 0],    // M4  long crest range — tier 2
+  // -- background wall, one aerial-perspective layer further back -----------
+  [-1500, -3600, 780, 2400, 1000, 0.06, 0],
+  [1900, -3560, 720, 2300, 950, -0.05, 0],
+  // -- home mountain: bulk under the two flanking shoulders so they stop
+  //    reading as fins stuck on the side of the run.
+  [-1500, 1250, 620, 1250, 1150, 0.0, 0],
+  [1850, 1270, 600, 1200, 1100, 0.0, 0],
+  // ...and under the two spurs that gate the run-out, deliberately unequal.
+  [-1750, -600, 380, 1100, 1300, 0.20, 0],
+  [2100, -650, 330, 1450, 1500, -0.15, 0],
+];
+
+const BULKS = BULK_DATA.map((b) => ({
+  x: b[0], z: b[1], h: b[2], irx: 1 / b[3], irz: 1 / b[4],
+  c: Math.cos(b[5]), s: Math.sin(b[5]), shape: b[6],
+}));
+
+function bulkAt(b, x, z) {
+  const dx = x - b.x, dz = z - b.z;
+  const px = (dx * b.c + dz * b.s) * b.irx;
+  const pz = (-dx * b.s + dz * b.c) * b.irz;
+  const d2 = px * px + pz * pz;
+  if (d2 >= 1) return 0;
+  const u = 1 - Math.sqrt(d2);
+  if (b.shape === 1) { const t = Math.min(1, u / 0.62); return b.h * t * t * (3 - 2 * t); }
+  if (b.shape === 2) return b.h * 0.5 * (1 - Math.cos(Math.PI * u));
+  return b.h * u * u * (3 - 2 * u);
+}
+
+/**
+ * Ridge polylines: `[x, z, crestElevation]` control points, a flank width `w`,
+ * and a crest sharpness `s` in 0..1.
+ *
+ * The cross-section used to be `v²(0.45v + 0.55)` for every ridge, whose slope
+ * at the crest is 2.45·crest/w — for the main aretes (crest 1000 m, w 620 m)
+ * that is 76 degrees for the top hundred metres, on *both* sides, which is the
+ * fin the gate kept seeing. `s` now mixes that peaked profile against a
+ * smoothstep whose crest is flat (slope 0 at the centreline, 1.5·crest/w at
+ * mid-flank). Knife ribs keep s ≈ 1 — they are meant to be knives, and the
+ * thermal pass relies on them standing at the angle of repose. Massif crests
+ * and range skylines run at 0.2-0.45, which is a shoulder.
+ */
 const RIDGES = [
   // Summit crest, high above the start of the run.
-  { w: 760, pts: [[-1400, 2150, 900], [-500, 2450, 1150], [430, 2600, 1300], [1350, 2400, 1120], [2100, 2000, 870]] },
+  { w: 760, s: 0.40, pts: [[-1400, 2150, 900], [-500, 2450, 1150], [430, 2600, 1300], [1350, 2400, 1120], [2100, 2000, 870]] },
   // West arete — the skier's right-hand wall, running down to the valley.
-  { w: 620, pts: [[430, 2560, 1300], [-700, 2000, 1180], [-1150, 1300, 1000], [-1350, 500, 790], [-1520, -300, 480], [-1950, -1250, 300]] },
+  { w: 620, s: 0.45, pts: [[430, 2560, 1300], [-700, 2000, 1180], [-1150, 1300, 1000], [-1350, 500, 790], [-1520, -300, 480], [-1950, -1250, 300]] },
   // East arete — the skier's left-hand wall.
-  { w: 640, pts: [[430, 2560, 1300], [1250, 2000, 1160], [1500, 1300, 990], [1620, 500, 780], [1800, -300, 470], [2250, -1250, 290]] },
+  { w: 640, s: 0.45, pts: [[430, 2560, 1300], [1250, 2000, 1160], [1500, 1300, 990], [1620, 500, 780], [1800, -300, 470], [2250, -1250, 290]] },
   // Rock ribs flanking the piste, ~750 m out on each side. Narrow and steep so
   // the thermal-erosion pass leaves them standing at the repose angle, which is
   // exactly where the shader stops holding snow. These are what give the run
   // something to be *between*.
-  { w: 130, pts: [[-780, 1450, 782], [-700, 1150, 712], [-660, 900, 652]] },
-  { w: 130, pts: [[860, 1330, 762], [800, 1050, 692], [770, 830, 642]] },
-  { w: 120, pts: [[-720, 330, 506], [-690, 90, 451], [-670, -140, 396]] },
-  { w: 120, pts: [[820, 250, 481], [790, 10, 426], [770, -220, 373]] },
-  { w: 105, pts: [[-560, 2000, 900], [-520, 1760, 840]] },
-  { w: 105, pts: [[640, 1900, 872], [610, 1660, 815]] },
+  { w: 130, s: 1, pts: [[-780, 1450, 782], [-700, 1150, 712], [-660, 900, 652]] },
+  { w: 130, s: 1, pts: [[860, 1330, 762], [800, 1050, 692], [770, 830, 642]] },
+  { w: 120, s: 1, pts: [[-720, 330, 506], [-690, 90, 451], [-670, -140, 396]] },
+  { w: 120, s: 1, pts: [[820, 250, 481], [790, 10, 426], [770, -220, 373]] },
+  { w: 105, s: 1, pts: [[-560, 2000, 900], [-520, 1760, 840]] },
+  { w: 105, s: 1, pts: [[640, 1900, 872], [610, 1660, 815]] },
   // Inner ribs, right on the shoulder of the piste — close enough to the fall
   // line to sit inside the frame all the way down.
-  { w: 95, pts: [[-520, 620, 549], [-495, 250, 447], [-480, -120, 363], [-500, -520, 270]] },
-  { w: 95, pts: [[560, 560, 526], [540, 190, 432], [530, -180, 350], [550, -580, 258]] },
-  { w: 88, pts: [[-430, 1500, 748], [-450, 1120, 660], [-470, 800, 588]] },
-  { w: 88, pts: [[490, 1420, 726], [510, 1060, 646], [520, 760, 578]] },
+  { w: 95, s: 1, pts: [[-520, 620, 549], [-495, 250, 447], [-480, -120, 363], [-500, -520, 270]] },
+  { w: 95, s: 1, pts: [[560, 560, 526], [540, 190, 432], [530, -180, 350], [550, -580, 258]] },
+  { w: 88, s: 1, pts: [[-430, 1500, 748], [-450, 1120, 660], [-470, 800, 588]] },
+  { w: 88, s: 1, pts: [[490, 1420, 726], [510, 1060, 646], [520, 760, 578]] },
   // Secondary spurs dropping into the bowl — these read as buttresses.
-  { w: 300, pts: [[-1150, 1300, 990], [-780, 1080, 800], [-520, 900, 640]] },
-  { w: 300, pts: [[1500, 1300, 980], [1080, 1000, 790], [800, 780, 640]] },
-  { w: 280, pts: [[-1350, 500, 780], [-940, 340, 610], [-680, 210, 500]] },
-  { w: 280, pts: [[1620, 500, 770], [1200, 330, 600], [930, 190, 490]] },
-  // The range across the valley: what you look at all the way down. Kept low
-  // and irregular — the summits themselves come from PEAKS, so the skyline is
-  // a row of horns and cols rather than one flat-topped wall.
-  // The cols matter as much as the summits. At a crest of 560-760 m under
-  // summits of 1000-1350 the saddles sat 500 m below their peaks, so the range
-  // read as a row of separate cones with clean sky between them — the single
-  // most synthetic thing about the old skyline. On a real range the col between
-  // two summits is 150-350 m down: the crest is continuous and the sky only
-  // starts above it.
-  { w: 820, pts: [[-3700, -2250, 800], [-2500, -2780, 960], [-1150, -3000, 880], [200, -3120, 1010], [1500, -2900, 900], [2800, -2550, 950], [3700, -2250, 790]] },
+  { w: 300, s: 0.7, pts: [[-1150, 1300, 990], [-780, 1080, 800], [-520, 900, 640]] },
+  { w: 300, s: 0.7, pts: [[1500, 1300, 980], [1080, 1000, 790], [800, 780, 640]] },
+  { w: 280, s: 0.7, pts: [[-1350, 500, 780], [-940, 340, 610], [-680, 210, 500]] },
+  { w: 280, s: 0.7, pts: [[1620, 500, 770], [1200, 330, 600], [930, 190, 490]] },
+  // Divides between the cirques bitten into the two home-mountain flanks. A
+  // knife width on purpose: this is the rock the two bowls leave standing.
+  { w: 70, s: 1, pts: [[-1150, 1290, 1010], [-1120, 1560, 960], [-1080, 1900, 880]] },
+  { w: 70, s: 1, pts: [[1500, 1300, 1000], [1480, 1580, 950], [1450, 1920, 870]] },
+  // -- crest systems of the massifs across the valley ------------------------
+  // These are *shoulders*, not skylines: wide (1800-2600 m) so that where they
+  // out-top their own pedestal they do it over 400-500 m of plan rather than
+  // 150, which is the difference between a ridge and a blade. The summits come
+  // from PEAKS; what these carry is the connective tissue — the cols, which on
+  // a real massif sit 150-350 m under the tops they join, never 500.
+  { w: 2200, s: 0.24, pts: [[-2500, -2950, 800], [-1780, -3060, 900], [-1150, -3170, 1000], [-620, -3040, 910], [-120, -2890, 780]] },  // M1
+  { w: 2400, s: 0.20, pts: [[1150, -2990, 1020], [1950, -3130, 1060], [2700, -2980, 1010], [3400, -2760, 900]] },                      // M2
+  { w: 2000, s: 0.26, pts: [[-3800, -2540, 800], [-3350, -2690, 900], [-2930, -2800, 940], [-2450, -2890, 860], [-2050, -2960, 790]] },// M4
   // Far background wall, right at the aerial-perspective limit.
-  { w: 760, pts: [[-3400, -3380, 940], [-1300, -3560, 1080], [900, -3500, 1010], [3000, -3300, 920]] },
+  { w: 2400, s: 0.18, pts: [[-3400, -3480, 900], [-1900, -3620, 1020], [-350, -3600, 1060], [1450, -3560, 980], [3000, -3440, 900]] },
+  // Buttresses down the front of each massif, running from the crest to the
+  // valley between the cirques. A 1600 m face with a crest and a toe and
+  // nothing in between has no scale: there is no feature on it the eye can use
+  // to judge how big it is, so it reads as a smooth curtain however much fine
+  // detail the shader puts on top. These are the spurs that divide one bowl
+  // from the next, and they are what the couloirs run down between.
+  { w: 260, s: 0.75, pts: [[-1150, -3140, 1450], [-1180, -2820, 1150], [-1230, -2520, 830], [-1300, -2250, 560]] },
+  { w: 240, s: 0.80, pts: [[-1700, -3010, 1150], [-1800, -2740, 900], [-1880, -2480, 650], [-1950, -2260, 480]] },
+  { w: 240, s: 0.80, pts: [[-560, -3000, 1250], [-500, -2740, 980], [-450, -2480, 700], [-420, -2260, 500]] },
+  { w: 280, s: 0.70, pts: [[1900, -3080, 1150], [1880, -2800, 950], [1850, -2540, 720], [1830, -2300, 520]] },
+  { w: 240, s: 0.75, pts: [[2600, -2950, 1080], [2650, -2700, 880], [2700, -2450, 660], [2750, -2250, 490]] },
+  { w: 240, s: 0.75, pts: [[-3350, -2700, 1050], [-3400, -2480, 850], [-3450, -2280, 640]] },
+  { w: 200, s: 0.80, pts: [[-1560, -360, 620], [-1450, -560, 500], [-1380, -780, 400]] },
+  { w: 200, s: 0.80, pts: [[1900, -420, 520], [1830, -640, 430], [1790, -860, 350]] },
+  // Foothills a kilometre in front of the range. Depth in a skyline is not
+  // made by the far peaks, it is made by having *layers* for the aerial
+  // perspective to separate: in every real photograph of a range there are
+  // four or five planes stacked between the observer and the summits, and this
+  // one had two. Kept off the fall line and low enough (4-6 degrees from the
+  // hero framing, against the main massif's 17) that they layer in front of
+  // the flanks without touching the view down the valley.
+  { w: 1100, s: 0.40, pts: [[-3200, -1900, 480], [-2400, -2150, 620], [-1500, -2250, 560]] },
+  { w: 1100, s: 0.40, pts: [[1400, -2200, 540], [2400, -2100, 660], [3300, -1900, 520]] },
   // Low shoulders framing the run-out.
-  { w: 700, pts: [[-2300, -700, 330], [-3000, -1700, 440], [-3500, -2350, 510]] },
-  { w: 700, pts: [[2350, -800, 320], [3050, -1750, 420], [3550, -2300, 490]] },
+  { w: 700, s: 0.5, pts: [[-2300, -700, 330], [-3000, -1700, 440], [-3500, -2350, 510]] },
+  { w: 700, s: 0.5, pts: [[2350, -800, 320], [3050, -1750, 420], [3550, -2300, 490]] },
   // Outliers so the mid distance is not empty.
-  { w: 560, pts: [[-3200, 900, 680], [-3600, 1900, 820]] },
-  { w: 560, pts: [[3100, 800, 640], [3550, 1750, 770]] },
+  { w: 900, s: 0.35, pts: [[-3200, 900, 680], [-3600, 1900, 820]] },
+  { w: 900, s: 0.35, pts: [[3100, 800, 640], [3550, 1750, 770]] },
 ];
 
 /**
- * Individual summits. Ridges alone give flat-topped mesas; the horns that make
- * an alpine skyline read as alpine have to be placed as points.
- * [x, z, elevation, radius, sharpness]
+ * Summits: `[x, z, top, base, radius, exponent]`.
+ *
+ * Authored as relief over radius. `(top - base) / radius` is the mean flank
+ * gradient of the summit cone and nothing else in the pipeline can rescue it
+ * from being wrong — the previous table gave absolute heights against implicit
+ * radii and the resulting cones measured 58-70 degrees over their whole visible
+ * area, which is why every one of them read as a paper spike. Everything here
+ * is between 0.55 and 0.85, i.e. 29-40 degrees, with the steep ground
+ * concentrated in the cirque headwalls where it belongs.
+ *
+ * `base` is a small pedestal that fades out over the last quarter of the radius
+ * so a summit blends into its massif instead of standing on the valley floor;
+ * `exponent` is the crown shape — 0.95-1.1 a horn, 1.2-1.4 a shouldered top,
+ * 1.6+ a dome.
+ *
+ * The hierarchy is explicit and it is the point: one dominant summit per tier-1
+ * massif, one or two subordinates at 0.78-0.85 of its relief hung off the same
+ * crest, then minor tops and gendarmes at 0.55-0.7 cluttering the cols.
  */
-const PEAKS = [
-  // Across the valley — the wall the player descends towards.
-  //
-  // Radius matters more than height here and it was badly wrong: a 1345 m peak
-  // over a 980 m base radius has a mean flank gradient of 1.4, i.e. 55 degrees,
-  // and the summit cone is steeper still. Measured on the built field, every
-  // sample point on the across-valley range came back between 1.0 and 1.23 rad
-  // — 58 to 70 degrees — over its whole visible area. Nothing in the shader can
-  // rescue that: at 60 degrees uniformly, the snow/rock threshold has no
-  // structure to bite on, no bench holds snow, no flank can carry forest, and
-  // the eye reads the result as a paper spike. Real 1300 m relief in the Alps
-  // is spread over 2-3 km of plan distance (25-35 degrees mean, with the
-  // steep ground concentrated in the headwalls). Radii roughly doubled and the
-  // exponents pulled towards 1.3, which convexes the shoulders instead of
-  // pinching the summit.
-  [-2500, -2820, 1210, 2000, 1.32], [-1050, -3020, 980, 1550, 1.36],
-  [250, -3150, 1345, 2200, 1.28], [1600, -2900, 1075, 1750, 1.34],
-  [2900, -2560, 1190, 1900, 1.3], [-3550, -2400, 900, 1500, 1.38],
-  // Far background horns.
-  [-1300, -3560, 1490, 2000, 1.26], [900, -3480, 1340, 1800, 1.3],
-  [2900, -3300, 1200, 1650, 1.34], [-3100, -3400, 1250, 1700, 1.32],
-  // Shoulders on the flanks of the home mountain, for mid-distance interest.
-  [-1180, 1290, 1060, 480, 1.8], [1520, 1310, 1040, 470, 1.8],
-  [-1560, -320, 560, 430, 1.9], [1840, -330, 545, 430, 1.9],
-  [-3300, 1500, 880, 620, 1.7], [3250, 1350, 840, 600, 1.7],
-  // Subsidiary towers and shoulders hung off the across-valley summits. Six
-  // evenly spaced horns on an otherwise clean wall is the single most
-  // procedural-looking thing a skyline can do: real ranges are a mess of
-  // sub-summits, gendarmes and cols at every scale, and the eye reads that
-  // clutter as scale. Small radii and high sharpness, deliberately off-centre
-  // from their parents so they break the parent's silhouette rather than just
-  // making it taller.
-  [-2860, -2620, 1010, 980, 1.44], [-2180, -2960, 1055, 940, 1.46],
-  [-1720, -2880, 880, 880, 1.5], [-680, -3140, 905, 850, 1.48],
-  [-160, -2960, 1120, 1040, 1.42], [640, -3240, 1090, 950, 1.44],
-  [1180, -2960, 930, 860, 1.5], [2080, -3020, 985, 960, 1.44],
-  [2520, -2700, 1085, 920, 1.46], [3320, -2740, 960, 940, 1.46],
-  // Second-rank towers on the background wall, so the far skyline has depth of
-  // its own rather than one clean crest behind another.
-  [-1900, -3480, 1215, 1040, 1.42], [-820, -3620, 1290, 1100, 1.4],
-  [300, -3560, 1180, 1000, 1.44], [1560, -3440, 1250, 1050, 1.42],
-  [2280, -3560, 1120, 950, 1.46], [-2560, -3540, 1150, 1020, 1.44],
+const PEAK_DATA = [
+  // -- M1 "Grande Aiguille": the dominant massif of the near skyline ---------
+  [-1150, -3160, 1620, 760, 1650, 0.95],   // dominant horn
+  [-560, -3020, 1330, 700, 1250, 1.15],    // subordinate, east ridge
+  [-1790, -3050, 1230, 680, 1150, 1.30],   // subordinate, west shoulder
+  [-2200, -2930, 1030, 620, 850, 1.45],    // minor top
+  [-190, -2870, 990, 600, 800, 1.40],      // minor top
+  [-1010, -2830, 1050, 800, 380, 1.05],    // gendarme on the north arete
+  // -- M2 "the Table": flat-topped, deliberately the opposite silhouette -----
+  [1950, -3120, 1210, 940, 1700, 1.60],    // barely a summit: a cap on a plateau
+  [2820, -2870, 1170, 820, 900, 1.05],     // tower at the east end of the rim
+  [1230, -2930, 1070, 800, 700, 1.30],
+  [3350, -2680, 990, 700, 750, 1.35],
+  // -- M3 "the Dome": rounded, snow-covered, sits in front and overlaps ------
+  [520, -2790, 900, 520, 1400, 1.70],
+  // -- M4: a subordinate range read as three tops on one continuous crest ----
+  [-3380, -2690, 1160, 700, 1000, 1.20],
+  [-2930, -2800, 1080, 680, 900, 1.35],
+  [-2470, -2890, 960, 640, 750, 1.40],
+  [-3800, -2520, 1000, 620, 800, 1.35],
+  // -- the background wall. Its dominant top is the highest thing in the
+  //    world and it is *behind* everything, seen through the col between M1
+  //    and the Dome: a summit glimpsed through a gap in a nearer range is the
+  //    strongest depth cue a skyline has, and it costs one peak.
+  [-350, -3600, 1690, 900, 1750, 1.05],
+  [-1900, -3620, 1560, 880, 1600, 1.15],
+  [1450, -3560, 1430, 850, 1350, 1.20],
+  [2900, -3480, 1310, 800, 1200, 1.25],
+  [-3200, -3520, 1250, 780, 1100, 1.30],
+  [-2700, -3560, 1130, 800, 800, 1.45],
+  [700, -3630, 1200, 820, 850, 1.40],
+  [2200, -3540, 1160, 800, 820, 1.45],
+  [3450, -3400, 1080, 750, 760, 1.45],
+  // -- home mountain: the two flanking shoulders. Given different crowns on
+  //    purpose — a horn on the west wall, a broad shouldered top on the east —
+  //    because they sit in the same frame in every screenshot.
+  [-1180, 1290, 1120, 700, 1000, 1.10],
+  [-1620, 900, 940, 580, 800, 1.30],
+  [1520, 1310, 1090, 690, 980, 1.45],
+  [1980, 950, 920, 570, 780, 1.25],
+  // The two spurs that gate the run-out. These sit dead centre of the `steep`
+  // framing and used to be a matched pair of blades — the same fin twice, left
+  // and right, which is the most obvious kind of symmetry a landscape can have
+  // and the eye finds it instantly. So: a rock tower on the west side, a broad
+  // forested shoulder on the east, at different heights.
+  [-1560, -320, 680, 340, 820, 1.05],
+  [-1880, -780, 520, 270, 620, 1.30],
+  [1900, -380, 560, 300, 1000, 1.60],
+  [2400, -900, 470, 250, 850, 1.50],
+  [-2400, -2150, 780, 430, 720, 1.30],     // foothill tops, in front of M4
+  [2450, -2120, 810, 450, 740, 1.35],
+  [-3300, 1500, 940, 560, 950, 1.25],
+  [3250, 1350, 900, 540, 920, 1.30],
 ];
+
+const PEAKS = PEAK_DATA.map((p) => ({
+  x: p[0], z: p[1], rel: p[2] - p[3], base: p[3], ir: 1 / p[4], e: p[5],
+}));
+
+/**
+ * Glacial cirques: bowls quarried back into the upper faces by ice that is no
+ * longer there. Each is an ellipse whose *back* radius is roughly 0.6 of its
+ * front one, so the headwall stands up steeply while the floor drains out
+ * through the mouth, plus a rock threshold across that mouth — which is what
+ * leaves a cirque floor hanging above the valley instead of merging into it.
+ *
+ * Aretes are not in this table because aretes are not authored. Place two
+ * bowls 1.5-1.8 rim-radii apart and the rock they fail to remove between them
+ * *is* the arete; the thermal pass then sharpens it. Same for the couloirs,
+ * which the descent tracer finds by following the water out of the mouths.
+ *
+ * `a` is the bearing the cirque opens towards (0 = +z, towards the player).
+ */
+const CIRQUE_DATA = [
+  // M1 — two bowls flanking the north arete of the dominant horn, and a small
+  // hanging one right under the summit.
+  { x: -1480, z: -2880, ru: 520, rf: 560, rb: 330, d: 175, lip: 21, a: 0.0, f: 500 },
+  { x: -820, z: -2840, ru: 470, rf: 500, rb: 300, d: 150, lip: 19, a: 0.25, f: 500 },
+  { x: -1150, z: -2985, ru: 330, rf: 340, rb: 210, d: 95, lip: 16, a: 0.0, f: 780 },
+  // M2 — bitten into the front rim of the plateau, which is how a table
+  // mountain gets a silhouette.
+  { x: 1500, z: -2790, ru: 470, rf: 500, rb: 300, d: 165, lip: 20, a: -0.2, f: 560 },
+  { x: 2290, z: -2780, ru: 430, rf: 460, rb: 280, d: 145, lip: 17, a: 0.15, f: 560 },
+  // M4 and the background wall.
+  { x: -3050, z: -2620, ru: 420, rf: 450, rb: 270, d: 130, lip: 15, a: 0.1, f: 420 },
+  { x: -1950, z: -3400, ru: 480, rf: 500, rb: 300, d: 140, lip: 16, a: 0.0, f: 520 },
+  { x: -330, z: -3390, ru: 500, rf: 530, rb: 320, d: 150, lip: 17, a: 0.0, f: 560 },
+  { x: 1500, z: -3360, ru: 440, rf: 470, rb: 280, d: 130, lip: 15, a: 0.0, f: 520 },
+  // Home mountain: bowls in the two walls the run is between, opening towards
+  // the piste so they are read from inside rather than in profile.
+  { x: -1150, z: 1720, ru: 380, rf: 400, rb: 250, d: 115, lip: 14, a: 1.35, f: 620 },
+  { x: -1250, z: 900, ru: 350, rf: 370, rb: 230, d: 100, lip: 12, a: 1.50, f: 500 },
+  { x: 1500, z: 1740, ru: 370, rf: 390, rb: 240, d: 110, lip: 14, a: -1.35, f: 620 },
+  { x: 1580, z: 920, ru: 340, rf: 360, rb: 220, d: 98, lip: 12, a: -1.50, f: 500 },
+  // Bowls in the inner faces of the two run-out spurs, opening across the
+  // valley so they are read from the piste rather than in profile.
+  { x: -1450, z: -650, ru: 330, rf: 350, rb: 210, d: 95, lip: 11, a: 1.20, f: 240 },
+  { x: 2050, z: -720, ru: 300, rf: 320, rb: 200, d: 80, lip: 10, a: -1.10, f: 220 },
+];
+
+const CIRQUES = CIRQUE_DATA.map((c, i) => ({
+  x: c.x, z: c.z, d: c.d, lip: c.lip, f: c.f,
+  iru: 1 / c.ru, irf: 1 / c.rf, irb: 1 / c.rb,
+  ox: Math.sin(c.a), oz: Math.cos(c.a),
+  nf: 2.6 / c.ru, nx: i * 37.13, nz: i * -19.71,   // rim wobble
+}));
+
+/**
+ * @param env the envelope so far. A bowl is only cut into ground that is
+ * actually high enough to hold one — without this a cirque near the toe of a
+ * massif quarries a crater out of the valley floor.
+ */
+function cirqueAt(c, x, z, env) {
+  const dx = x - c.x, dz = z - c.z;
+  const v = dx * c.ox + dz * c.oz;               // + towards the mouth
+  const u = dx * c.oz - dz * c.ox;               // across the bowl
+  const a = u * c.iru;
+  const b = v > 0 ? v * c.irf : v * c.irb;       // shorter behind: the headwall
+  let d2 = a * a + b * b;
+  if (d2 >= 2.6) return 0;
+  // The rim is not a circle. Wobbling the radius with a noise at ~0.4 of the
+  // bowl width is the difference between a cirque and a stamp.
+  d2 *= 0.78 + 0.44 * vnoise(x * c.nf + c.nx, z * c.nf + c.nz);
+  if (d2 >= 2.1) return 0;
+  const g = smoothstep(c.f - 30, c.f + 210, env);
+  if (g <= 0) return 0;
+  let h = 0;
+  if (d2 < 1) { const w = 1 - d2; h -= c.d * w * (1.25 - 0.25 * w); }
+  if (v > 0) {
+    const t = (Math.sqrt(d2) - 1.0) * (1 / 0.36);
+    h += c.lip * Math.exp(-t * t);
+  }
+  return h * g;
+}
+
+/**
+ * Couloir seeds. A couloir is not a shape you draw, it is where the mountain
+ * lets snow and rock leave, so these are only *starting points* — the notch at
+ * the back of a cirque, and a fan of points around the shoulder of every summit
+ * with enough relief to shed. `_carveCouloirs` traces each one down the actual
+ * envelope by steepest descent, which is what makes them connect: they run into
+ * the bowls, out through the mouths, and merge into the same fans the flow pass
+ * later deepens, instead of being a set of unrelated grooves.
+ *
+ * `[x, z, halfWidth, depth, steps]`
+ */
+const COULOIR_SEEDS = [];
+{
+  const hash = (i) => {
+    const s = Math.sin(i * 12.9898 + 4.1414) * 43758.5453;
+    return s - Math.floor(s);
+  };
+  let n = 0;
+  for (const c of CIRQUE_DATA) {
+    const ox = Math.sin(c.a), oz = Math.cos(c.a);
+    for (let k = -1; k <= 1; k++) {
+      const t = k * 0.52;
+      const r = hash(n++);
+      COULOIR_SEEDS.push([
+        c.x - ox * c.rb * 0.86 + oz * c.ru * t,
+        c.z - oz * c.rb * 0.86 - ox * c.ru * t,
+        24 + 16 * r, 26 + 18 * r, 90,
+      ]);
+    }
+  }
+  for (const p of PEAK_DATA) {
+    const rel = p[2] - p[3];
+    if (rel < 180) continue;
+    const m = rel > 500 ? 6 : 4;
+    for (let k = 0; k < m; k++) {
+      const r = hash(n++);
+      const a = (k + 0.35 * r) * (Math.PI * 2 / m) + p[0] * 0.0013;
+      COULOIR_SEEDS.push([
+        p[0] + Math.cos(a) * p[4] * 0.30,
+        p[1] + Math.sin(a) * p[4] * 0.30,
+        20 + 20 * r, 22 + 26 * r, 110,
+      ]);
+    }
+  }
+  // Gully fans down the flanks of every major crest, dropped alternately on
+  // either side of the line. Without these the big faces between the summits
+  // have nothing on them at all: the summit cones get their couloirs and the
+  // 2 km of wall between them stays a clean ramp, which is exactly how a face
+  // ends up reading as a sail.
+  for (const rg of RIDGES) {
+    if (rg.w < 400) continue;
+    for (let i = 0; i < rg.pts.length - 1; i++) {
+      const [x0, z0, h0] = rg.pts[i];
+      const [x1, z1] = rg.pts[i + 1];
+      const dx = x1 - x0, dz = z1 - z0;
+      const len = Math.hypot(dx, dz);
+      const nx = -dz / len, nz = dx / len;
+      // Sparse on purpose. Seeded every 230 m the traces come off a conical
+      // face as forty parallel grooves — a comb, which is the exact artefact
+      // the flow pass had to have a channel-initiation threshold to avoid.
+      // Real couloirs are 600-900 m apart at the crest and they *converge*.
+      const steps = Math.max(1, Math.round(len / 700));
+      for (let k = 0; k < steps; k++) {
+        const t = (k + 0.5) / steps;
+        if (h0 < 380) continue;
+        const r = hash(n++);
+        const side = (k & 1) ? 1 : -1;
+        const off = (55 + 90 * r) * side;
+        COULOIR_SEEDS.push([
+          x0 + dx * t + nx * off, z0 + dz * t + nz * off,
+          22 + 26 * r, 24 + 30 * r, 80,
+        ]);
+      }
+    }
+  }
+}
 
 // Flatten to segments for a tight inner loop.
 const SEGS = [];
@@ -288,8 +581,56 @@ for (const r of RIDGES) {
     const [x0, z0, h0] = r.pts[i];
     const [x1, z1, h1] = r.pts[i + 1];
     const dx = x1 - x0, dz = z1 - z0;
-    SEGS.push({ x0, z0, h0, dx, dz, dh: h1 - h0, inv: 1 / (dx * dx + dz * dz), iw: 1 / r.w });
+    SEGS.push({
+      x0, z0, h0, dx, dz, dh: h1 - h0,
+      inv: 1 / (dx * dx + dz * dz), iw: 1 / r.w, sh: r.s ?? 0.45,
+    });
   }
+}
+
+/**
+ * Bedding. Returns where a point sits *within its bed*, 0..1.
+ *
+ * Sedimentary rock is a stack, not a solid: beds tens of metres thick, each
+ * with a weaker layer under it, tilted at some dip and striking in some
+ * direction that is constant over a massif and different over the next one. Two
+ * separate passes need exactly this number and they have to agree, or the
+ * strata the geometry shows and the benches the erosion cuts belong to two
+ * different mountains:
+ *
+ *   - the talus field, because a weak bed relaxes to a much lower angle than
+ *     the competent rock above it, which is what puts a ledge across a face;
+ *   - the bedding displacement itself, which raises the resistant part of each
+ *     bed proud of the recessive one.
+ *
+ * Dip 12-23 degrees, beds 44-74 m, both from slow noise so each massif gets its
+ * own structural domain instead of one pattern stamped across the range.
+ */
+function bedPhase(x, z, h) {
+  const dom = fbm(x * 0.00042, z * 0.00042, 2);
+  const dip = 0.21 + 0.19 * dom;
+  const strike = dom * 3.1 + 1.2;
+  const period = 44 + 30 * vnoise(x * 0.0007 + 13.4, z * 0.0007 - 7.1);
+  return (h * Math.cos(dip)
+    + (x * Math.cos(strike) + z * Math.sin(strike)) * Math.sin(dip)) / period;
+}
+
+/**
+ * Per-bed character, hashed off the bed index. Beds of *equal* thickness and
+ * equal hardness are the giveaway: a face banded at one pitch and one amplitude
+ * all the way across is corrugated iron, not rock. Real sections are bundles —
+ * a massive unit that stands as a cliff, then five thin ones that weather into
+ * a staircase, then a recessive marl that cuts a terrace right across the
+ * mountain. `_beddingPlanes` scales its displacement by this and the talus
+ * field scales its weak layer by it, so a bed that stands proud is also a bed
+ * that holds its angle.
+ */
+function bedHardness(s) {
+  const bi = Math.floor(s);
+  const r = Math.sin(bi * 12.9898 + 78.233) * 43758.5453;
+  const u = r - Math.floor(r);
+  const r2 = Math.sin(bi * 39.3468 - 11.7) * 24634.6345;
+  return { amp: 0.30 + 1.55 * u * u, brk: 0.46 + 0.34 * (r2 - Math.floor(r2)) };
 }
 
 /** Polynomial smooth-max: keeps ridge intersections from creasing. */
@@ -299,16 +640,22 @@ function smax(a, b, k) {
 }
 
 /**
- * The massif. A single conical body centred on the summit gives the mountain
- * one unambiguous identity and one obvious fall line; the ridge network is
- * smooth-maxed on top of it to produce aretes, buttresses and the ranges
- * across the valley.
+ * The massif. A single conical body centred on the summit gives the home
+ * mountain one unambiguous identity and one obvious fall line; the massif
+ * pedestals, the ridge network and the summits are smooth-maxed on top of it in
+ * that order — mass, then structure, then tops — and the cirques are cut last,
+ * because a bowl that a summit cone can fill back in is not a bowl.
  */
 function massif(x, z) {
   const dx = x - SUMMIT_X, dz = z - SUMMIT_Z;
   const r = Math.sqrt(CONE_KX * dx * dx + dz * dz);
   const u = clamp(1 - r / CONE_R, 0, 1);
   let env = CONE_H * u * u;
+
+  for (let i = 0; i < BULKS.length; i++) {
+    const c = bulkAt(BULKS[i], x, z);
+    if (c > env - 260) env = smax(env, c, 260);
+  }
 
   for (let i = 0; i < SEGS.length; i++) {
     const s = SEGS[i];
@@ -319,18 +666,32 @@ function massif(x, z) {
     const d = Math.sqrt(ex * ex + ez * ez) * s.iw;
     if (d >= 1) continue;
     const v = 1 - d;
-    const c = (s.h0 + s.dh * t) * v * v * (v * 0.45 + 0.55);
+    // Crest cross-section: flat-crested smoothstep blended towards the old
+    // peaked profile by the ridge's sharpness. See the RIDGES doc comment.
+    const prof = v * v * ((3 - 2 * v) + s.sh * (2.45 * v - 2.45));
+    const c = (s.h0 + s.dh * t) * prof;
     if (c > env - 150) env = smax(env, c, 150);
   }
 
   for (let i = 0; i < PEAKS.length; i++) {
     const p = PEAKS[i];
-    const ex = x - p[0], ez = z - p[1];
-    const d = Math.sqrt(ex * ex + ez * ez) / p[3];
+    const ex = x - p.x, ez = z - p.z;
+    const d = Math.sqrt(ex * ex + ez * ez) * p.ir;
     if (d >= 1) continue;
-    const c = p[2] * Math.pow(1 - d, p[4]);
+    const v = 1 - d;
+    // Summit cone over a pedestal. The pedestal is a smoothstep across the
+    // *whole* radius, and that is not a detail: fading it over the last quarter
+    // instead (which is what this did first) leaves an 880 m plateau ending in
+    // a 290 m drop, i.e. a 73-degree step right round the foot of every summit.
+    // Thermal erosion then planes that step into a single flat surface, and a
+    // 1500 m flat surface at 40 degrees with a smooth parabolic silhouette is
+    // not a mountain face, it is a sail. Measured at x = -1125: the north front
+    // of the main massif climbed 599 m -> 1260 m across 200 m of plan.
+    const c = p.rel * Math.pow(v, p.e) + p.base * v * v * (3 - 2 * v);
     if (c > env - 170) env = smax(env, c, 170);
   }
+
+  for (let i = 0; i < CIRQUES.length; i++) env += cirqueAt(CIRQUES[i], x, z, env);
   return env;
 }
 
@@ -454,16 +815,51 @@ export class Terrain {
         const b = fbm(qx * 0.00072, qz * 0.00072, 5);
 
         let h = 26 + env;
-        h += (r - 0.30) * (115 + env * 0.58);      // secondary ridges + spurs
-        h += b * (38 + env * 0.14);                // broad undulation
-        // Mid band: this is what stops big faces reading as smooth ramps.
-        h += (ridgedMF(qx * 0.0016, qz * 0.0016, 5) - 0.31) * (26 + 78 * alt);
-        h += (ridgedMF(qx * 0.0058, qz * 0.0058, 3) - 0.31) * (11 + 34 * alt);
-        h += (ridgedMF(qx * 0.0115, qz * 0.0115, 3) - 0.31) * (6 + 22 * alt);
+        // Secondary ridges and spurs.
+        //
+        // This coefficient used to be `115 + env*0.58`, which on a 1000 m
+        // massif is 695 m of ridged multifractal — measured, the term was
+        // adding +660 m to some cells and -210 m to their neighbours. At that
+        // amplitude the *noise* is the mountain: whatever hierarchy the
+        // skeleton lays down, a 9-octave ridged fractal stamps its own row of
+        // equal-sized tents over the top, which is precisely the "repeated
+        // spike generator" reading. It has to dress the skeleton, not compete
+        // with it, so the altitude-proportional part is a third of what it was
+        // and the mass it used to supply now comes from BULKS and PEAKS, where
+        // it can be composed. The mid bands below are untouched: they are the
+        // surface texture that keeps big faces from reading as ramps, and they
+        // are too fine to move a silhouette.
+        h += (r - 0.30) * (100 + env * 0.19);
+        h += b * (32 + env * 0.075);               // broad undulation
+        // Mid band: this is what stops big faces reading as smooth ramps, and
+        // it is where the amplitude taken off the term above has gone. A 625 m
+        // wavelength puts 100-200 m buttresses and gullies on a face without
+        // ever inventing a summit, so it buys back all of the structure and
+        // none of the spikes.
+        // ...but only out on the faces. The corridor is blended in over its
+        // outer 360 m and the extra amplitude survives that blend as a lip on
+        // the shoulder of the piste, which is enough to launch the skier.
+        const away = smoothstep(420, 950, Math.abs(x - corridorX(z)));
+        h += (ridgedMF(qx * 0.0016, qz * 0.0016, 5) - 0.31) * (26 + (78 + 52 * away) * alt);
+        // Serration, modulated along the crest. A ridge line that is toothed at
+        // one amplitude for its whole length is the last thing that gives a
+        // procedural skyline away even once the *sizes* are right: a real crest
+        // runs smooth for four hundred metres, throws up three gendarmes, and
+        // goes smooth again. A slow field (1.8 km) scaling the two serration
+        // bands between 0.3x and 1.75x buys exactly that, and it is squared so
+        // the smooth stretches dominate. Held at 1x near the fall line, where
+        // extra metre-scale relief is a hazard rather than a silhouette.
+        const sr = clamp(fbm(x * 0.00055 + 5.7, z * 0.00055 - 2.3, 2) * 0.5 + 0.5, 0, 1);
+        const ser = 1 + (0.30 + 1.45 * sr * sr - 1) * away;
+        h += (ridgedMF(qx * 0.0058, qz * 0.0058, 3) - 0.31) * (13 + 52 * alt) * ser;
+        h += (ridgedMF(qx * 0.0115, qz * 0.0115, 3) - 0.31) * (6 + 22 * alt) * ser;
 
         H[j * R + i] = h;
       }
     }
+
+    // -- 1b. couloirs ---------------------------------------------------------
+    this._carveCouloirs(H);
 
     // -- 2. thermal / talus relaxation ---------------------------------------
     // Material above the repose angle slides. This carves scree fans below the
@@ -475,13 +871,34 @@ export class Terrain {
     // those tell-tale contour terraces: every face relaxes to exactly the same
     // gradient. Jittering it with a smooth noise field (harder bands of rock
     // hold steeper) keeps the scree fans but kills the staircase.
+    //
+    // The jitter used to be free noise, and its floor was far too low: a third
+    // of the map relaxed at 17-35 degrees. Applied to *bedrock* that is simply
+    // wrong — 30 degrees is the repose angle of scree, competent rock stands at
+    // 55-75 — and it is why every big face came out as a single planed surface
+    // with nothing on it. Anything the fractal put on a 45-degree wall exceeded
+    // repose by construction and was immediately taken off again, which left
+    // the old skeleton no way to hold structure except by making the peaks so
+    // over-steep that they read as fangs.
+    //
+    // So the threshold is keyed on the bedding instead: competent rock relaxes
+    // at 50-57 degrees, the weak layer at the top of each bed at 29-35, and
+    // what the pass now does on a face is undercut the soft bands and leave the
+    // hard ones standing. That is a ledge system, it is where the snow sits,
+    // and it is the same geometry `_beddingPlanes` displaces.
     const talus = new Float32Array(R * R);
     for (let j = 0; j < R; j++) {
       const z = MAP_ORIGIN + j * MAP_STEP;
       for (let i = 0; i < R; i++) {
+        const k = j * R + i;
         const x = MAP_ORIGIN + i * MAP_STEP;
-        const t = fbm(x * 0.0021, z * 0.0021, 3) * 0.5 + fbm(x * 0.011, z * 0.011, 2) * 0.34;
-        talus[j * R + i] = (0.82 + t * 0.62) * MAP_STEP;
+        const bs = bedPhase(x, z, H[k]);
+        const w = bs - Math.floor(bs);
+        const hard = bedHardness(bs);
+        const weak = smoothstep(0.66, 0.82, w) * (1 - smoothstep(0.93, 1.0, w))
+          * clamp(1.35 - hard.amp * 0.7, 0.15, 1);
+        const t = fbm(x * 0.0021, z * 0.0021, 3) * 0.16 + fbm(x * 0.011, z * 0.011, 2) * 0.11;
+        talus[k] = (1.30 - 0.72 * weak + t) * MAP_STEP;
       }
     }
     for (let it = 0; it < 7; it++) {
@@ -547,9 +964,20 @@ export class Terrain {
         // power law is exactly that: nothing at all below ~50 cells of upstream
         // area, and the big dendritic couloirs are untouched (they had flow in
         // the thousands and lose 8% of their depth).
-        const fq = Math.pow(flow[k], 0.45) - 5.6;
+        //
+        // The threshold alone is not enough on a *cliff*. Fluvial incision
+        // needs ground that water can move; above about 48 degrees there is no
+        // regolith to take away, the face is bedrock, and what actually
+        // channels it is rockfall — which is the couloir pass, placed
+        // explicitly. Left ungated the carve puts its comb straight back onto
+        // every big wall (measured: the whole 2.5 km north face of the main
+        // massif striped at 8-16 m pitch), and raising the repose angle so
+        // bedrock could hold structure made it worse, because the carve weight
+        // saturates at 1.0 on exactly the faces that got steeper.
+        const fq = Math.pow(flow[k], 0.45) - 6.4;
         delta[k] = fq <= 0 ? 0
-          : -Math.min(38, 0.335 * fq) * clamp(slope * 2.4 - 0.10, 0.0, 1);
+          : -Math.min(38, 0.335 * fq) * clamp(slope * 2.4 - 0.10, 0.0, 1)
+            * (1 - smoothstep(1.05, 1.85, slope));
       }
     }
     // The channel carve leaves a stepped trench that has to be relaxed. A
@@ -586,6 +1014,9 @@ export class Terrain {
       relaxW.set(relax2);
       for (let k = 0; k < R * R; k++) H[k] += delta[k] * 0.30 * relaxW[k];
     }
+
+    // -- 4b. bedding planes ---------------------------------------------------
+    this._beddingPlanes(H);
 
     // -- 5. the piste --------------------------------------------------------
     for (let j = 0; j < R; j++) {
@@ -655,8 +1086,136 @@ export class Terrain {
       F[k * 4 + 0] = H[k];
       F[k * 4 + 1] = clamp(curv[k] * 0.55, -1.4, 1.4);
       F[k * 4 + 2] = Math.log(flow[k] + 1) * invLogMax;
-      F[k * 4 + 3] = clamp(strip[k] * 0.09, -0.8, 1.0);
+      // Bedrock exposure. The scale is calibrated, not chosen: raising the
+      // repose angle so competent rock could hold structure means the thermal
+      // pass strips less material, and this channel is the *amount stripped*.
+      // Measured, the 90th percentile of the packed channel fell from 0.104 to
+      // 0.062 and the fraction above 0.3 from 3.8% to 2.7% — i.e. the mountains
+      // quietly turned white, which is the one thing the snow/rock logic was
+      // praised for getting right. 0.145 puts the distribution back where it
+      // was (p90 0.101, 4.1% over 0.3) without touching the shader.
+      F[k * 4 + 3] = clamp(strip[k] * 0.145, -0.8, 1.0);
     }
+  }
+
+  /**
+   * Couloirs and gullies.
+   *
+   * Every seed is walked down the *envelope* — the skeleton without its
+   * fractal, so the line follows the mountain rather than the noise — with a
+   * little momentum so it cuts across minor bumps the way a rockfall chute
+   * does. The trench is max-blended, not accumulated, so overlapping steps
+   * cannot dig a hole, and each run tapers out at its foot, where the thermal
+   * pass then builds the fan.
+   *
+   * The ordering matters: this runs *before* thermal relaxation and flow
+   * accumulation, so the couloirs are widened at the repose angle and then
+   * deepened again by the drainage they now collect. That is why they read as
+   * part of the same drainage network as the dendritic gullies instead of as
+   * decals on top of one.
+   *
+   * The piste is untouchable: a trace that comes within 640 m of the corridor
+   * centreline stops there.
+   */
+  _carveCouloirs(H) {
+    const R = MAP_RES;
+    const carve = new Float32Array(R * R);
+    for (let si = 0; si < COULOIR_SEEDS.length; si++) {
+      const s = COULOIR_SEEDS[si];
+      let x = s[0], z = s[1], vx = 0, vz = 0;
+      const N = s[4];
+      for (let n = 0; n < N; n++) {
+        const e = 10;
+        const gx = (massif(x + e, z) - massif(x - e, z)) * (1 / (2 * e));
+        const gz = (massif(x, z + e) - massif(x, z - e)) * (1 / (2 * e));
+        const m = Math.sqrt(gx * gx + gz * gz);
+        if (m < 0.20) break;                       // out on the flat: done
+        // A cross-slope push from a slow noise field. Pure steepest descent on
+        // a conical face gives radial lines that never meet; a real chute is
+        // deflected by whatever it runs into and ends up joining its neighbour.
+        const wob = (vnoise(x * 0.0035 + 9.7, z * 0.0035 - 3.1) - 0.5) * 0.62;
+        const dirx = -gx / m - (-gz / m) * wob;
+        const dirz = -gz / m - (gx / m) * wob;
+        const dm = Math.sqrt(dirx * dirx + dirz * dirz) || 1;
+        vx = vx * 0.62 + (dirx / dm) * 0.38;
+        vz = vz * 0.62 + (dirz / dm) * 0.38;
+        const vm = Math.sqrt(vx * vx + vz * vz) || 1;
+        x += (vx / vm) * 13; z += (vz / vm) * 13;
+        if (Math.abs(x - corridorX(z)) < 640) break;
+        if (Math.abs(x) > 3900 || Math.abs(z) > 3900) break;
+        const f = n / N;
+        const amp = s[3] * Math.min(1, f * 9) * (1 - smoothstep(0.55, 1, f));
+        if (amp < 0.5) continue;
+        const wr = s[2] * (1 + 0.55 * f);
+        const i0 = Math.max(1, Math.ceil((x - wr - MAP_ORIGIN) / MAP_STEP));
+        const i1 = Math.min(R - 2, ((x + wr - MAP_ORIGIN) / MAP_STEP) | 0);
+        const j0 = Math.max(1, Math.ceil((z - wr - MAP_ORIGIN) / MAP_STEP));
+        const j1 = Math.min(R - 2, ((z + wr - MAP_ORIGIN) / MAP_STEP) | 0);
+        for (let j = j0; j <= j1; j++) {
+          const pz = MAP_ORIGIN + j * MAP_STEP - z;
+          for (let i = i0; i <= i1; i++) {
+            const px = MAP_ORIGIN + i * MAP_STEP - x;
+            const d = Math.sqrt(px * px + pz * pz) / wr;
+            if (d >= 1) continue;
+            const t = 1 - d;
+            const v = amp * t * t * (3 - 2 * t);
+            const k = j * R + i;
+            if (v > carve[k]) carve[k] = v;
+          }
+        }
+      }
+    }
+    for (let k = 0; k < R * R; k++) H[k] -= carve[k];
+  }
+
+  /**
+   * Bedding planes.
+   *
+   * A limestone face is not a surface, it is a stack: beds tens of metres thick
+   * with a soft layer between each pair, and the differential erosion between
+   * them puts a ledge system right across every wall. It is the strongest cue
+   * there is that a mountain is made of rock rather than of noise, it is where
+   * snow sits on ground too steep to hold a slab, and it costs one pass over
+   * the grid.
+   *
+   * Bands are cut along a plane, not along a contour: dip 12-23 degrees, with
+   * dip direction and bed thickness coming from a slow noise so each massif is
+   * its own structural domain instead of one pattern stamped across the range.
+   *
+   * Two gates, both load-bearing. Slope, because a ledge system is a feature of
+   * a *wall*; and distance from the fall line, because the piste corridor is
+   * only blended in over its outer 360 m and a 16 m bed cut into that shoulder
+   * is a ski jump. (It was: at a 27-degree slope gate the run-out shoulder
+   * picked up enough of a lip to launch the skier on the `ridge` framing and
+   * bury the whole shot in spray.)
+   */
+  _beddingPlanes(H) {
+    const R = MAP_RES;
+    const bed = new Float32Array(R * R);
+    for (let j = 1; j < R - 1; j++) {
+      const z = MAP_ORIGIN + j * MAP_STEP;
+      const cx = corridorX(z);
+      for (let i = 1; i < R - 1; i++) {
+        const k = j * R + i;
+        const gx = (H[k + 1] - H[k - 1]) * (1 / (2 * MAP_STEP));
+        const gz = (H[k + R] - H[k - R]) * (1 / (2 * MAP_STEP));
+        let m = smoothstep(0.46, 0.95, Math.sqrt(gx * gx + gz * gz));
+        if (m <= 0.02) continue;
+        const x = MAP_ORIGIN + i * MAP_STEP;
+        m *= smoothstep(520, 900, Math.abs(x - cx));
+        if (m <= 0.02) continue;
+        const bs = bedPhase(x, z, H[k]);
+        const w = bs - Math.floor(bs);
+        const hard = bedHardness(bs);
+        // Asymmetric: a resistant bed over a recessive one, i.e. a long ramp up
+        // to a lip and a short drop off its front. Symmetric bands read as
+        // corrugation; this reads as strata.
+        const b = hard.brk;
+        const t = w < b ? w / b : 1 - (w - b) / (1 - b);
+        bed[k] = (t - 0.5) * (5.2 + 11.5 * m) * m * hard.amp;
+      }
+    }
+    for (let k = 0; k < R * R; k++) H[k] += bed[k];
   }
 
   /** Counting sort of cell indices by descending height. O(n). */

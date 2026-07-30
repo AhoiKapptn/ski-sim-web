@@ -81,7 +81,7 @@ function makeSprayAtlas(tile = 128) {
           let d = Math.exp(-r * r * 4.0) * smoothstep(1.02, 0.34, r);
 
           // Internal structure: granular clumps.
-          d *= 0.44 + 0.95 * fbm(ox * 2 + u * 6.5, oy * 2 + v * 6.5, 5);
+          d *= 0.30 + 1.22 * fbm(ox * 2 + u * 6.5, oy * 2 + v * 6.5, 5);
 
           const fine = fbm(ox * 3 + u * 27.0, oy * 3 + v * 27.0, 3);
           const glint = Math.pow(clamp((fine - 0.60) / 0.40, 0, 1), 2.0);
@@ -147,8 +147,14 @@ float lobeField(vec3 q) {
           // A third octave at ~1.5 m. Real spray is filamentary at that scale —
           // wisps and streaks, not one smooth mass — and two octaves at 5 m and
           // 2.5 m only ever produce a soft blob.
-          + 0.34 * sin(lp.x * 6.1 + 0.7) * sin(lp.y * 5.3 + 4.2) * sin(lp.z * 6.9);
-  return clamp(v * 0.545 * 0.5 + 0.5, 0.0, 1.0);
+          + 0.34 * sin(lp.x * 6.1 + 0.7) * sin(lp.y * 5.3 + 4.2) * sin(lp.z * 6.9)
+          // A fourth octave at ~0.6 m. The carve curtain is only two metres
+          // long, so the three octaves above (5 m, 2.5 m, 1.5 m) barely vary
+          // across it and every sprite in it drew the same lobe value - which is
+          // exactly how a plume this compact ends up as one smooth grey mass
+          // instead of the streaky, clumped thing a photograph shows.
+          + 0.22 * sin(lp.x * 14.3 + 2.4) * sin(lp.y * 12.7 + 0.9) * sin(lp.z * 15.1 + 5.5);
+  return clamp(v * 0.475 * 0.5 + 0.5, 0.0, 1.0);
 }
 
 void main() {
@@ -192,7 +198,12 @@ void main() {
   above = max(dot(aC.xyz, p) - aC.w, 0.0);
 
   float size  = aA.z * (1.0 + aA.w * t);
-  float fin   = smoothstep(0.0, 0.09, u);
+  // Fade-in on absolute age, not on a fraction of life. As a fraction it scaled
+  // with lifetime, so the short-lived snow at the edge - which is exactly the
+  // dense root of the curtain - spent its first 100 ms at a third of its alpha
+  // and the plume appeared to start a metre behind the ski. Snow does not fade
+  // up as it leaves an edge; 25 ms is only there to stop a spawn popping.
+  float fin   = smoothstep(0.0, 0.025, t);
   // The tail of the plume is the *old* snow, forty metres behind the skier. A
   // hard fade-out (this used to be fout squared from 46% of life) deletes it and
   // leaves a compact puff stuck to the boot; real spray hangs and thins.
@@ -277,11 +288,22 @@ void main() {
   alpha *= smoothstep(uFadeNear * 0.3, uFadeNear, -mv.z);
 
   if (isGroundQuad > 0.5) above = 9.0;   // ground decals must not fade themselves
-  // Soft-particle fade against the birth plane. Kept tight: a wide fade band
-  // erases the snow right at the ski, which is what made the rooster tail read
-  // as a detached cloud floating beside the skier instead of a sheet peeling
-  // off the edge.
-  alpha *= smoothstep(-0.06, 0.17, above);
+  // Soft-particle fade against the birth plane, sized to the sprite instead of
+  // fixed.
+  //
+  // The band used to be a constant smoothstep(-0.06, 0.17): a corner had to be
+  // 17 cm clear of the snow to reach full alpha. Snow leaving an edge is *at*
+  // the snow - the root of a rooster tail sits in the top 5 cm - so every
+  // particle in the root came out at 20-50% alpha and the plume detached from
+  // the ski. That gap is the classic particle-system tell and the gate named it.
+  //
+  // What the band is actually for is hiding the hard line where a vertical
+  // billboard crosses the surface, and that only needs to happen over a distance
+  // comparable to the sprite's own radius. So it scales with size and is
+  // anchored *below* the surface: a small sprite sitting on the snow is fully
+  // opaque, and only the part that has gone under fades out.
+  float sBand = clamp(size * 0.62, 0.045, 0.34);
+  alpha *= smoothstep(-sBand * 1.7, sBand * 0.34, above);
 
   vLocal   = position.xy * 2.0;
   vUv      = uv * 0.5 + vec2(step(0.5, fract(seed * 4.0)) * 0.5,
@@ -356,12 +378,36 @@ void main() {
   // one turns every sprite into a soap bubble), plus a real vertical gradient:
   // snow low in the plume sits in the shadow of the snow above it.
   float ao = mix(0.88, 1.0, tex.b);
-  // Measured: with the old floors, spray pixels came out at 177 luma over a 173
-  // backdrop — a 2% difference, i.e. invisible on a white slope. Sunlit spray is
-  // a cloud of ice with an albedo *higher* than the pack it came off and a huge
-  // amount of multiple scattering; it belongs 20-35% above the piste, with the
-  // contrast carried by its own underside shadow and the shadow it casts.
-  float vs = mix(0.50, 1.20, clamp(vRise * 0.70, 0.0, 1.0));
+
+  // ---- what value does spray actually sit at, on a white slope? -------------
+  //
+  // Measured on front-lit reference photography of a hard GS carve (Hinterstoder
+  // / Trysil, bluebird, sun over the shoulder):
+  //
+  //     clean sunlit piste beside the skier   mean 230   sd 17
+  //     body of the curtain                   mean 200   sd 27   (-13%)
+  //     dense root at the edge                mean 194   sd 43   max 255
+  //
+  // So the body of a curtain is NOT brighter than the snow. It is about an
+  // eighth *darker*, with half again the local variance and occasional grains
+  // that clip. That is the physics: the pack is a 0.9-albedo multiple-scattering
+  // half-space, and a thin cloud of ice crystals hung in front of it can only
+  // scatter a fraction of what it hides. What makes spray read is texture and
+  // the fact that it takes bright snow *down*, not a glow.
+  //
+  // The previous tuning aimed the other way - "20-35% above the piste" - which
+  // is a backlit rule applied to a front-lit shot, and it landed the curtain
+  // within 2% of the snow behind it. 2% is invisible: measured, spray on vs
+  // spray off over the ski changed the region mean by 3.2 codes out of 178.
+  //
+  // The one thing that IS brighter than the pack is the dense root: an optically
+  // thick sheet in direct sun with the piste bouncing into it, plus specular
+  // glints off crystal facets. So brightness now tracks *density* rather than
+  // height, which also puts the light where the eye needs it to weld the plume
+  // to the ski.
+  float vs = mix(0.70, 1.06, clamp(vRise * 0.62, 0.0, 1.0));
+  // Optical density of this fragment, 0 at the wispy fringe, 1 in the core.
+  float thick = clamp(dens * 1.6, 0.0, 1.0);
 
   // Self-shadowing only applies where the plume is optically thick. A thin
   // fringe has nothing above it to shade it, so it stays white; shading it like
@@ -372,20 +418,24 @@ void main() {
   vec3 col = uAmbient * ao * (0.62 + 0.38 * n.z);
   col += uSunColor * wrap * ao * vs * shd;
   // Multiple scattering inside a dense cloud of ice: even the shadow side of
-  // snow spray is nowhere near black.
-  col += uSunColor * 0.34 * ao * mix(0.55, 1.0, vs) * mix(0.70, 1.0, shd);
+  // snow spray is nowhere near black. Weighted by optical depth - a single
+  // crystal has nothing to multiply-scatter with.
+  col += uSunColor * (0.16 + 0.30 * thick) * ao * mix(0.55, 1.0, vs) * mix(0.70, 1.0, shd);
   col += uGroundBounce * (0.5 - 0.5 * n.y);
   col *= vBright;
 
-  // Additive forward scatter: the glow that makes it read as photographic.
-  col += uSunColor * hg * uScatter * (0.10 + 0.90 * thin * thin) * vs;
+  // Additive forward scatter. Keyed on density, not on thinness: the old
+  // thin*thin weighting put the glow on exactly the wispy tail that a photograph
+  // shows as translucent grey, and starved the dense root that a photograph
+  // shows blowing out to 255.
+  col += uSunColor * hg * uScatter * (0.20 + 0.80 * thick) * vs;
 
-  // Opposition surge. Ice crystals retro-reflect hard, which is why front-lit
-  // spray is *brighter* than the snow it came off rather than the same value —
-  // and being the same value as the snow behind it is exactly how a spray
-  // system becomes invisible on a white slope.
+  // Opposition surge. Ice crystals retro-reflect hard, and where the snow is
+  // piled thickest that surge is what takes the root above the piste it came
+  // off. Density-weighted for the same reason as the term above.
   float bs = max(dot(V, L), 0.0);
-  col += uSunColor * (0.26 * bs * bs + 0.22 * pow(bs, 6.0)) * ao * vs * shd;
+  col += uSunColor * (0.30 * bs * bs + 0.26 * pow(bs, 6.0)) * ao * vs * shd
+         * (0.25 + 0.95 * thick);
 
   // Individual ice crystals catching the light.
   float tw = sin(uTime * 26.0 + vSeed * 137.0) * 0.5 + 0.5;
@@ -516,7 +566,7 @@ export function createSpray(scene) {
 
   const WHITE = new THREE.Color(1, 1, 1);
   let sun = null, sunSearch = 0;
-  const acc = { rooster: 0, sheet: 0, veil: 0, crystal: 0, air: 0 };
+  const acc = { root: 0, rooster: 0, sheet: 0, veil: 0, crystal: 0, air: 0 };
   let prevAirborne = false, prevSpeed = 0, prevVy = 0;
   let landCooldown = 0, stopCooldown = 0;
 
@@ -610,10 +660,64 @@ export function createSpray(scene) {
   }
 
   // -------------------------------------------------------------------------
+  // Per-emitter rate multipliers. Ship at 1; a probe can zero one out to see
+  // exactly which band is putting light where, which is the only way to tell a
+  // curtain at the ski from a cloud forty metres behind it.
+  const gain = { root: 1, rooster: 1, sheet: 1, veil: 1, crystal: 1, air: 1 };
+
   const api = {
     mesh,
     material: mat,
+    gain,
     liveCount: 0,
+
+    /**
+     * Dev probe. Replays the vertex shader's closed-form trajectory on the CPU
+     * for every live slot and reports where the snow actually *is*, in metres
+     * behind the skier, weighted by the alpha each sprite will be drawn with.
+     * "A curtain at the ski" and "a cloud thirty metres back" look identical in
+     * a particle count and completely different here.
+     */
+    nearStats(camera, state) {
+      const buckets = [0, 0, 0, 0, 0];   // <2m, 2-5, 5-12, 12-30, >30
+      let live = 0, nearCamFaded = 0, totalW = 0, wSum = 0;
+      const sx = state.pos.x, sy = state.pos.y, sz = state.pos.z;
+      const cx = camera ? camera.position.x : sx;
+      const cy = camera ? camera.position.y : sy;
+      const cz = camera ? camera.position.z : sz;
+      const fadeNear = uniforms.uFadeNear.value;
+      for (let i = 0; i < N; i++) {
+        const i4 = i * 4, i3 = i * 3;
+        const t = time - bufA[i4], life = bufA[i4 + 1];
+        if (!(t >= 0 && t < life)) continue;
+        live++;
+        const k = bufB[i4 + 1], grav = bufD[i4 + 3];
+        const e = Math.exp(-k * t);
+        const wx = uniforms.uWind.value;
+        const vinfY = (-9.81 * grav) / k + wx.y;
+        const px = bufP0[i3] + (bufV0[i3] - wx.x) * (1 - e) / k + wx.x * t;
+        const py = bufP0[i3 + 1] + (bufV0[i3 + 1] - vinfY) * (1 - e) / k + vinfY * t;
+        const pz = bufP0[i3 + 2] + (bufV0[i3 + 2] - wx.z) * (1 - e) / k + wx.z * t;
+        const u = t / life;
+        const fout = 1 - smoothstep(0.55, 1.0, u);
+        const w = bufB[i4 + 3] * smoothstep(0, 0.025, t) * fout * (1 - 0.55 + 0.55 * fout);
+        const d = Math.hypot(px - sx, py - sy, pz - sz);
+        buckets[d < 2 ? 0 : d < 5 ? 1 : d < 12 ? 2 : d < 30 ? 3 : 4] += w;
+        totalW += w;
+        wSum += w * d;
+        const dc = Math.hypot(px - cx, py - cy, pz - cz);
+        if (dc < fadeNear) nearCamFaded += w;
+      }
+      const pct = (v) => +(100 * v / Math.max(totalW, 1e-6)).toFixed(1);
+      return {
+        live,
+        alphaMassPct: { d0_2: pct(buckets[0]), d2_5: pct(buckets[1]), d5_12: pct(buckets[2]),
+                        d12_30: pct(buckets[3]), d30plus: pct(buckets[4]) },
+        meanDistM: +(wSum / Math.max(totalW, 1e-6)).toFixed(2),
+        camFadedPct: pct(nearCamFaded),
+        camDistM: +Math.hypot(cx - sx, cy - sy, cz - sz).toFixed(2),
+      };
+    },
 
     /** Hook for other systems (impacts, collisions) to throw a powder burst. */
     puff(x, y, z, strength = 1) {
@@ -663,6 +767,15 @@ export function createSpray(scene) {
       const load = clamp((carveLoad * 0.75 + skidLoad * 0.55) * speedF *
                          (0.70 + 0.20 * Math.min(gf, 2.5)), 0, 1.3);
 
+      // How far over is the ski? state.edge is phi / 60 degrees, so 0.83 is 50
+      // degrees. Everything about a carve changes character over the last third
+      // of that range: below ~25 degrees the base is doing the work and the ski
+      // barely displaces snow, and above ~50 the edge is ploughing a trench and
+      // throwing its heaviest curtain. The old spray had no term for this at
+      // all - it was driven by `load`, which is nearly saturated by 35 degrees -
+      // so the money shot looked exactly like a lazy traverse.
+      const edgeBoost = smoothstep(0.42, 0.92, edgeAbs);
+
       // Which way does the snow fly? Outside of the arc, plus the skid vector.
       let lat = edge * 0.8 + slip * 1.8;
       if (Math.abs(lat) < 0.04) lat = edge >= 0 ? 0.04 : -0.04;
@@ -675,14 +788,73 @@ export function createSpray(scene) {
       // 1. ROOSTER TAIL - the continuous curtain off the edged ski
       // ---------------------------------------------------------------------
       if (!airborne && load > 0.012) {
-        acc.rooster += 5400 * load * dt;
+        // -------------------------------------------------------------------
+        // 1a. THE ROOT. A separate, very short-lived band emitted along the
+        // running edge itself.
+        //
+        // This is the piece the whole effect was missing. Everything else here
+        // is snow that has already left the ski and is being abandoned at 15 m/s;
+        // by the time it is 30 cm clear of the edge the skier is a metre past it
+        // and there is nothing left connecting the two. What a photograph of a
+        // carve actually shows is a bright dense wedge *welded* to the edge, a
+        // hand's width tall, shearing back and dissolving over about half a
+        // metre. So: emitted at the contact point, carrying nearly the ski's own
+        // velocity so it stays with it, dense, and dead inside a third of a
+        // second so it never smears down the slope.
+        // -------------------------------------------------------------------
+        acc.root += (4200 + 9000 * edgeBoost) * load * gain.root * dt;
+        let nr = Math.min(acc.root | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
+        acc.root -= nr;
+        const rootOut = 0.85 + 2.1 * load + 1.5 * edgeBoost;
+        for (; nr > 0; nr--) {
+          // The whole running length of the edge, tip to tail.
+          const alongT = -0.95 + 1.75 * rnd();
+          const lateral = sgn * (0.15 + rnd() * 0.13);
+          const rise = rnd();
+          const px = p.x + fwd.x * alongT + right.x * lateral;
+          const py = p.y + fwd.y * alongT + right.y * lateral + 0.012 + rise * rise * 0.12;
+          const pz = p.z + fwd.z * alongT + right.z * lateral;
+          // ~85% of the ski's speed: the wedge travels with the ski for the
+          // fraction of a second it exists, which is what welds it to the edge.
+          const keep = spd * (0.72 + 0.22 * rnd());
+          const outK = rootOut * (0.45 + 0.9 * rnd());
+          const upK = (0.35 + 1.5 * rise) * (0.6 + 1.5 * load);
+          emit(
+            px, py, pz,
+            right.x * sgn * outK + up.x * upK + velDir.x * keep + rndc() * 0.5,
+            right.y * sgn * outK + up.y * upK + velDir.y * keep + rndc() * 0.3,
+            right.z * sgn * outK + up.z * upK + velDir.z * keep + rndc() * 0.5,
+            0.15 + rnd() * 0.26,                               // life
+            0.062 + rnd() * rnd() * 0.24 + 0.09 * load,        // size
+            1.35,                                              // grow: it shears
+            2.1 + rnd() * 1.4,                                 // drag
+            0.10 + rnd() * 0.14,                               // turbulence
+            0.95 + rnd() * 0.50,                               // dense
+            gN.x, gN.y, gN.z, groundD,
+            0.30 + 0.18 * rnd(),                               // streaks back
+            0.30,
+            1.14 + rnd() * 0.30,                               // bright
+            0.45
+          );
+        }
+
+        // Rate roughly doubled against the halved lifetime below: same live
+        // population, but concentrated into the first few metres behind the ski
+        // instead of trailed over fifteen.
+        acc.rooster += (8600 + 9500 * edgeBoost) * load * gain.rooster * dt;
         let n = Math.min(acc.rooster | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
         acc.rooster -= n;
 
         // A World Cup GS turn throws the curtain 2-4 m out and head high. The
         // numbers below are sized against that, not against a puff of dust.
-        const vOut = 1.30 + 3.5 * load + 0.052 * spd;
-        const vUp = 1.55 + 3.5 * load + 0.050 * spd;
+        // Sized against the reference: on hard piste a GS curtain is a wedge
+        // roughly two and a half metres long and half a metre tall that hugs the
+        // snow. The old numbers were written for a powder mushroom - 5 m/s of
+        // outward and 5 m/s of upward throw, which with this drag builds a plume
+        // nearly two metres tall and three wide, and since the chase camera sits
+        // less than five metres away that filled a third of the frame with fog.
+        const vOut = 0.70 + 1.55 * load + 0.024 * spd + 1.05 * edgeBoost;
+        const vUp = 0.85 + 1.55 * load + 0.022 * spd + 0.85 * edgeBoost;
         // Snow leaves a moving ski with most of the ski's forward momentum and
         // then decelerates hard. That retained momentum plus high drag is what
         // lays the plume down as a long wall behind the skier instead of
@@ -690,21 +862,30 @@ export function createSpray(scene) {
         const carry = spd * 0.62;
 
         for (; n > 0; n--) {
-          // Along the running edge, boot to tail, weighted toward the tail.
-          const alongT = -2.3 + 2.7 * Math.pow(rnd(), 0.7);
+          // Along the running edge. Pulled forward from the old -2.3..0.4 m: the
+          // curtain is generated *at* the edge and then left behind by the
+          // skier, so seeding it two metres back as well only doubles up on snow
+          // that is already there and starves the part that is still attached.
+          const alongT = -1.55 + 2.05 * Math.pow(rnd(), 0.7);
           // The sheet peels off the edge and widens as it leaves the ski.
           const peel = rnd();
-          const lateral = sgn * (0.11 + peel * peel * (0.35 + 0.9 * load)) + rndc() * 0.05;
+          const lateral = sgn * (0.14 + peel * peel * (0.28 + 0.62 * load + 0.34 * edgeBoost))
+                        + rndc() * 0.05;
           const px = p.x + fwd.x * alongT + right.x * lateral;
           const py = p.y + fwd.y * alongT + right.y * lateral
-                   + 0.04 + peel * (0.16 + 0.7 * load);
+                   + 0.03 + peel * (0.16 + 0.7 * load);
           const pz = p.z + fwd.z * alongT + right.z * lateral;
 
           // Fan the curtain: mostly outward, some straight up, some low sheet.
           const fan = rnd();
           const outK = vOut * (0.45 + 1.15 * fan) * (0.75 + 0.5 * rnd());
           const upK = vUp * (1.20 - 0.80 * fan) * (0.6 + 0.8 * rnd());
-          const backK = carry * (0.55 + 0.7 * rnd());
+          // Snow nearest the edge has barely been separated from the ski yet, so
+          // it keeps more of its speed; snow at the outside of the fan has been
+          // thrown and is already being left behind. Making `carry` fall off with
+          // `peel` is what shears the curtain back into a wall instead of
+          // translating the whole plume at one speed.
+          const backK = carry * (0.55 + 0.7 * rnd()) + spd * 0.30 * (1.0 - peel);
           const big = rnd();
           const vx = right.x * sgn * outK + up.x * upK + velDir.x * backK + rndc() * 0.85;
           const vy = right.y * sgn * outK + up.y * upK + velDir.y * backK + rndc() * 0.50;
@@ -713,10 +894,18 @@ export function createSpray(scene) {
           // of snow travelling with the skier; long lives and low drag smear the
           // same particle budget over forty metres of slope, which measured as
           // 66% of the frame touched and none of it reading as anything.
-          const life = 0.68 + rnd() * 1.00 + load * 0.45;
+          //
+          // At 15 m/s a one-second life is a fifteen-metre trail, and the probe
+          // measured half of the plume's alpha mass sitting 5-12 m back: a wall
+          // of fog off to the side of the frame with nothing at the ski. Real
+          // spray at this speed is a two-metre plume, because it disperses below
+          // the visible threshold in a fraction of a second. So the life is
+          // halved and the rate doubled - same cost, and the snow is where a
+          // photograph puts it.
+          const life = 0.17 + rnd() * 0.27 + load * 0.16;
           // Snow leaves the edge as chunks and clods, not as dust: the size
           // distribution has to have a long tail or the curtain is a grey haze.
-          const size = 0.115 + big * big * 0.66 + load * 0.14;
+          const size = 0.070 + big * big * 0.34 + load * 0.10;
 
           if ((n & 3) === 0) {
             emitShadowBlob(px + vx * 0.22, py + vy * 0.22, pz + vz * 0.22,
@@ -727,10 +916,10 @@ export function createSpray(scene) {
           emit(
             px, py, pz, vx, vy, vz,
             life, size,
-            0.90 + rnd() * 0.80,                               // grow
+            0.40 + rnd() * 0.35,                               // grow
             3.4 + rnd() * 1.9,                                 // drag
             0.22 + rnd() * 0.30,                               // turbulence
-            0.50 + rnd() * rnd() * 0.55,                       // alpha
+            0.90 + rnd() * rnd() * 0.80,                       // alpha
             gN.x, gN.y, gN.z, groundD,
             0.26 + 0.16 * rnd(),                               // motion stretch
             0.10,
@@ -742,12 +931,12 @@ export function createSpray(scene) {
           // packed snow that fly nearly ballistically, out ahead of the soft
           // body of the curtain. They are what give a rooster tail its grain and
           // its leading edge - without them the plume is cotton wool.
-          if ((n & 7) === 0) {
+          if ((n & 7) === 0 || (edgeBoost > 0.45 && (n & 3) === 0)) {
             const cs = 1.45 + rnd() * 0.7;
             emit(
               px, py, pz, vx * cs, vy * cs * 0.85, vz * cs,
               0.34 + rnd() * 0.45,
-              0.022 + rnd() * rnd() * 0.055,
+              0.030 + rnd() * rnd() * 0.090,
               0.25,                                            // barely grows
               0.55 + rnd() * 0.55,                             // low drag
               0.06,
@@ -762,7 +951,7 @@ export function createSpray(scene) {
         }
 
         // ------ low sheet that stays glued to the surface -------------------
-        acc.sheet += 190 * load * dt;
+        acc.sheet += 190 * load * gain.sheet * dt;
         let ns = Math.min(acc.sheet | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
         acc.sheet -= ns;
         for (; ns > 0; ns--) {
@@ -775,10 +964,18 @@ export function createSpray(scene) {
             right.x * sgn * (0.5 + rnd()) + velDir.x * spd * 0.10 + rndc() * 0.4,
             0.35 + rnd() * 0.75,
             right.z * sgn * (0.5 + rnd()) + velDir.z * spd * 0.10 + rndc() * 0.4,
-            2.2 + rnd() * 2.4,                                 // lingers
-            0.55 + rnd() * 1.5, 0.55,
+            // Lifetime halved, and growth with it. At 2.2-4.6 s and 0.55/s of
+            // growth these ground decals reached seven metres across and were
+            // still at full alpha sixty metres back, where a hundred of them
+            // stacked along the view ray into an opaque wall that hid a fence
+            // and a treeline. Measured: that region was +32 luma codes with
+            // spray on versus off, while the snow at the ski was +3. Every bit
+            // of the effect's light was landing in the one place a photograph
+            // has nothing - which is precisely the "detached fog puff" read.
+            0.62 + rnd() * 0.75,
+            0.50 + rnd() * 1.1, 0.34,
             3.0 + rnd(), 0.24 + rnd() * 0.26,
-            0.020 + rnd() * 0.030,                             // sheer
+            0.016 + rnd() * 0.024,                             // sheer
             gN.x, gN.y, gN.z, groundD,
             0.0, -1.0, 1.02, 0.16
           );
@@ -796,8 +993,15 @@ export function createSpray(scene) {
       // not a few opaque ones, is what keeps it looking like suspended snow
       // rather than like smoke.
       // ---------------------------------------------------------------------
+      // Through a committed carve the veil is throttled back and pushed to the
+      // outside of the arc. It is a straight-running effect: on a big edge angle
+      // it was adding a low-alpha grey wash across the whole chase view - over
+      // the skier's own legs, over the trench, over the curtain - which is
+      // precisely the "detached fog puff" read. The curtain terms above own that
+      // snow now, and they place it where a photograph puts it.
       if (!airborne && spd > 4.5) {
-        acc.veil += (220 + 820 * speedF) * (0.45 + 0.55 * Math.min(load, 1)) * dt;
+        acc.veil += (220 + 820 * speedF) * (0.45 + 0.55 * Math.min(load, 1)) *
+                    (1.0 - 0.78 * edgeBoost) * gain.veil * dt;
         let n = Math.min(acc.veil | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
         acc.veil -= n;
         for (; n > 0; n--) {
@@ -806,8 +1010,9 @@ export function createSpray(scene) {
           // veil that is spread thinly over the whole slope measures as nothing.
           // Well behind the tails and low: in a chase view anything emitted at
           // the boot sits between the camera and the skier and fogs his legs.
-          const alongT = -0.95 - rnd() * 2.3;
-          const lateral = rndc() * (0.28 + 0.45 * load) + sgn * load * 0.28 * rnd();
+          const alongT = -1.25 - rnd() * 2.4;
+          const lateral = rndc() * (0.28 + 0.45 * load)
+                        + sgn * (load * 0.28 + edgeBoost * 0.55) * rnd();
           const rise = rnd();
           emit(
             p.x + fwd.x * alongT + right.x * lateral,
@@ -816,9 +1021,9 @@ export function createSpray(scene) {
             velDir.x * spd * 0.10 + rndc() * 0.8 + right.x * sgn * load * 1.4,
             0.45 + rnd() * 1.2 + load * 1.1,
             velDir.z * spd * 0.10 + rndc() * 0.8 + right.z * sgn * load * 1.4,
-            0.60 + rnd() * 0.80,
+            0.32 + rnd() * 0.42,
             0.13 + rnd() * rnd() * 0.34,                       // large and soft
-            0.55,                                              // keeps expanding
+            0.44,                                              // keeps expanding
             2.4 + rnd() * 1.1,
             0.24 + rnd() * 0.28,
             0.042 + rnd() * rnd() * 0.095,                     // sheer
@@ -833,7 +1038,7 @@ export function createSpray(scene) {
       //    sun. Small and bright: these are the sparkle, not the volume.
       // ---------------------------------------------------------------------
       if (!airborne && spd > 5) {
-        acc.crystal += (90 + 420 * speedF * (0.25 + 0.75 * load)) * dt;
+        acc.crystal += (90 + 420 * speedF * (0.25 + 0.75 * load)) * gain.crystal * dt;
         let n = Math.min(acc.crystal | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
         acc.crystal -= n;
         for (; n > 0; n--) {
@@ -860,7 +1065,7 @@ export function createSpray(scene) {
       // 4. AIRBORNE trail - snow still shedding off the skis in flight
       // ---------------------------------------------------------------------
       if (airborne && spd > 4) {
-        acc.air += 70 * speedF * dt;
+        acc.air += 70 * speedF * gain.air * dt;
         let n = Math.min(acc.air | 0, MAX_SPAWN_PER_FRAME - spawnedThisFrame);
         acc.air -= n;
         for (; n > 0; n--) {

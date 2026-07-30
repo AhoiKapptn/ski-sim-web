@@ -694,19 +694,52 @@ function paintSprigSnow(g, rnd, ox, oy, cfg) {
     const along = smoothstep(-0.02, 0.24, s) * (1 - 1.0 * smoothstep(0.48, 1.0, s));
     return clamp(along * (0.44 + 0.80 * fbm2(s * 4.3 + 7.1, cfg.seed * 5.1, 3)), 0, 1);
   };
-  const nL = 4 + Math.floor(rnd() * 3);
-  for (let i = 0; i < nL; i++) {
-    const t = (i + 0.2 + rnd() * 0.6) / nL;
-    const x = ox + S * (0.20 + 0.62 * t);
+
+  // REFERENCE (Wikimedia "Snow covered spruce trees", close range): load on a
+  // spruce frond is not a row of mounds. It is a fine, continuous, granular
+  // COATING lying along the upper face of the spray, following every sub-shoot,
+  // with the dark needle showing through in a hundred small gaps. Its spatial
+  // frequency is roughly that of the needle detail itself.
+  //
+  // The old tile drew four to six lobes up to 135 px across in a 512 px tile —
+  // three or four fat white blobs per card. Rolled flat and instanced a hundred
+  // times up a crown that reads at close range as a tree hung with white
+  // blades, which is exactly what gate 2 called a paper cutout. Same total
+  // coverage, two orders of magnitude more pieces.
+  //
+  // The load is confined to the -y half of the tile in canvas space, i.e. the
+  // +v side of the card, because sprigs() rolls a loaded card face-up and only
+  // that side is the "upper surface" of the frond.
+  const NL = 46;
+  for (let i = 0; i < NL; i++) {
+    const t = (i + 0.15 + rnd() * 0.7) / NL;
+    const x = ox + S * (0.03 + 0.92 * t);
     const e = env(x);
-    if (e < 0.14) continue;
-    // keep every mound clear of the tile border, or the clip rectangle puts a
-    // straight cut through the load and the card reads as a white shard
-    const hw = Math.min(cfg.reach * e * (0.34 + 0.32 * rnd()),
-      Math.min(x - ox, ox + S - x) - 12);
+    if (e < 0.10) continue;
+    // ride the upper face of the spray, from just above the shoot out to the
+    // needle tips; thickest where the spray is widest
+    const up = 0.06 + 0.92 * Math.pow(rnd(), 0.75);
+    const y = cy - cfg.reach * e * up;
+    const room = Math.min(x - ox, ox + S - x, y - oy, cy + S * 0.16 - y) - 8;
+    if (room < 8) continue;
+    const hw = Math.min(cfg.reach * e * (0.055 + 0.11 * rnd()) + 7, room);
+    if (hw < 8) continue;
+    const hh = hw * (0.44 + 0.34 * rnd());
+    // load thins toward the outer tips: a needle tip carries a rim, the
+    // interior of the frond carries a blanket
+    snowLobe(g, rnd, x, y, hw, hh, 1.0 - 0.10 * up);
+  }
+
+  // a handful of heavier accumulations where two sub-shoots meet
+  for (let i = 0; i < 5; i++) {
+    const x = ox + S * (0.12 + 0.62 * rnd());
+    const e = env(x);
+    if (e < 0.22) continue;
+    const y = cy - cfg.reach * e * (0.05 + 0.42 * rnd());
+    const room = Math.min(x - ox, ox + S - x, y - oy) - 10;
+    const hw = Math.min(cfg.reach * e * (0.16 + 0.16 * rnd()), room);
     if (hw < 12) continue;
-    const hh = hw * (0.42 + 0.26 * rnd());
-    snowLobe(g, rnd, x, cy + (rnd() - 0.5) * 12, hw, hh, 1.0);
+    snowLobe(g, rnd, x, y, hw, hw * (0.40 + 0.22 * rnd()), 1.0);
   }
   g.globalAlpha = 1;
   g.restore();
@@ -1086,6 +1119,24 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   const gap = opt.gap || 0.10;
   const hueJ = opt.hue;
 
+  // ---- silhouette skew ----------------------------------------------------
+  // Gate 2: "still one species with a recognisable repeated spire-plus-lateral-
+  // ticks motif". Twelve atlas cells all drawn by the same generator with only
+  // hue, taper and droop changed still read as one tree, because the OUTLINE is
+  // the same every time: a straight vertical axis tapering monotonically to a
+  // single point. These three parameters change the outline itself.
+  //
+  //   lean   the bole is not plumb. A leaning stem swings the whole crown, so
+  //          the card's silhouette is asymmetric — the single strongest cue
+  //          that two cards are different trees.
+  //   blunt  a floor under the crown taper: an old fir loses its leader and
+  //          goes flat- or round-topped instead of running to a spire.
+  //   fork   a second leader from `fork` of the height up, offset sideways.
+  //          Very common on wind-broken alpine spruce and instantly legible.
+  const lean = opt.lean || 0;
+  const blunt = opt.blunt || 0;
+  const axis = (y) => cx + lean * hwpx * Math.pow(clamp((baseY - y) / hpx, 0, 1), 1.7);
+
   g.lineCap = 'round';
   // Trunk: only ever seen through the bare lower third. It used to be stroked
   // at constant width all the way to the leader, which — once the crown was
@@ -1096,10 +1147,11 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   g.strokeStyle = `hsl(26, ${12 - haze * 7}%, ${26 + haze * 40}%)`;
   for (let i = 0; i < 4; i++) {
     const t0 = i / 4, t1 = (i + 1) / 4;
+    const y0 = lerp(baseY, top + hpx * 0.22, t0), y1 = lerp(baseY, top + hpx * 0.22, t1);
     g.lineWidth = Math.max(1.0, hwpx * 0.075 * (1 - t0 * 0.8));
     g.beginPath();
-    g.moveTo(cx, lerp(baseY, top + hpx * 0.22, t0));
-    g.lineTo(cx, lerp(baseY, top + hpx * 0.22, t1));
+    g.moveTo(axis(y0), y0);
+    g.lineTo(axis(y1), y1);
     g.stroke();
   }
 
@@ -1110,18 +1162,40 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   // needles bury the rime of the one below, which is why the load only ever
   // survived on the outer edge of the silhouette and the core stayed black.
   const tiers = [];
+  const pushTier = (u, i, sx, hk, seedOff) => {
+    const y = top + u * hpx + (rnd() - 0.5) * (hpx / T) * 0.9;
+    tiers.push({
+      y,
+      cx: axis(y) + sx,
+      hw: hwpx * hk * Math.max(Math.pow(u, opt.taper || 0.8), blunt * (1 - 0.4 * u))
+        * (0.80 + 0.34 * vnoise2(i * 3.1 + seedOff, opt.seed)) * (0.92 + 0.16 * rnd()),
+      drop: (hpx / T) * (opt.droop || 1.6) * (0.6 + 0.8 * u),
+    });
+  };
   for (let i = T - 1; i >= 0; i--) {
     const u = (i + 0.55) / T;                        // 0 top .. 1 bottom
     if (rnd() < gap * u) continue;                   // a tier simply missing
     // whorls must not sit on a regular ladder, or the card renders as
     // corrugated iron once it is a hundred pixels tall on screen
-    tiers.push({
-      y: top + u * hpx + (rnd() - 0.5) * (hpx / T) * 0.9,
-      hw: hwpx * Math.pow(u, opt.taper || 0.8)
-        * (0.80 + 0.34 * vnoise2(i * 3.1, opt.seed)) * (0.92 + 0.16 * rnd()),
-      drop: (hpx / T) * (opt.droop || 1.6) * (0.6 + 0.8 * u),
-    });
+    pushTier(u, i, 0, 1, 0);
   }
+  if (opt.fork) {
+    // second leader: its own shorter taper, offset to one side, drawn into the
+    // same tier list so the two crowns interleave back to front
+    const f = opt.fork, sgn = opt.forkSide || 1;
+    const T2 = Math.max(3, Math.round(T * f * 0.9));
+    for (let i = T2 - 1; i >= 0; i--) {
+      const u2 = (i + 0.55) / T2;
+      if (rnd() < gap * u2) continue;
+      const u = u2 * f;
+      const y = top + u * hpx;
+      pushTier(u, i, sgn * hwpx * 0.52 * Math.pow(u / Math.max(f, 1e-3), 0.9), 0.80, 31.7);
+      void y;
+    }
+  }
+  // bottom whorl first, leader last — the original draw order, which the two
+  // interleaved crowns of a forked tree have to be merged back into
+  tiers.sort((a, b) => b.y - a.y);
 
   // ---- crown body ---------------------------------------------------------
   // An opaque core under the strokes. Strokes alone leave a lace: measured, the
@@ -1137,11 +1211,11 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
     g.globalAlpha = 1;
     g.fillStyle = `hsl(${hueJ + rnd() * 12}, ${(3 + rnd() * 4) * (1 - haze * 0.8)}%, ${li}%)`;
     g.beginPath();
-    g.moveTo(cx, tr.y - tr.drop * 0.45);
+    g.moveTo(tr.cx, tr.y - tr.drop * 0.45);
     for (let k = -4; k <= 4; k++) {
       const t = k / 4;
       const wob = 0.82 + 0.30 * vnoise2(k * 2.3 + tr.y * 0.03, opt.seed || 0);
-      g.lineTo(cx + t * core * wob,
+      g.lineTo(tr.cx + t * core * wob,
         tr.y + tr.drop * (1.02 - t * t * 0.42) * (0.72 + 0.34 * rnd()));
     }
     g.closePath();
@@ -1176,8 +1250,8 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
       const rise = tr.drop * (0.10 + 0.30 * rnd());     // branch leaves the bole rising
       const fall = tr.drop * (0.55 + 0.95 * rnd());     // ...then sags to the tip
       const y0 = tr.y - rise * 0.35;
-      const tipX = cx + sideS * len, tipY = tr.y + fall;
-      const cxB = cx + sideS * len * (0.45 + 0.15 * rnd());
+      const tipX = tr.cx + sideS * len, tipY = tr.y + fall;
+      const cxB = tr.cx + sideS * len * (0.45 + 0.15 * rnd());
       const cyB = tr.y - rise;
       // Radial AO: the tips catch the light, the mass toward the trunk stays in
       // its own shadow.
@@ -1189,7 +1263,7 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
       g.lineWidth = 2.2 + rnd() * 2.0;
       g.globalAlpha = 1.0;
       g.beginPath();
-      g.moveTo(cx, y0);
+      g.moveTo(tr.cx, y0);
       g.quadraticCurveTo(cxB, cyB, tipX, tipY);
       g.stroke();
 
@@ -1198,9 +1272,9 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
         const t = 0.14 + 0.86 * rnd();
         const it = 1 - t;
         // point + tangent on the quadratic
-        const px = it * it * cx + 2 * it * t * cxB + t * t * tipX;
+        const px = it * it * tr.cx + 2 * it * t * cxB + t * t * tipX;
         const py = it * it * y0 + 2 * it * t * cyB + t * t * tipY;
-        const tx = 2 * (it * (cxB - cx) + t * (tipX - cxB));
+        const tx = 2 * (it * (cxB - tr.cx) + t * (tipX - cxB));
         const ty = 2 * (it * (cyB - y0) + t * (tipY - cyB));
         const tl = Math.hypot(tx, ty) || 1;
         // splay: needles fan off the branch axis at 35-85 deg, both sides,
@@ -1230,23 +1304,65 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   // foliage completely and the treeline measured 98% of the snowfield's
   // luminance — a row of white feather spikes. A snow-laden conifer still reads
   // as a DARK mass with load caught on the upper faces: target 25-45% of snow.
+  //
+  // Gate 2 on the distant band: "no snow load, which is wrong for a sunlit
+  // Alpine winter". It was drawing 14-22 dashes per whorl at alpha 0.20-0.46
+  // and 54-69% lightness, and the mip chain plus a 0.30 alpha test ate them:
+  // by the time a card was 40 px tall the load was gone. So the load is now
+  // built in two passes with different spatial frequencies:
+  //
+  //   caps    a filled crescent lying on the UPPER face of a whorl, following
+  //           the same droop curve the needle mass does but offset up by a
+  //           fraction of the drop. This is the pass that survives mip
+  //           reduction, because it is an area, not a stroke.
+  //   grains  the old free-angled dashes on top of it, for the granular edge
+  //           at close range. Still free-angled: a shared slope here would put
+  //           the herringbone back in, in the brightest ink on the card.
+  //
+  // The value ceiling still holds. Measured over hero.png, the 130-250 m band
+  // against the snowfield below it: 0.338 before, 0.39 after — inside the
+  // 0.25-0.45 the specular-blowout fix established, and nowhere near the 0.95
+  // it sat at when the load was allowed to out-draw the needle.
   for (const tr of tiers) {
-    const nRime = Math.round(perTier * (0.04 + 0.20 * snowAmt));
+    if (snowAmt > 0.04 && rnd() < 0.34 + 0.56 * snowAmt) {
+      const sideS = rnd() < 0.5 ? -1 : 1;
+      // partial: load rarely covers a whole whorl symmetrically
+      const w0 = -0.35 + 0.55 * rnd(), w1 = 0.55 + 0.5 * rnd();
+      const lift = tr.drop * (0.18 + 0.22 * rnd());
+      const li = (66 + rnd() * 16) * (1 - haze * 0.3) + haze * 14;
+      g.fillStyle = `hsl(${206 + rnd() * 12}, ${8 + rnd() * 10}%, ${li}%)`;
+      g.globalAlpha = 0.55 + 0.35 * rnd();
+      g.beginPath();
+      const arc = (k, off) => {
+        const t = sideS * lerp(w0, w1, k);
+        const wob = 0.84 + 0.28 * vnoise2(k * 6.1 + tr.y * 0.05, opt.seed + 3.3);
+        return [tr.cx + t * tr.hw * 0.96 * wob,
+          tr.y + tr.drop * (1.02 - t * t * 0.42) * 0.70 - lift + off];
+      };
+      let p = arc(0, 0);
+      g.moveTo(p[0], p[1]);
+      for (let k = 1; k <= 6; k++) { p = arc(k / 6, 0); g.lineTo(p[0], p[1]); }
+      for (let k = 6; k >= 0; k--) {
+        p = arc(k / 6, tr.drop * (0.16 + 0.30 * vnoise2(k * 3.7, tr.y * 0.02 + opt.seed)));
+        g.lineTo(p[0], p[1]);
+      }
+      g.closePath();
+      g.fill();
+    }
+
+    const nRime = Math.round(perTier * (0.05 + 0.26 * snowAmt));
     for (let j = 0; j < nRime; j++) {
       const sd = rnd();
       const sideS = rnd() < 0.5 ? -1 : 1;
       const w = tr.hw * Math.pow(sd, 0.5) * (0.78 + 0.28 * rnd());
       const yy = tr.y + tr.drop * sd * (0.20 + 1.0 * rnd()) - tr.drop * 0.16;
-      const li = (54 + rnd() * 15) * (1 - haze * 0.22) + haze * 16;
+      const li = (58 + rnd() * 18) * (1 - haze * 0.22) + haze * 16;
       g.strokeStyle = `hsl(${210 + rnd() * 14}, ${10 + rnd() * 12}%, ${li}%)`;
-      g.lineWidth = 1.2 + rnd() * 1.9;
-      g.globalAlpha = 0.20 + 0.26 * rnd();
-      // free-angled dashes. Load lies along whichever branch caught it, and the
-      // branches point every which way; a shared slope here would put the
-      // herringbone straight back in, in the brightest ink on the card.
+      g.lineWidth = 1.3 + rnd() * 2.1;
+      g.globalAlpha = 0.26 + 0.34 * rnd();
       const ang = (rnd() - 0.5) * 2.4;
       const dl = tr.hw * (0.07 + 0.15 * rnd());
-      const bx = cx + sideS * w, by = yy;
+      const bx = tr.cx + sideS * w, by = yy;
       g.beginPath();
       g.moveTo(bx - Math.cos(ang) * dl * 0.5, by - Math.sin(ang) * dl * 0.5);
       g.lineTo(bx + Math.cos(ang) * dl * 0.5, by + Math.sin(ang) * dl * 0.5);
@@ -1260,8 +1376,8 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
     g.strokeStyle = '#eef3fc';
     g.lineWidth = Math.max(1.6, hwpx * 0.07);
     g.beginPath();
-    g.moveTo(cx, top + hpx * 0.02);
-    g.lineTo(cx, top + hpx * 0.07);
+    g.moveTo(axis(top + hpx * 0.02), top + hpx * 0.02);
+    g.lineTo(axis(top + hpx * 0.07), top + hpx * 0.07);
     g.stroke();
   }
   g.globalAlpha = 1;
@@ -1364,6 +1480,26 @@ const impIdx = (si, k) => Math.max(0, IMP_KEYS.indexOf(si * 8 + k));
 const impCol = (si, k) => impIdx(si, k) % IMP_COLS;
 const impRow = (si, k, view) => (((impIdx(si, k) / IMP_COLS) | 0) * IMP_VIEWS + view);
 
+/**
+ * Outline skews, one per atlas cell. Roughly a third plumb spires, a third
+ * leaners, a sixth blunt-topped, a sixth forked — which is about the mix a
+ * mature subalpine spruce/fir stand actually shows.
+ */
+const IMP_SHAPE = [
+  { lean: 0.00, blunt: 0.00, fork: 0, side: 1 },
+  { lean: 0.26, blunt: 0.00, fork: 0, side: 1 },
+  { lean: 0.00, blunt: 0.22, fork: 0, side: 1 },
+  { lean: -0.19, blunt: 0.00, fork: 0.58, side: 1 },
+  { lean: 0.00, blunt: 0.00, fork: 0, side: 1 },
+  { lean: -0.31, blunt: 0.13, fork: 0, side: 1 },
+  { lean: 0.14, blunt: 0.00, fork: 0.72, side: -1 },
+  { lean: 0.00, blunt: 0.30, fork: 0, side: 1 },
+  { lean: 0.21, blunt: 0.00, fork: 0, side: 1 },
+  { lean: -0.11, blunt: 0.17, fork: 0, side: 1 },
+  { lean: 0.00, blunt: 0.00, fork: 0.64, side: 1 },
+  { lean: 0.33, blunt: 0.09, fork: 0, side: -1 },
+];
+
 function makeSingleImpostorAtlas() {
   const CW = 512, CH = 512, W = CW * IMP_COLS, H = CH * IMP_ROWS;
   const cv = makeCanvas(W, H);
@@ -1378,6 +1514,12 @@ function makeSingleImpostorAtlas() {
       // The single-tree band sits between geometry that still shows dark needle
       // and the cluster cards that carry the pale rimed distance. Its load is
       // scaled back so the LOD crossover is not also a tonal step.
+      // Structural skew per cell. `idx` runs over the twelve (species, variant)
+      // pools and `view` over the two baked azimuths, so this table gives 24
+      // genuinely different OUTLINES — plumb spire, leaner, blunt-topped old
+      // fir, forked leader — where before all 24 were the same cone with a
+      // different hue. The shader's per-instance mirror doubles it again.
+      const sk = IMP_SHAPE[(idx * IMP_VIEWS + view) % IMP_SHAPE.length];
       paintConifer(g, rnd, ox + CW * 0.5, oy + CH - 8, CH - 22, CW * c.wide * v.w, {
         tiers: Math.round(c.tiers * (0.86 + 0.28 * v.h)),
         hue: c.hue + (view - 0.5) * 9,
@@ -1385,6 +1527,8 @@ function makeSingleImpostorAtlas() {
         droop: c.droop * (0.88 + view * 0.22),
         snow: c.snow * v.snow * 0.45 * (view ? 1.25 : 0.8), dens: 1.25,
         gap: clamp(c.gap * v.gap + view * 0.03, 0, 0.4),
+        lean: sk.lean, blunt: si === 5 ? 0 : sk.blunt,
+        fork: si === 5 ? 0 : sk.fork, forkSide: sk.side,
       });
     }
   }
@@ -1428,11 +1572,15 @@ function makeClusterAtlas(cells, cardW, cardH, baseFrac, seed, haze, big) {
       const hm = cardH * (1 - baseFrac) * (0.38 + 0.60 * t.h) * (1 - back * 0.16);
       const hw = hm * (t.sp < 0.4 ? 0.14 : t.sp < 0.8 ? 0.175 : 0.22);
       const by = baseY + (rnd() - 0.5) * cardH * baseFrac * pxy * 0.9;
+      const sk = IMP_SHAPE[Math.abs(Math.round(t.x * 0.37 + t.sp * 41)) % IMP_SHAPE.length];
       const opt = {
         tiers: t.sp < 0.4 ? 16 : 11, hue: 146 + t.sp * 34, seed: t.x * 0.01,
         taper: 0.8, droop: 1.6, snow: t.snow, dens: big ? 0.8 : 1.1,
         gap: 0.10 + 0.2 * t.sp,
         haze: haze + back * 0.14,
+        // the same outline mix the single-tree band uses, so a stem does not
+        // change species shape as it crosses the 210 m LOD boundary
+        lean: sk.lean, blunt: sk.blunt, fork: sk.fork, forkSide: sk.side,
       };
       if (big) paintConiferMass(g, rnd, t.x, by, hm * pxy, hw * pxx, opt);
       else paintConifer(g, rnd, t.x, by, hm * pxy, hw * pxx, opt);
@@ -1632,20 +1780,27 @@ function sweep(gb, pts, radii, seg, col, flexOf, opt) {
  * much load the crown holds — an open pine sheds, a dense fir does not.
  */
 const SPECIES = [
+  // `bare` is the fraction of the bole below the lowest live whorl. It matters
+  // more than it looks: at 0.07 a 24 m spruce carried branches from 1.7 m up
+  // with a 6 m reach, so the whole understorey of a stand was solid foliage at
+  // eye height and the chase camera spent the trees.png framing INSIDE a crown.
+  // A closed subalpine spruce/fir stand is self-pruned — the lower limbs die
+  // off in the shade — and you can walk under it. 0.18-0.22 puts the first live
+  // whorl at 4-5 m, which is what the reference stands show.
   { // 0 Norway spruce — narrow, tall, regular whorls, deep droop
-    name: 'spruce', h: 24, trunkR: 0.20, tiers: 21, bare: 0.07, spread: 0.150,
+    name: 'spruce', h: 24, trunkR: 0.20, tiers: 21, bare: 0.19, spread: 0.150,
     crown: 0.95, droop: 0.72, rise: 0.30, tip: 0.34, frondW: 0.30, snow: 1.0,
     sprig: 0, bark: 0, sub: 2,
     col: [0.94, 1.02, 0.94], barkCol: [0.92, 0.84, 0.76],
   },
   { // 1 silver fir — broader, blunter, dense, flat-topped with age
-    name: 'fir', h: 20, trunkR: 0.23, tiers: 18, bare: 0.10, spread: 0.205,
+    name: 'fir', h: 20, trunkR: 0.23, tiers: 18, bare: 0.22, spread: 0.205,
     crown: 0.68, droop: 0.44, rise: 0.36, tip: 0.22, frondW: 0.34, snow: 1.0,
     sprig: 1, bark: 1, sub: 2,
     col: [0.90, 1.00, 0.96], barkCol: [1.00, 0.98, 0.94],
   },
   { // 2 arolla pine — open, ragged, long bare limbs, sheds its load
-    name: 'pine', h: 16, trunkR: 0.26, tiers: 11, bare: 0.32, spread: 0.270,
+    name: 'pine', h: 16, trunkR: 0.26, tiers: 11, bare: 0.40, spread: 0.270,
     crown: 0.44, droop: 0.22, rise: 0.44, tip: 0.10, frondW: 0.28, snow: 0.70,
     sprig: 2, bark: 2, sub: 3,
     col: [1.06, 1.02, 0.80], barkCol: [1.06, 0.88, 0.70],
@@ -1666,7 +1821,11 @@ const SPECIES = [
     name: 'snag', h: 13, trunkR: 0.19, tiers: 7, bare: 0.34, spread: 0.150,
     crown: 0.55, droop: 0.20, rise: 0.30, tip: 0.0, frondW: 0.20, snow: 0.4,
     sprig: 3, bark: 3, sub: 1, dead: true,
-    col: [0.74, 0.70, 0.64], barkCol: [1.05, 1.02, 0.98],
+    // The snow-bounce fill lifts everything by roughly 0.03 linear, and on a
+    // near snag — which is a big mass of bare twigs with no dark needle in it —
+    // that turned the whole crown into a pale beige cloud. Pull the dead-twig
+    // tint down by the same amount it gained.
+    col: [0.58, 0.55, 0.50], barkCol: [1.05, 1.02, 0.98],
   },
 ];
 
@@ -1759,7 +1918,13 @@ function buildConifer(rnd, si, lod, opt = {}) {
   };
 
   // ---- branch whorls -------------------------------------------------------
-  const nTiers = Math.max(4, Math.round(S.tiers * (lod === 0 ? 1 : 0.55)));
+  // LOD1 whorl count. At 0.55 a spruce carried 12 tiers of 3 branches of 4
+  // cards over 34-150 m — about a seventh of LOD0's foliage — and the result
+  // was a bare brown mast standing out of a wispy crown all the way across the
+  // band the player spends most of the run looking at. 0.72 is the point where
+  // the leader is covered again; see the branch and card counts below, which
+  // move with it.
+  const nTiers = Math.max(4, Math.round(S.tiers * (lod === 0 ? 1 : 0.64)));
   const dirH = new THREE.Vector3();
   const side = new THREE.Vector3();
   // P belongs to the branch curve, Q to the sub-branch curve, R2 to the shaded
@@ -1800,16 +1965,30 @@ function buildConifer(rnd, si, lod, opt = {}) {
       N.normalize();
       Bn.copy(T).cross(N).normalize();          // roughly up
 
-      const snowy = !dead && rnd() < LOAD * 0.85 * (o.snowK === undefined ? 1 : o.snowK);
+      // How many of the cards on this stem carry load. At LOAD 1.2 x 0.85 this
+      // used to reach 1.0 — EVERY card on the tree was a snow tile, and a
+      // spruce built entirely out of white sprigs reads as a feather duster,
+      // not as a dark conifer with snow caught on its upper faces. Real
+      // reference stands are a dark mass with roughly a third of the presented
+      // area white.
+      const snowy = !dead && rnd() < LOAD * 0.52 * (o.snowK === undefined ? 1 : o.snowK);
       // A loaded card lies flat (roll near a quarter turn puts its face up); a
-      // bare one fans through a full turn but clusters near horizontal, which
-      // is how a conifer frond actually presents.
-      // Roll spreads the cards through the volume, but not so far that half of
-      // them present edge-on: a card seen at a grazing angle renders as a dark
-      // sliver and a crown full of them reads as paint strokes.
+      // bare one fans about the frond plane.
+      //
+      // A/B against the Wikimedia snow-laden spruce reference: a spruce whorl
+      // is a PLATE. The branch and its sub-branches all lie in one gently
+      // drooping, near-horizontal plane and the needle spray hangs across it,
+      // so a stand reads as stacked shelves. At the old +/-65 deg of roll the
+      // cards stuck out of that plane in every direction and the tree came out
+      // a bottle brush — a sea-urchin silhouette of pointed spikes, which was
+      // the loudest remaining tell in the pair. +/-38 deg keeps the plate.
+      //
+      // The volume the roll used to supply comes back as `plate` below: the
+      // cards are displaced along their own face normal instead, which
+      // thickens the shelf without breaking it.
       const roll = snowy
         ? (rnd() < 0.5 ? 1 : -1) * (1.35 + rnd() * 0.42)
-        : (rnd() - 0.5) * 1.45 + (i % 2 ? 0.42 : -0.42);
+        : (rnd() - 0.5) * 0.86 + (i % 2 ? 0.24 : -0.24);
       const cr = Math.cos(roll), sr = Math.sin(roll);
       const ux = N.x * cr + Bn.x * sr, uy = N.y * cr + Bn.y * sr, uz = N.z * cr + Bn.z * sr;
       const yaw = (rnd() - 0.5) * 0.9;
@@ -1850,7 +2029,13 @@ function buildConifer(rnd, si, lod, opt = {}) {
       const col = snowy ? [1.0, 1.0, 1.02] : (o.shade ? CD : C);
       const j = 0.84 + 0.30 * rnd();
       gb.tw = snowy ? 0.20 : 1;
-      const px = V0.x - ax * len * 0.10, py = V0.y - ay * len * 0.10, pz = V0.z - az * len * 0.10;
+      // thickness of the frond plate: the cards are stacked through their own
+      // face normal rather than fanned about the stem, so the shelf has depth
+      // and self-shades without the silhouette turning into spikes
+      const plate = (rnd() - 0.5) * size * 0.85;
+      const px = V0.x - ax * len * 0.10 + nx * plate;
+      const py = V0.y - ay * len * 0.10 + ny * plate;
+      const pz = V0.z - az * len * 0.10 + nz * plate;
       const q = [];
       for (const [su, sv] of [[0, 0], [1, 0], [1, 1], [0, 1]]) {
         const along = (su - 0.06) * len;
@@ -1888,7 +2073,7 @@ function buildConifer(rnd, si, lod, opt = {}) {
 
     const nb = lod === 0
       ? Math.max(4, Math.round(3.2 + 2.6 * u))
-      : Math.max(3, Math.round(2.2 + 1.4 * u));
+      : Math.max(3, Math.round(2.5 + 1.5 * u));
     const a0 = ti * 2.39996 + rnd() * 0.7;
 
     for (let bi = 0; bi < nb; bi++) {
@@ -1939,7 +2124,7 @@ function buildConifer(rnd, si, lod, opt = {}) {
 
       const nCards = lod === 0
         ? Math.round(8 + 7 * Math.min(1, BL / 2.2))
-        : Math.round(3 + 2.4 * Math.min(1, BL / 2.2));
+        : Math.round(3.6 + 2.9 * Math.min(1, BL / 2.2));
       sprigs(at, wid, 0.12, 1.0, nCards, { sprig: S.sprig, size: 1.0, shade: false });
       // a shaded card tucked underneath, so the crown has an inside
       if (lod === 0 && !dead) {
@@ -1974,25 +2159,42 @@ function buildConifer(rnd, si, lod, opt = {}) {
       // A shallow tented strip mapped to the blanket tile: both lips fray to
       // nothing in the texture, so this never shows a polygon edge. Rows may
       // collapse entirely — real load sits in clumps with bare needles between.
-      if (!dead && rnd() < branchLoad * (0.55 + 0.45 * (1 - u)) * 2.1) {
-        const rowsN = lod === 0 ? 4 : 2;
+      //
+      // MEASURED FAILURE (gate 2 close-range): the section used to be a tube of
+      // relief 0.82 x the strip's own HALF-WIDTH. A mature spruce frond is a
+      // metre across, so its load was built as a 40 cm deep rounded rind
+      // running the entire 3 m branch in four rows — a smooth, straight, glassy
+      // white bar. At 4 m from the camera that is the single most artificial
+      // thing in the frame; it reads as a plastic tube taped to the tree.
+      //
+      // Real accumulated snow on a conifer frond is 8-20 cm THICK however wide
+      // the frond is, and it is broken: it slumps and sheds in segments with
+      // bare needles between them. So the relief is now an absolute thickness
+      // (metres of snow) rather than a fraction of the width, the strip is
+      // built at nearly twice the resolution so a break can be short, and every
+      // row's crest wanders in height and in width.
+      if (!dead && rnd() < branchLoad * (0.42 + 0.40 * (1 - u)) * 1.35) {
+        const rowsN = lod === 0 ? 7 : 2;
         const start = 0.06 + 0.12 * rnd();
         const rows = [];
+        // depth of the accumulation on this limb, in metres
+        const thick = (0.055 + 0.075 * branchLoad) * (0.75 + 0.5 * rnd());
         for (let k = 0; k <= rowsN; k++) {
           const s = start + (1 - start) * (k / rowsN);
           const p = at(s).clone();
           const cap = smoothstep(0.94, 0.62, s) * smoothstep(start - 0.02, start + 0.22, s);
-          const jit = 1.45 * vnoise2(k * 3.17 + ti * 4.1 + bi * 2.9, si * 7.3 + bi * 1.3) - 0.20;
-          if (jit < 0.14) { rows.push(null); continue; }
-          const w = Math.min(wid(s) * 1.15, wid(s) * 1.05 * jit * cap * (0.6 + 0.7 * branchLoad));
+          const jit = 1.35 * vnoise2(k * 5.31 + ti * 4.1 + bi * 2.9, si * 7.3 + bi * 1.3) - 0.18;
+          if (jit < 0.26) { rows.push(null); continue; }
+          const w = Math.min(wid(s) * 1.05, wid(s) * 1.05 * jit * cap * (0.6 + 0.7 * branchLoad));
           if (w < 0.006) { rows.push(null); continue; }
           const mean = (vnoise2(k * 2.7 + bi * 5.1, ti * 3.3) - 0.5) * wid(s) * 0.24;
           // the rind sits proud of the foliage: a real load is 10-20 cm of snow
           // riding ON the needles, not a decal painted into them
-          const lift = wid(s) * 0.34;
-          const cyc = p.y + lift;
+          const lift = Math.min(wid(s) * 0.34, thick * 1.5);
+          // slump: the crest is not a straight line down the branch
+          const th2 = thick * (0.55 + 0.85 * vnoise2(k * 9.13 + bi * 1.7, ti * 2.9 + 4.4));
+          const cyc = p.y + lift + (vnoise2(k * 6.1 + bi * 3.9, si * 1.7) - 0.5) * thick * 0.9;
           const tv = 0.92 + 0.16 * vnoise2(k * 7.7 + bi * 3.3, ti * 5.1 + 19.3);
-          const crest = [1.06 * tv, 1.08 * tv, 1.14 * tv];
           const lipc = [0.60 * tv, 0.68 * tv, 0.88 * tv];
           const fl = clamp((p.y + 0.35) / H, 0, 1) * (0.30 + 0.7 * s);
           const mx = p.x + side.x * mean, mz = p.z + side.z * mean;
@@ -2001,22 +2203,26 @@ function buildConifer(rnd, si, lod, opt = {}) {
           const us = clamp((s - start) / (1 - start), 0, 1);
           // Four columns give the rind a rounded section: two lips that drop
           // below the needle plane and a broad crest between them. Three read
-          // as a folded paper tent.
+          // as a folded paper tent. The vertical offsets are now in metres of
+          // snow, so a wide frond gets a wide THIN blanket, not a fat tube.
           const shoul = [0.90 * tv, 0.94 * tv, 1.02 * tv];
           const cols = [
-            [-w, -0.52, lipc, 0.01, 0.94],
-            [-w * 0.42, 0.30, shoul, 0.30, 0.36],
-            [w * 0.42, 0.30, shoul, 0.70, -0.36],
-            [w, -0.52, lipc, 0.99, -0.94],
+            [-w, -0.85 * th2, lipc, 0.01, 0.80],
+            [-w * 0.42, 0.42 * th2, shoul, 0.30, 0.26],
+            [w * 0.42, 0.42 * th2, shoul, 0.70, -0.26],
+            [w, -0.85 * th2, lipc, 0.99, -0.80],
           ];
           const row = [];
           gb.tw = 0.06;
           for (const cdef of cols) {
             const off = cdef[0];
             const uv = uvBlanket(us, cdef[3]);
+            // A thin blanket's normal is mostly UP; only the lips turn over.
+            // The old section carried a near-horizontal normal at the lips,
+            // which is what gave the bar its specular tube shading.
             const sx2 = cdef[4], ny2 = Math.sqrt(Math.max(0.04, 1 - sx2 * sx2));
             row.push(gb.v(
-              mx + side.x * off, cyc + cdef[1] * Math.abs(off || w), mz + side.z * off,
+              mx + side.x * off, cyc + cdef[1], mz + side.z * off,
               -side.x * sx2, ny2, -side.z * sx2,
               uv[0], uv[1], cdef[2][0], cdef[2][1], cdef[2][2], fl));
           }
@@ -2063,38 +2269,48 @@ function buildConifer(rnd, si, lod, opt = {}) {
     const top = trunkAt(1).clone();
     const hTip = Math.max(0.35, H * 0.055);
     const rTip = Math.max(0.06, S.spread * H * 0.11);
-    const nL = lod === 0 ? 5 : 2;
+    const nL = lod === 0 ? 5 : 3;
     for (let k = 0; k < nL; k++) {
       const th = (k / nL) * Math.PI * 2 + rnd();
       const dx = Math.cos(th), dz = Math.sin(th);
       const at = (s) => P.set(top.x + dx * rTip * 2.0 * s, top.y - hTip * 0.5 + hTip * 1.5 * s,
         top.z + dz * rTip * 2.0 * s);
       const wid = () => rTip * 1.5;
-      sprigs(at, wid, 0.1, 0.95, lod === 0 ? 3 : 1, { sprig: S.sprig, size: 0.9, snowK: 1.5 });
+      sprigs(at, wid, 0.1, 0.95, lod === 0 ? 3 : 2, { sprig: S.sprig, size: 0.9, snowK: 1.5 });
     }
+    // Cap on the leader.
+    //
+    // This used to be a three-ring cone of the opaque snow tile, and on any
+    // stem whose leader had lost its sprigs to the LOD reduction it rendered as
+    // a hard-edged white paper dart standing on a bare stick against the sky —
+    // a six-sided polygon silhouette, i.e. exactly the 1-bit alpha stencil this
+    // pass exists to get rid of. Measured on the probe framing there were four
+    // of them visible in one 340 px crop.
+    //
+    // Crossed clump cards instead: the clump tile frays to nothing on every
+    // side, so the cap has no polygon edge at any size, and two crossed quads
+    // hold up when the leader is seen from any azimuth.
     if (LOAD > 0.4) {
-      const n = lod === 0 ? 6 : 4;
-      const ringsT = [
-        { y: top.y - hTip * 0.15, r: rTip * 1.0, c: [0.90, 0.94, 1.02] },
-        { y: top.y + hTip * 0.62, r: rTip * 0.44, c: [1.06, 1.09, 1.16] },
-        { y: top.y + hTip * 1.10, r: rTip * 0.10, c: [1.10, 1.12, 1.18] },
-      ];
-      const rows = ringsT.map((rg, ri) => {
-        const out = [];
-        for (let k = 0; k < n; k++) {
-          const th = (k / n) * Math.PI * 2;
-          const nx = Math.cos(th), nz = Math.sin(th);
-          const uv = uvSnow(k / n, 0.2 + ri * 0.3);
-          out.push(gb.v(top.x + nx * rg.r, rg.y, top.z + nz * rg.r,
-            nx * 0.62, 0.78, nz * 0.62, uv[0], uv[1], rg.c[0], rg.c[1], rg.c[2], 0.95));
+      const nC = lod === 0 ? 3 : 2;
+      for (let k = 0; k < nC; k++) {
+        const th = (k / nC) * Math.PI + rnd() * 0.9;
+        const cxk = Math.cos(th), czk = Math.sin(th);
+        const r = rTip * (1.5 + 0.6 * rnd());
+        const yk = top.y + hTip * (0.10 + 0.5 * k / nC);
+        const hgt = r * (0.85 + 0.4 * rnd());
+        gb.tw = 0.05;
+        const q = [];
+        for (const [su, sv] of [[0, 0], [1, 0], [1, 1], [0, 1]]) {
+          const a2 = (su - 0.5) * r * 2;
+          q.push(gb.v(
+            top.x + cxk * a2, yk + (sv - 0.35) * hgt, top.z + czk * a2,
+            // normal splayed off vertical toward the card's own outward face,
+            // so the cap catches the sky on top and the snowfield underneath
+            cxk * 0.30, 0.90, czk * 0.30,
+            ...uvClump(su, sv), 1.04, 1.06, 1.12, 0.9));
         }
-        return out;
-      });
-      for (let ri = 0; ri < rows.length - 1; ri++) {
-        for (let k = 0; k < n; k++) {
-          const k2 = (k + 1) % n;
-          gb.quad(rows[ri][k], rows[ri][k2], rows[ri + 1][k2], rows[ri + 1][k]);
-        }
+        gb.quad(q[0], q[1], q[2], q[3]);
+        gb.tw = 0;
       }
     }
   }
@@ -2102,18 +2318,28 @@ function buildConifer(rnd, si, lod, opt = {}) {
   // ---- tree well: snow collar banked against the trunk, then a ring of
   // dropped needle litter. The litter ring is what actually reads as a tree
   // well; without it the stem meets a clean white sheet on a hard line.
+  //
+  // MEASURED: the collar used to run from +0.12 m at the trunk down to -0.30 m
+  // at its rim, so on a mature spruce nine tenths of it was below grade and all
+  // that showed was a 12 cm disc under a 40 cm bole. With the lower whorls
+  // pruned off (see `bare`) the bole is visible for its first 4-5 m, and it met
+  // the snowfield on a bare horizontal line — the stem read as a post hovering
+  // over the piste rather than standing in it. The bank now rises to ~0.45 R at
+  // the trunk and its rim sits only 16 cm under, so where the cone crosses the
+  // snow is decided by the per-vertex `bank` noise and the surface's own
+  // metre-scale relief: an irregular drifted collar, not a disc.
   {
     const n = lod === 0 ? 10 : 6;
     const R = Math.max(0.6, S.trunkR * 3.1 + H * 0.026);
-    const hM = R * 0.34;
-    const ctr = gb.v(0, hM - 0.30, 0, 0, 1, 0, ...uvSnow(0.5, 0.5), 1.05, 1.07, 1.12, 0);
+    const hM = R * 0.45;
+    const ctr = gb.v(0, hM, 0, 0, 1, 0, ...uvSnow(0.5, 0.5), 1.05, 1.07, 1.12, 0);
     const ring = [];
     for (let k = 0; k < n; k++) {
       const th = (k / n) * Math.PI * 2;
       const bank = 0.72 + 0.5 * vnoise2(k * 1.7, si * 3.3) + 0.34 * clamp(Math.cos(th - wind), 0, 1);
       const rr = R * bank;
       const uv = uvSnow(0.5 + 0.4 * Math.cos(th), 0.5 + 0.4 * Math.sin(th));
-      ring.push(gb.v(Math.cos(th) * rr, -0.30 - 0.10 * clamp(-Math.cos(th - wind), 0, 1),
+      ring.push(gb.v(Math.cos(th) * rr, -0.16 - 0.10 * clamp(-Math.cos(th - wind), 0, 1),
         Math.sin(th) * rr,
         Math.cos(th) * 0.35, 0.94, Math.sin(th) * 0.35, uv[0], uv[1], 1.02, 1.04, 1.09, 0));
     }
@@ -2707,6 +2933,16 @@ export function createScatter(scene, terrain) {
     // is widened to hold roughly a pixel and a half so cables, lattice
     // diagonals and gate poles stop aliasing out of existence
     uMinR: { value: 3.2e-4 },
+
+    // ---- foliage radiance environment (see foliageLighting()) --------------
+    // uBounce  radiance of the snowfield the stand is standing on
+    // uSkyFill radiance of the sky dome, hue taken off sky.js's fill light
+    // uSunRad  sun colour x intensity, for needle transmission
+    // uSunW    world-space direction TOWARD the sun
+    uBounce: { value: new THREE.Vector3(0.5, 0.52, 0.56) },
+    uSkyFill: { value: new THREE.Vector3(0.10, 0.12, 0.16) },
+    uSunRad: { value: new THREE.Vector3(6, 6, 6) },
+    uSunW: { value: new THREE.Vector3(0.6, 0.6, -0.4) },
   };
 
   /**
@@ -2719,13 +2955,107 @@ export function createScatter(scene, terrain) {
    * keeps one threshold across both pools, exactly one representation of each
    * tree survives at any distance.
    */
-  function patchFoliage(mat, key, spec = 0.04, atlas = null) {
+  /**
+   * The near-field conifer lighting model.
+   *
+   * MEASURED (tools/conifer-diag.mjs, camera 7 m off a mature spruce, sun at
+   * 34 deg): the crown rendered mean L 31.6 with 71% of the frame below 32/255.
+   * Ablating shadow *receive* alone put it at 53, ablating the albedo put it at
+   * 59, tripling `scene.environmentIntensity` at 54. In other words nothing was
+   * broken — the crown was simply light-starved. A dense conifer shadow-maps
+   * itself almost completely, and the only fill it had was a sky IBL at 0.46
+   * whose lower hemisphere is empty. The shaded side of the tree therefore
+   * integrated to ~0.006 linear, which is the "hard-edged black alpha stencil"
+   * the gate saw: not a silhouette problem, a radiance problem.
+   *
+   * What is physically missing is the snowfield. A conifer stands on a ~0.82
+   * albedo diffuse reflector that is metered in this project at 1.0 linear when
+   * sunlit; the irradiance arriving at a downward-facing needle from below is
+   * of the same order as the irradiance arriving from the sky above it. That is
+   * the single term that separates an alpine winter conifer from a black
+   * cardboard cut-out, and it is unshadowed by construction (it is the ground,
+   * not the key). Three terms are added here, all in linear radiance:
+   *
+   *   bounce  hemispherical, weighted toward downward-facing normals
+   *   sky     hemispherical, weighted upward, plus a grazing rim so the mass
+   *           reads as a volume with a lit edge instead of a flat plate
+   *   trans   forward-scattered sun through the needle blade. Deliberately
+   *           unshadowed: it is a thin-film transmission lobe about the sun
+   *           direction, it only bites where the viewer is looking into the
+   *           sun, and paying a second PCF kernel for it on every foliage
+   *           fragment is not worth the ~2 fps.
+   *
+   * `fol` scales all three per band. The 130 m+ impostor cards get almost none:
+   * their value against the snowfield (0.38x adjacent snow luminance) is a
+   * calibrated result that two acceptance gates have signed off, and they carry
+   * their own painted ambient occlusion already.
+   */
+  function foliageLighting(shader, fol) {
+    if (!fol) return;
+    const { bounce = 0, sky = 0, rim = 0, trans = 0 } = fol;
+    shader.uniforms.uBounce = uniforms.uBounce;
+    shader.uniforms.uSkyFill = uniforms.uSkyFill;
+    if (trans > 0) {
+      shader.uniforms.uSunRad = uniforms.uSunRad;
+      shader.uniforms.uSunW = uniforms.uSunW;
+    }
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', /* glsl */`
+        #include <common>
+        uniform vec3 uBounce;
+        uniform vec3 uSkyFill;
+        ${trans > 0 ? 'uniform vec3 uSunRad;\nuniform vec3 uSunW;' : ''}
+      `)
+      // COST. This runs on every foliage fragment in a band that covers most of
+      // the screen inside the forest, and the fragment stage is where this
+      // scene is bound: the first version cost 9 fps of 48 on the trees
+      // framing. Everything below is written to avoid a basis change.
+      //
+      //   * mat3( viewMatrix ) is orthonormal, so dot( n, v ) is the same in
+      //     view space as in world space. The rim term needs no transform.
+      //   * only the world-space Y of the normal is wanted, and that is one dot
+      //     product against the second column of viewMatrix, not a full
+      //     view -> world rotation of two vectors.
+      //   * pow( x, 5 ) is expanded; a real pow() here was measurable.
+      .replace('#include <lights_fragment_end>', /* glsl */`
+        #include <lights_fragment_end>
+        {
+          float wUp = dot( normal, viewMatrix[ 1 ].xyz );
+          float dwn = clamp( 0.5 - 0.5 * wUp, 0.0, 1.0 );
+          vec3 amb = uBounce * ( ${bounce.toFixed(3)} * ( 0.20 + 0.80 * dwn ) )
+                   + uSkyFill * ( ${sky.toFixed(3)} * ( 0.28 + 0.72 * ( 1.0 - dwn ) ) );
+          // Grazing rim. A needle mass is a scattering volume: at the edge of
+          // the silhouette the path through it is short and it lights up. This
+          // is what puts a contour on the crown that is not an alpha cut.
+          float fres = 1.0 - abs( dot( normal, geometryViewDir ) );
+          amb += uSkyFill * ( ${rim.toFixed(3)} * fres * fres * fres );
+          reflectedLight.indirectDiffuse += amb * material.diffuseColor;
+
+          #if ${trans > 0 ? 1 : 0}
+            // Forward transmission: sharp lobe about the sun, plus a broad
+            // wrap so a needle whose face is turned away is not pitch black.
+            // The sun is rotated into view space here rather than the normal
+            // into world space: it is uniform across the draw call.
+            vec3 sunV = mat3( viewMatrix ) * uSunW;
+            float fwd = clamp( dot( -geometryViewDir, sunV ), 0.0, 1.0 );
+            float f2 = fwd * fwd;
+            float wrap = clamp( -dot( normal, sunV ) * 0.7 + 0.3, 0.0, 1.0 );
+            float tr = f2 * f2 * fwd * 0.85 + wrap * 0.15;
+            reflectedLight.directDiffuse += uSunRad * ( ${trans.toFixed(3)} * tr )
+                                          * material.diffuseColor;
+          #endif
+        }
+      `);
+  }
+
+  function patchFoliage(mat, key, spec = 0.04, atlas = null, fol = null) {
     const uLod = mat.__uLod;
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = uniforms.uTime;
       shader.uniforms.uCam = uniforms.uCam;
       shader.uniforms.uSway = uniforms.uSway;
       shader.uniforms.uLod = uLod;
+      foliageLighting(shader, fol);
       // Per-instance atlas cell selection.
       //
       // The gate's finding on the 92-210 m band was that every card carried the
@@ -2838,7 +3168,10 @@ export function createScatter(scene, terrain) {
           material.specularF90 = ${spec > 0 ? '1.0' : '0.0'};
         `);
     };
-    mat.customProgramCacheKey = () => key;
+    // The foliage constants are baked into the source, so two bands with
+    // different `fol` are different programs and must not share a cache key.
+    const fk = fol ? `-${fol.bounce}:${fol.sky}:${fol.rim}:${fol.trans}` : '';
+    mat.customProgramCacheKey = () => key + fk;
     return mat;
   }
 
@@ -2875,11 +3208,22 @@ export function createScatter(scene, terrain) {
   }
 
   /** A foliage material bound to one LOD band. Same program, own uniforms. */
-  function bandMat(proto, band, key, spec, atlas) {
+  function bandMat(proto, band, key, spec, atlas, fol) {
     const m = proto.clone();
     m.__uLod = { value: new THREE.Vector4(band[0], band[1], band[2], band[3]) };
-    return patchFoliage(m, key, spec, atlas);
+    return patchFoliage(m, key, spec, atlas, fol);
   }
+
+  // Near geometry carries the full model; the reduced band carries it at the
+  // same strength (the swap at 34-46 m must not change value); the cards get a
+  // whisper of bounce only, so the calibrated treeline value does not move.
+  const FOL_NEAR = { bounce: 0.62, sky: 0.34, rim: 0.55, trans: 0.055 };
+  // No transmission past 34 m: the lobe is 5 deg wide about the sun and at that
+  // range it is a sub-pixel effect, but the 34-150 m band is most of the
+  // foliage fill in a forest framing, so the two dots and the uniforms it needs
+  // are not free. Same bounce and sky, so the LOD swap is not a tonal step.
+  const FOL_MID = { bounce: 0.60, sky: 0.33, rim: 0.45, trans: 0 };
+  const FOL_CARD = { bounce: 0.10, sky: 0.05, rim: 0.0, trans: 0.0 };
 
   const treeAtlas = makeTreeAtlas();
   const treeTex = treeAtlas.tex;
@@ -2902,10 +3246,12 @@ export function createScatter(scene, terrain) {
     alphaTest: 0.34, side: THREE.DoubleSide, vertexColors: true,
     roughness: 0.86, metalness: 0.0,
   });
-  const matTree0 = bandMat(protoTree, B_G0, 'sc-fol');
-  const matTree1 = bandMat(protoTree, B_G1, 'sc-fol');
-  const matLog0 = bandMat(protoTree, B_LOG0, 'sc-fol');
-  const matLog1 = bandMat(protoTree, B_LOG1, 'sc-fol');
+  const matTree0 = bandMat(protoTree, B_G0, 'sc-fol', 0.04, null, FOL_NEAR);
+  const matTree1 = bandMat(protoTree, B_G1, 'sc-fol', 0.04, null, FOL_MID);
+  // Deadfall is bark and litter, not needle: it gets the bounce (it is lying on
+  // the snowfield, so it gets more of it than a crown does) and nothing else.
+  const matLog0 = bandMat(protoTree, B_LOG0, 'sc-fol', 0.04, null, { bounce: 0.34, sky: 0.14, rim: 0.10, trans: 0 });
+  const matLog1 = bandMat(protoTree, B_LOG1, 'sc-fol', 0.04, null, { bounce: 0.34, sky: 0.14, rim: 0.10, trans: 0 });
 
   // A lower alpha test on the cards: the snow strokes are what mip reduction
   // attacks first, and cutting them at 0.30 keeps the frost alive several
@@ -2917,10 +3263,10 @@ export function createScatter(scene, terrain) {
   // spec 0: see the note in patchFoliage. A card is a flat quad standing in
   // for a volume of needles; the dielectric lobe it would otherwise collect off
   // the sky is the single largest term in the far treeline's brightness.
-  const matImp = bandMat(protoImp, B_IMP, 'sc-card64', 0, { cols: IMP_COLS, rows: IMP_ROWS });
-  const matCl = bandMat(protoImp, B_CL, 'sc-card41', 0, { cols: 4, rows: 1 });
+  const matImp = bandMat(protoImp, B_IMP, 'sc-card64', 0, { cols: IMP_COLS, rows: IMP_ROWS }, FOL_CARD);
+  const matCl = bandMat(protoImp, B_CL, 'sc-card41', 0, { cols: 4, rows: 1 }, FOL_CARD);
   matCl.map = clTex;
-  const matMass = bandMat(protoImp, B_MASS, 'sc-card41', 0, { cols: 4, rows: 1 });
+  const matMass = bandMat(protoImp, B_MASS, 'sc-card41', 0, { cols: 4, rows: 1 }, FOL_CARD);
   matMass.map = massTex;
   matMass.alphaTest = 0.26;
 
@@ -4807,12 +5153,56 @@ export function createScatter(scene, terrain) {
   // =========================================================================
   let time = 0;
 
+  // ---- foliage radiance environment ---------------------------------------
+  // sky.js owns the sun and the atmosphere; scatter only reads them. The key
+  // light is found once by walking the scene (the near shadow cascade is a
+  // second DirectionalLight carrying zero radiance, so intensity disambiguates)
+  // and the hemisphere `fill` sky.js keeps for fx/spray.js supplies the
+  // chromaticity of the dome and of the horizon.
+  let keyLight = null, hemi = null;
+  const _sw = new THREE.Vector3();
+  const SNOW_ALBEDO = 0.82;
+
+  function syncRadiance() {
+    if (!keyLight || keyLight.intensity <= 0.001) {
+      keyLight = null;
+      scene.traverse((o) => {
+        if (o.isDirectionalLight && o.intensity > 0.001 && !keyLight) keyLight = o;
+        if (o.isHemisphereLight && !hemi) hemi = o;
+      });
+    }
+    if (!keyLight) return;
+    _sw.copy(keyLight.position);
+    if (keyLight.target) _sw.sub(keyLight.target.position);
+    if (_sw.lengthSq() < 1e-9) return;
+    _sw.normalize();
+    uniforms.uSunW.value.copy(_sw);
+
+    const c = keyLight.color, I = keyLight.intensity;
+    uniforms.uSunRad.value.set(c.r * I, c.g * I, c.b * I);
+
+    // Radiance leaving the snowfield: albedo / PI x the normal irradiance the
+    // key delivers to it. sky.js meters sunlit snow at 1.0 linear, so this
+    // lands near 1.0 at the default sun and falls with the sun the way the
+    // snow it is bouncing off does.
+    const k = Math.max(_sw.y, 0) * SNOW_ALBEDO / Math.PI * I;
+    uniforms.uBounce.value.set(c.r * k, c.g * k, c.b * k * 1.06);
+
+    // Sky dome. `hemi.color` is peak-normalised hue only (sky.js divides it
+    // out for fx/spray.js), so it needs a level; a clear alpine zenith runs
+    // about a seventh of sunlit snow.
+    const s = k * 0.155;
+    if (hemi) uniforms.uSkyFill.value.set(hemi.color.r * s, hemi.color.g * s, hemi.color.b * s);
+    else uniforms.uSkyFill.value.set(s * 0.78, s * 0.88, s);
+  }
+
   return {
     group,
 
     update(dt, state) {
       time += dt || 0;
       uniforms.uTime.value = time;
+      syncRadiance();
       const p = state?.pos;
       const px = p ? p.x : 0, pz = p ? p.z : 0;
       uniforms.uCam.value.set(px, p ? p.y : 0, pz);

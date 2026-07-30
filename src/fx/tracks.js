@@ -41,10 +41,19 @@ import { createSnowMaterial } from '../world/snow-material.js';
  *    costs one vertex upload, never a rebuild.
  */
 
-const MAX_SEG = 2200;      // ring buffer of track segments
+const MAX_SEG = 2600;      // ring buffer of track segments
 const STEP = 0.28;         // metres of travel per segment
+// A carved arc is a curve, and a curve sampled by arc length alone facets. At
+// 54 degrees of edge the ski's contact point sweeps sideways nearly as fast as
+// it goes forward, so the ribbon is *also* subdivided on heading change: commit
+// a rib whenever the skier has turned this far since the last one. 0.055 rad is
+// about 3 degrees, i.e. a 30-sided polygon around a full circle, which is below
+// the faceting threshold at any width this trench ever has.
+const STEP_YAW = 0.055;
+const STEP_MIN = 0.055;    // ...but never closer together than this, in metres
 const MAX_JUMP = 6.0;      // teleport / respawn guard
 const SURFACE_EPS = 0.016; // lift off the terrain to stop z-fighting
+const TAIL_TAPER = 0.10;   // compaction left at a deliberate ribbon end
 
 // Cross-section of one ski trench, in normalised coordinates.
 //
@@ -506,17 +515,25 @@ export function createTracks(scene, terrain) {
     nrm: new Float32Array(2 * P * 3),
     acr: new Float32Array(2 * P * 3),
     along: 0, comp: 0, halfW: 0.1, depth: 0.05, skid: 0, load: 0,
+    cx: 0, cz: 0, spacing: 0.14,
   });
-  let ribPrev = makeRib(), ribCur = makeRib();
+  // Three ribs, rotated between: the last committed one, the one being built at
+  // the ski right now, and a scratch used to close a ribbon off.
+  let ribPrev = makeRib(), ribHead = makeRib(), ribTmp = makeRib();
   let havePrev = false;
 
   let segCursor = 0, segCount = 0;
+  let liveHead = false;                 // is slot `segCursor` holding a live head?
   let time = 0, travelled = 0, haveLast = false;
   let renderer = null, needDeform = false;
+  const lastCommit = new THREE.Vector3();
+  let lastCommitHeading = 0;
+  // Dirty bookkeeping. Deliberately NOT flushed from update(): see flush().
   let dirtyLo = Infinity, dirtyHi = -1, dirtyWrapped = false;
 
   /** Build both ski cross-sections of one rib. */
   function buildRib(rib, px, pz, spacing, width, depth) {
+    rib.cx = px; rib.cz = pz; rib.spacing = spacing;
     for (let ski = 0; ski < 2; ski++) {
       const side = ski === 0 ? -1 : 1;
       const cx = px + right.x * side * spacing;
@@ -538,11 +555,8 @@ export function createTracks(scene, terrain) {
     }
   }
 
-  function writeSegment(a, b) {
-    const s = segCursor;
-    segCursor += 1;
-    if (segCursor >= MAX_SEG) { segCursor = 0; dirtyWrapped = true; }
-    if (segCount < MAX_SEG) segCount++;
+  /** Write the quad strips of one segment into ring slot `s`. */
+  function writeSegmentAt(s, a, b) {
     if (s < dirtyLo) dirtyLo = s;
     if (s > dirtyHi) dirtyHi = s;
 
@@ -569,7 +583,86 @@ export function createTracks(scene, terrain) {
     }
   }
 
-  mesh.onBeforeRender = (r) => { renderer = r; };
+  /** Commit one segment permanently and advance the ring. */
+  function commitSegment(a, b) {
+    writeSegmentAt(segCursor, a, b);
+    segCursor += 1;
+    if (segCursor >= MAX_SEG) { segCursor = 0; dirtyWrapped = true; }
+    if (segCount < MAX_SEG) segCount++;
+  }
+
+  /**
+   * Push the dirty slice to the GPU.
+   *
+   * This MUST run once per draw and nowhere else. `BufferAttribute.addUpdateRange`
+   * is consumed by the renderer at upload time, and `clearUpdateRanges()` throws
+   * away anything not yet uploaded — so calling it from update() silently deleted
+   * every segment but the last whenever the sim stepped more than once between
+   * frames. That is exactly what tools/flyby.mjs does (five 120 Hz substeps per
+   * captured frame), and it is why the trench came out as detached rectangles
+   * with square ends: one rib in every two or three reached the GPU and the rest
+   * stayed as the zero-filled degenerate triangles the buffer was born with.
+   *
+   * onBeforeRender fires immediately before renderBufferDirect binds the
+   * geometry, so this is the one place where "add range, mark dirty" is
+   * guaranteed to be followed by the upload that consumes it.
+   */
+  function flush() {
+    if (dirtyHi < 0) return;
+    const lo = dirtyWrapped ? 0 : dirtyLo;
+    const hi = dirtyWrapped ? MAX_SEG - 1 : dirtyHi;
+    const start = lo * VERTS_PER_SEG, count = (hi - lo + 1) * VERTS_PER_SEG;
+    for (let i = 0; i < ATTRS.length; i++) {
+      const a = ATTRS[i];
+      a.clearUpdateRanges();
+      a.addUpdateRange(start * a.itemSize, count * a.itemSize);
+      a.needsUpdate = true;
+    }
+    dirtyLo = Infinity; dirtyHi = -1; dirtyWrapped = false;
+  }
+
+  /**
+   * How much of the ring is on screen. `+1` while a live head is present, since
+   * the head lives in the slot the next commit will take.
+   */
+  function setDrawRange() {
+    const n = Math.min(segCount + (liveHead ? 1 : 0), MAX_SEG);
+    geo.setDrawRange(0, n * TRIS_PER_SEG * 3);
+  }
+
+  /** Stamp both ski contacts into the deformation map. */
+  function stampContacts(p, spacing, width, depth, compact) {
+    const rot = Math.atan2(right.z, right.x);
+    const dNorm = clamp(depth / 0.13, 0, 1);
+    for (let ski = 0; ski < 2; ski++) {
+      const side = ski === 0 ? -1 : 1;
+      deform.stamp(p.x + right.x * side * spacing, p.z + right.z * side * spacing,
+                   width * 1.2, rot, dNorm, compact, dNorm * 0.8);
+    }
+    needDeform = true;
+  }
+
+  /**
+   * Terminate the ribbon with a short taper instead of a square cut. `ribPrev`
+   * is duplicated a little further along the ski direction with its compaction
+   * pulled almost to zero, and since compaction is what drives the ribbon's
+   * alpha the trench dissolves into untouched snow over ~20 cm.
+   */
+  function closeRibbon() {
+    const half = ribPrev.halfW;
+    buildRib(ribTmp,
+      ribPrev.cx + fwd.x * 0.22, ribPrev.cz + fwd.z * 0.22,
+      ribPrev.spacing, half, ribPrev.depth * 0.55);
+    ribTmp.along = ribPrev.along + 0.22;
+    ribTmp.comp = ribPrev.comp * TAIL_TAPER;
+    ribTmp.halfW = half;
+    ribTmp.depth = ribPrev.depth * 0.55;
+    ribTmp.skid = ribPrev.skid;
+    ribTmp.load = ribPrev.load;
+    commitSegment(ribPrev, ribTmp);
+  }
+
+  mesh.onBeforeRender = (r) => { renderer = r; flush(); };
 
   const api = {
     mesh,
@@ -587,6 +680,37 @@ export function createTracks(scene, terrain) {
     },
 
     get ribCount() { return segCount; },
+
+    /**
+     * Dev probe: the geometric continuity of the ribbon as it stands in the
+     * vertex buffer. `gaps` counts places where the end rib of one segment does
+     * not coincide with the start rib of the next, which is the signature the
+     * dashed trench had; `degenerate` counts slots still holding the zero-filled
+     * triangles a never-uploaded slot leaves behind.
+     */
+    ribbonStats(back = 64) {
+      const n = Math.min(segCount, back);
+      let gaps = 0, degenerate = 0, worst = 0, maxSpan = 0;
+      const centre = P >> 1;
+      for (let k = 1; k <= n; k++) {
+        let s = segCursor - k;
+        while (s < 0) s += MAX_SEG;
+        let sPrev = s - 1;
+        while (sPrev < 0) sPrev += MAX_SEG;
+        // Row 0 = start rib, row 1 = end rib; ski 0, profile centre.
+        const a1 = (s * VERTS_PER_SEG + 0 * P + centre) * 3;             // start of s
+        const a0 = (sPrev * VERTS_PER_SEG + P + centre) * 3;             // end of s-1
+        const e1 = (s * VERTS_PER_SEG + P + centre) * 3;                 // end of s
+        if (pos[a1] === 0 && pos[a1 + 1] === 0 && pos[a1 + 2] === 0) { degenerate++; continue; }
+        const dx = pos[a1] - pos[a0], dy = pos[a1 + 1] - pos[a0 + 1], dz = pos[a1 + 2] - pos[a0 + 2];
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d > 0.01) { gaps++; if (d > worst) worst = d; }
+        const sx = pos[e1] - pos[a1], sy = pos[e1 + 1] - pos[a1 + 1], sz = pos[e1 + 2] - pos[a1 + 2];
+        maxSpan = Math.max(maxSpan, Math.sqrt(sx * sx + sy * sy + sz * sz));
+      }
+      return { checked: n, gaps, degenerate, worstGap: +worst.toFixed(4),
+               maxSegmentSpan: +maxSpan.toFixed(3), segments: segCount, liveHead };
+    },
 
     /** Dev probe: mean coverage written into the deformation map so far. */
     deformStats() {
@@ -627,18 +751,28 @@ export function createTracks(scene, terrain) {
       fwd.normalize();
       right.crossVectors(fwd, gN).normalize().negate();
 
-      if (!haveLast) { lastPos.copy(p); haveLast = true; needDeform = true; }
+      if (!haveLast) {
+        lastPos.copy(p); lastCommit.copy(p); lastCommitHeading = state.heading;
+        haveLast = true; needDeform = true;
+      }
 
       const moved = tmp.copy(p).sub(lastPos).length();
 
-      // Teleport / respawn: break the ribbon rather than stretching it.
+      // Teleport / respawn: break the ribbon rather than stretching it. A
+      // takeoff is a real end, but it is not a *square* one - the edge unweights
+      // over the last few centimetres - so the ribbon is closed with a short
+      // tapered segment instead of simply stopping mid-quad.
       if (moved > MAX_JUMP || state.airborne) {
-        lastPos.copy(p);
-        havePrev = false;
+        if (havePrev) closeRibbon();
+        lastPos.copy(p); lastCommit.copy(p); lastCommitHeading = state.heading;
+        havePrev = false; liveHead = false;
         needDeform = true;
+        setDrawRange();
         return;
       }
-      if (moved < STEP) return;
+
+      travelled += moved;
+      lastPos.copy(p);
 
       // How is the trench being cut right now?
       const edgeAbs = Math.min(Math.abs(state.edge || 0), 1);
@@ -661,44 +795,65 @@ export function createTracks(scene, terrain) {
       // committed carve leaves a fully polished one.
       const compact = clamp(0.42 + carve * 0.50 + gf * 0.16 - skid * 0.08, 0.30, 1.0);
 
-      travelled += moved;
-      const t = ribPrev; ribPrev = ribCur; ribCur = t;     // recycle, never alloc
-      buildRib(ribCur, p.x, p.z, spacing, width, depth);
-      ribCur.along = travelled;
-      ribCur.comp = compact;
-      ribCur.halfW = width;
-      ribCur.depth = depth;
-      ribCur.skid = skid;
-      ribCur.load = clamp(gf * 0.7 + carve * 0.5, 0, 1);
+      // The rib at the ski *right now*, rebuilt every frame.
+      buildRib(ribHead, p.x, p.z, spacing, width, depth);
+      ribHead.along = travelled;
+      ribHead.comp = compact;
+      ribHead.halfW = width;
+      ribHead.depth = depth;
+      ribHead.skid = skid;
+      ribHead.load = clamp(gf * 0.7 + carve * 0.5, 0, 1);
 
-      if (havePrev) writeSegment(ribPrev, ribCur);
-      havePrev = true;
-      lastPos.copy(p);
-
-      // Stamp both ski contacts into the deformation map.
-      const rot = Math.atan2(right.z, right.x);
-      const dNorm = clamp(depth / 0.13, 0, 1);
-      for (let ski = 0; ski < 2; ski++) {
-        const side = ski === 0 ? -1 : 1;
-        deform.stamp(p.x + right.x * side * spacing, p.z + right.z * side * spacing,
-                     width * 1.2, rot, dNorm, compact, dNorm * 0.8);
+      if (!havePrev) {
+        // Start of a ribbon: fade the very first rib in so it does not begin on
+        // a hard transverse edge.
+        const t = ribPrev; ribPrev = ribHead; ribHead = t;
+        ribPrev.comp = compact * TAIL_TAPER;
+        havePrev = true;
+        liveHead = false;
+        lastCommit.copy(p);
+        lastCommitHeading = state.heading;
+        stampContacts(p, spacing, width, depth, compact);
+        setDrawRange();
+        return;
       }
-      needDeform = true;
 
-      // Upload only the slots we touched.
-      if (dirtyHi >= 0) {
-        const lo = dirtyWrapped ? 0 : dirtyLo;
-        const hi = dirtyWrapped ? MAX_SEG - 1 : dirtyHi;
-        const start = lo * VERTS_PER_SEG, count = (hi - lo + 1) * VERTS_PER_SEG;
-        for (let i = 0; i < ATTRS.length; i++) {
-          const a = ATTRS[i];
-          a.clearUpdateRanges();
-          a.addUpdateRange(start * a.itemSize, count * a.itemSize);
-          a.needsUpdate = true;
-        }
-        geo.setDrawRange(0, segCount * TRIS_PER_SEG * 3);
-        dirtyLo = Infinity; dirtyHi = -1; dirtyWrapped = false;
+      // ---- commit test ------------------------------------------------------
+      // Arc length OR heading change, whichever trips first. The second term is
+      // what keeps the ribbon smooth at 50+ degrees of edge, where the contact
+      // point is sweeping sideways: a fixed 0.28 m step samples that arc far too
+      // coarsely and the quads visibly facet and pinch on the inside wall.
+      const dCommit = tmp.copy(p).sub(lastCommit).length();
+      let dYaw = state.heading - lastCommitHeading;
+      while (dYaw > Math.PI) dYaw -= 2 * Math.PI;
+      while (dYaw < -Math.PI) dYaw += 2 * Math.PI;
+
+      let committed = false;
+      if (dCommit >= STEP || (dCommit >= STEP_MIN && Math.abs(dYaw) >= STEP_YAW)) {
+        commitSegment(ribPrev, ribHead);
+        const t = ribPrev; ribPrev = ribHead; ribHead = t;   // recycle, never alloc
+        lastCommit.copy(p);
+        lastCommitHeading = state.heading;
+        stampContacts(p, spacing, width, depth, compact);
+        committed = true;
       }
+
+      // ---- live head --------------------------------------------------------
+      // Between commits the ribbon would otherwise stop up to 28 cm behind the
+      // ski, which from a chase camera is a visible gap between the ski tail and
+      // the trench - the "skis read as floating" half of the defect. So the slot
+      // the next commit will use is filled every frame with a provisional
+      // segment running from the last committed rib to the ski. It costs one
+      // segment upload per frame and is overwritten in place when the real
+      // commit lands.
+      //
+      // On the frame the commit itself lands the head has just *become* the last
+      // rib, so the provisional segment is written zero-length. That is not a
+      // no-op: it scrubs whatever the ring buffer left in the newly vacated slot
+      // from 600 m ago, which would otherwise flash for one frame.
+      writeSegmentAt(segCursor, ribPrev, committed ? ribPrev : ribHead);
+      liveHead = true;
+      setDrawRange();
     },
 
     dispose() {

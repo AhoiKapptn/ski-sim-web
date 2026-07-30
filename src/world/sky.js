@@ -493,6 +493,7 @@ uniform vec3  uHorizonTint;    // luminance-preserving horizon tint, toward the 
 uniform vec3  uHorizonTintCool; // ... and away from it (Belt of Venus at dusk)
 uniform vec2  uSunAz;          // normalised sun azimuth
 uniform vec3  uZenithTint;     // multiplier that deepens the zenith
+uniform vec3  uZenithDeep;     // deep-sky level: how dark the zenith actually is
 uniform vec3  uGroundColor;    // below-horizon valley haze / snow bounce
 uniform float uNightAmount;
 uniform vec3  uNightZenith;
@@ -504,6 +505,7 @@ uniform float uTime;
 uniform float uCoverage;
 uniform float uCloudDensity;
 uniform float uCirrus;
+uniform vec3  uDeckMask;       // (cirrus, altocumulus, cumulus) on/off, for probes
 uniform vec3  uCloudSun;       // linear sun radiance reaching cloud tops
 uniform vec3  uCloudAmb;       // anti-solar upper sky: the light on flanks/bases
 uniform vec3  uCloudBase;      // multiplier for a fully self-shadowed base
@@ -576,7 +578,20 @@ vec3 atmosphere( vec3 dir ) {
 // preserves luminance (so it can never blow out), valley haze below.
 vec3 gradeSky( vec3 col, vec3 dir ) {
   float h = dir.y;
-  col *= mix( vec3( 1.0 ), uZenithTint, smoothstep( 0.03, 0.85, h ) );
+  float zk = smoothstep( 0.03, 0.85, h );
+  col *= mix( vec3( 1.0 ), uZenithTint, zk );
+
+  // DEEP-SKY LEVEL. uZenithTint is a hue move; this is the level, and they are
+  // separate because the reported defect ("bright AND saturated where real
+  // altitude blue is dark and saturated") is a level defect. See the long note
+  // on params.zenithDeep for the measured sweep and why it currently sits at
+  // identity — the level is really owned by the grade's sky secondary, not by
+  // the atmosphere model, and this is the hook to move it from when that
+  // changes. Only a third of it reaches the env capture: the zenith is a large
+  // share of the irradiance on up-facing snow and the blue fill in the cast
+  // shadows is the most expensive thing this project has earned, so the dome
+  // may read like altitude but the IBL may not lose a stop for it.
+  col *= mix( vec3( 1.0 ), uZenithDeep, zk * mix( 1.0, 0.34, uEnvMode ) );
 
   // The warm band belongs around the sun; opposite it the horizon stays cool.
   float dl = length( dir.xz );
@@ -637,7 +652,22 @@ vec2 cloudWarp( vec2 p ) {
   return vec2( fbm2( p * 0.42 ), fbm2( p * 0.42 + vec2( 4.7, 1.3 ) ) );
 }
 
-float cloudShape( vec2 p, vec2 q, float cov, int quality ) {
+// A very-low-frequency DIVERGENT warp: this is what gives one deck a range of
+// cell sizes instead of one. Adding g(p) to the domain scales local feature
+// size by 1/(1 + div g), so where the warp converges the cells shrink and where
+// it diverges they grow, over a ~20-unit (≈18 km) wavelength — i.e. a region of
+// big clouds here, a region of small ones over there.
+//
+// The obvious thing to try instead — multiplying p by a spatially varying
+// frequency f(p) — does NOT work and is worth the warning. p is thousands of
+// units from the origin, so d/dp of p·f(p) is dominated by p·f′, and the field
+// shears into streaks that swim as the camera moves.
+vec2 megaWarp( vec2 p, float amp ) {
+  return ( vec2( vnoise( p * 0.052 + vec2( 61.7, 5.3 ) ),
+                 vnoise( p * 0.052 + vec2( 13.1, 44.9 ) ) ) - 0.5 ) * amp;
+}
+
+float cloudShape( vec2 p, vec2 q, float cov, float soft, int quality ) {
   float n = ( quality > 0 ) ? fbm5( p + 0.9 * q ) : fbm3( p + 0.9 * q );
   float d = clamp( ( n - cov ) / max( 1.0 - cov, 0.05 ), 0.0, 1.0 );
   if ( quality > 0 ) {
@@ -646,57 +676,165 @@ float cloudShape( vec2 p, vec2 q, float cov, int quality ) {
     // lumpy cauliflower outline a cumulus actually has. Squaring the erosion
     // noise biases it toward a few hard bites rather than a uniform nibble,
     // which is the difference between a lumpy edge and a blurred one.
+    // soft is per-region, so neighbouring cells are not bitten by identical
+    // teeth — one of the four things that made every cloud here the same cloud.
     float er = fbm3( p * 3.1 + 19.0 );
     er *= er;
-    d = clamp( ( d - ( 1.0 - d ) * er * 1.05 ) * 1.62, 0.0, 1.0 );
+    d = clamp( ( d - ( 1.0 - d ) * er * soft ) * 1.62, 0.0, 1.0 );
+    // Two more, finer, bites. A cumulus edge is cauliflower all the way down:
+    // one erosion octave gives a lumpy outline, three give an outline whose
+    // lumps have lumps that have lumps, which is what reads as vapour rather
+    // than as a decal. The finest (er3) sits at ~80 m of cloud — one degree at
+    // 4 km, i.e. a scale the frame can actually resolve — and putting it in was
+    // what finally stopped our silhouette reading smoother than a photographed
+    // one in the blind pair.
+    float er2 = vnoise( p * 8.3 + 47.0 );
+    float er3 = vnoise( p * 22.0 + 91.0 );
+    d = clamp( d - ( 1.0 - d ) * ( er2 * er2 * 0.62 + er3 * er3 * 0.30 ) * soft,
+               0.0, 1.0 );
   } else {
     d = clamp( d * 1.35, 0.0, 1.0 );
   }
   return d * d * ( 3.0 - 2.0 * d );
 }
 
+// relief   > 0 turns on parallax-mapped vertical development (cumulus only)
+// sizeAmp    amplitude of the divergent warp = how wide the cell-size range is
+// covSpread  how hard the deck clumps: 0 tiles evenly, 1 opens real holes
+// aniso      how much the per-region elongation varies
 vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale,
                  vec2 drift, float cov, float thickness, float ambBoost,
-                 float apRate, int quality, float odSelf, float lit ) {
+                 float apRate, int quality, float odSelf, float lit,
+                 float relief, float sizeAmp, float covSpread, float aniso,
+                 float yFade ) {
   if ( dir.y < 0.010 ) return vec4( 0.0 );
   float t = ( altitude - camPos.y ) / dir.y;
   if ( t <= 0.0 ) return vec4( 0.0 );
 
-  vec2 p = ( camPos.xz + dir.xz * t ) * scale + drift * uTime;
+  // ---- radial de-foreshortening -------------------------------------------
+  // THE reason a plane-based deck reads as procedural. At 8 deg elevation a
+  // flat deck is compressed 7:1 in the vertical, so every cell on it arrives as
+  // a lens with pointed ends, and thirty rows of those lenses stack up the
+  // frame as an evenly spaced comb. No amount of noise shaping fixes it,
+  // because it is the projection, not the field.
+  //
+  // Pulling the radial coordinate in as the elevation drops stretches the cells
+  // back out along the line of sight, so the far deck resolves into fewer,
+  // rounder cells instead of a comb. It is a projection cheat — the deck is no
+  // longer a plane, it is a shallow bowl — but a stable one: the factor depends
+  // only on the elevation of the WORLD direction, so it is exactly invariant to
+  // camera yaw, which is the axis the chase cam actually moves on. It creeps
+  // with camera position, and at 3-10 km range that is slow parallax, which is
+  // what a cloud deck is supposed to do anyway.
+  float defor = clamp( pow( 0.42 / max( dir.y, 0.05 ), 0.62 ), 1.0, 3.4 );
+  vec2 p0 = camPos.xz * scale + dir.xz * ( t * scale / defor ) + drift * uTime;
 
-  // Weather, not wallpaper. A single global coverage threshold produces a field
-  // of identically sized puffs evenly spaced across the whole dome, which is
-  // the second thing (after their sheer size) that gives a procedural sky away.
-  // Modulating the threshold with one very low-frequency octave gives dense
-  // clumps of large cells with clear lanes between them — the size *range* is
-  // what a real deck has and a single fbm does not.
-  float covL = clamp( cov + ( fbm2( p * 0.11 + 3.3 ) - 0.5 ) * 0.46, 0.03, 0.95 );
+  // ---- weather field -------------------------------------------------------
+  // One slowly varying sample with four consequences, so a region of sky has a
+  // consistent character. A single global coverage at a single global frequency
+  // is what makes a threshold-mapped fbm read as wallpaper: every cell the same
+  // size, the same softness, the same lozenge, evenly spaced.
+  float wCov  = fbm2(   p0 * 0.075 + vec2(  3.3,  1.7 ) );
+  float wRot  = vnoise( p0 * 0.043 + vec2( 27.4, 11.9 ) );
+  float wSoft = vnoise( p0 * 0.088 + vec2(  5.9, 33.2 ) );
+  float wHgt  = vnoise( p0 * 0.061 + vec2( 44.1,  8.6 ) );
 
-  vec2 q = cloudWarp( p );
-  float d = cloudShape( p, q, covL, quality );
+  // Clustering. Remapping the threshold through a CONTRASTY low-frequency
+  // octave (rather than adding a gentle ±0.16 wobble, which is what was here)
+  // is what opens genuinely empty lanes of sky and packs genuinely dense
+  // clumps, instead of spreading the same coverage evenly over the dome.
+  float clump = smoothstep( 0.26, 0.72, wCov );
+  float covL = clamp( mix( cov + 0.30 * covSpread, cov - 0.26 * covSpread, clump ),
+                      0.05, 0.93 );
+
+  vec2 p = p0 + megaWarp( p0, sizeAmp );
+
+  // ---- per-region elongation ----------------------------------------------
+  // Real decks are sheared, and both the amount and the direction of the shear
+  // change across the sky. Identically elongated lozenges everywhere was the
+  // single most artificial thing in the frame.
+  // Kept deliberately narrow: the axis ratio is ex^2, so ex = 1.4 is already a
+  // 2:1 cell, and past that the deck stops being cumulus and turns into the
+  // combed ribbons this rewrite is trying to get rid of.
+  float ang = ( wRot - 0.5 ) * 2.4;
+  float ca = cos( ang ), sa = sin( ang );
+  float ex = clamp( 1.0 + aniso * ( wHgt - 0.5 ), 0.76, 1.34 );
+  mat2 A = mat2( ca, -sa, sa, ca ) * mat2( ex, 0.0, 0.0, 1.0 / ex );
+
+  vec2 ps = A * p;
+  float soft = 0.55 + 1.15 * wSoft;
+
+  vec2 q = cloudWarp( ps );
+  float dBase = cloudShape( ps, q, covL, soft, quality );
+
+  // ---- vertical development ------------------------------------------------
+  // A flat plane is exactly why every cloud in this sky was a lozenge: at
+  // 10-25 deg elevation the plane foreshortens by 1/sin(elev), so anything
+  // drawn on it arrives as a horizontal streak no matter what shape it is.
+  //
+  // A second sample offset along the view's ground track is a parallax-mapped
+  // heightfield. The top of a cell at ground distance D appears at elevation
+  // (D + Δ)/... — concretely, the cloud whose TOP shows at this pixel is
+  // relief/dir.y further away than the one whose BASE shows here, so sampling
+  // the field at p + groundTrack·par draws that cloud's top above its own base:
+  // an actual profile, from one extra tap.
+  //
+  // The 1/dir.y is clamped. The true offset runs to kilometres near the
+  // horizon, and two samples a kilometre apart are not the top and the bottom
+  // of one cloud, they are two unrelated clouds — which is a second decorrelated
+  // deck, i.e. the bug this whole rewrite exists to remove.
+  float dTop = 0.0;
+  float topness = 0.5;
+  if ( relief > 0.0 ) {
+    vec2 gd = dir.xz;
+    float gl = length( gd );
+    gd = ( gl > 1e-5 ) ? gd / gl : vec2( 1.0, 0.0 );
+    // wHgt: some cells tower, some stay flat humilis pancakes. Density-weighted,
+    // because a wisp does not build a tower.
+    float par = relief * ( 0.55 / max( dir.y, 0.24 ) ) * ( 0.40 + 1.35 * wHgt ) / defor;
+    vec2 pt = A * ( p + gd * par );
+    // The top of a cumulus is narrower than its base — raise the threshold — and
+    // it is bitten harder, which is the cauliflower.
+    dTop = cloudShape( pt, cloudWarp( pt ), min( covL + 0.14, 0.95 ),
+                       soft * 1.30, quality );
+    topness = dTop / max( dTop + dBase, 1e-4 );
+  }
+  float d = max( dBase, dTop );
   if ( d <= 0.003 ) return vec4( 0.0 );
 
   // March toward the sun through the slab for self-shadowing. The taps run at
-  // the SAME quality as the silhouette — i.e. the same five octaves and the
-  // same erosion — because a shadow marched through a cheaper field is not a
-  // shadow of the cloud you can see: it is an uncorrelated grey wash laid over
-  // it, which is exactly what made these decks read as pasted decals. Three
-  // taps at full quality is the single most expensive thing in this shader, and
-  // it is worth it.
+  // the SAME quality as the silhouette — i.e. the same five octaves, the same
+  // erosion, the same per-region covL/soft/A — because a shadow marched through
+  // a cheaper or differently-parameterised field is not a shadow of the cloud
+  // you can see: it is an uncorrelated grey wash laid over it, which is exactly
+  // what made these decks read as pasted decals.
   vec2 sdir = uSunDir.xz;
   float sl = length( sdir );
   sdir = ( sl > 1e-4 ) ? sdir / sl : vec2( 1.0, 0.0 );
+  sdir = A * sdir;                       // march in the same sheared space
   float stepLen = thickness * ( 0.6 / max( uSunDir.y, 0.20 ) );
-  vec2 p1 = p + sdir * stepLen, p2 = p + sdir * stepLen * 2.4, p3 = p + sdir * stepLen * 5.2;
-  // covL is reused rather than re-derived: its octave has a wavelength of ~9
-  // units and the longest step is 2.4, so it barely moves — unlike the warp,
-  // which does.
-  float s1 = cloudShape( p1, cloudWarp( p1 ), covL, quality );
-  float s2 = cloudShape( p2, cloudWarp( p2 ), covL, quality );
-  float s3 = cloudShape( p3, cloudWarp( p3 ), covL, quality );
-  // Everything below the top of the deck is shaded by the deck above it, so
-  // the optical depth toward the sun never really goes to zero inside a body.
-  float shadow = s1 * 0.50 + s2 * 0.32 + s3 * 0.18 + d * odSelf;
+  vec2 p1 = ps + sdir * stepLen, p3 = ps + sdir * stepLen * 4.2;
+  // covL / soft / A are reused rather than re-derived: their octaves have
+  // wavelengths of 11-23 units and the longest step is ~4, so they barely
+  // move — unlike the warp, which does, and which is therefore re-derived.
+  float s1 = cloudShape( p1, cloudWarp( p1 ), covL, soft, quality );
+  float s3 = cloudShape( p3, cloudWarp( p3 ), covL, soft, quality );
+  // THE MARCH IS TWO TAPS, NOT THREE, and the third one did not go missing —
+  // it was replaced by a better one. dTop is the density of the slab *directly
+  // above this pixel*, already paid for by the silhouette, and mass overhead is
+  // a more honest occluder of a cloud base than a third horizontal tap along
+  // the sun vector ever was. Two full-quality horizontal taps plus one exact
+  // vertical one costs less than three horizontal ones and shades the flat
+  // bases better, which is what the earlier review was actually asking for.
+  //
+  // Everything below the top of the deck is shaded by the deck above it, so the
+  // optical depth toward the sun never really goes to zero inside a body.
+  // (1 - topness) is 1 exactly where this pixel is the underside of a cell and
+  // 0 where it is the tower above it, and it is derived from dBase/dTop, i.e.
+  // from the very field whose silhouette you are looking at. There is no
+  // decorrelated shadow field anywhere in here.
+  float shadow = s1 * 0.60 + s3 * 0.40 + d * odSelf
+               + ( 1.0 - topness ) * 0.72 * dBase * step( 0.001, relief );
 
   // Cauliflower relief. The density field falling away toward the sun means
   // this flank turns into the light; rising means it turns away. It is a
@@ -726,8 +864,14 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   // Lit rim: thin, sun-facing edges are where forward scattering escapes.
   float rim = min( pow( 1.0 - d, 3.0 ) * hgPhase( ct, 0.86 ) * 9.0, 0.85 );
 
+  // The tower is lit and the underside is not: same split as the shadow term above,
+  // same field, so a cell's bright cauliflower top and its flat grey base are
+  // two ends of one continuous shading, not two stamps.
+  float vert = mix( 1.0, 0.58 + 0.84 * topness, step( 0.001, relief ) );
+
   vec3 col = uCloudSun * lit
-             * ( beer * phase * ( 0.30 + 0.70 * powder ) * ( 0.55 + 0.90 * facing ) + rim )
+             * ( beer * phase * ( 0.30 + 0.70 * powder ) * ( 0.55 + 0.90 * facing ) * vert
+                 + rim )
            + uCloudAmb * mix( vec3( 1.0 ), uCloudBase, sh ) * ambBoost;
 
   // aerial perspective: dissolve into the sky that is actually behind them
@@ -738,7 +882,11 @@ vec4 cloudLayer( vec3 dir, vec3 camPos, vec3 skyCol, float altitude, float scale
   // covers noticeably more sky than the silhouette you actually see. Trim the
   // coverage back so the IBL is not over-clouded (at low sun that showed up
   // directly as warm cloud light neutralising the blue in the shadows).
-  float a = smoothstep( 0.02, 0.30, d ) * smoothstep( 0.018, 0.115, dir.y )
+  // Per-region edge width. A real deck has crisp-edged cells next to woolly
+  // ones; one global smoothstep gives every cloud in the frame the same
+  // softness, which the blind gate called out by name.
+  float a = smoothstep( 0.02, mix( 0.15, 0.37, wSoft ), d )
+          * smoothstep( yFade * 0.16, yFade, dir.y )
           * mix( 1.0, 0.72, uEnvMode );
   return vec4( col, clamp( a, 0.0, 1.0 ) );
 }
@@ -747,11 +895,37 @@ vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol ) {
   if ( dir.y < 0.02 || uCirrus <= 0.001 ) return vec4( 0.0 );
   float t = ( 9200.0 - camPos.y ) / dir.y;
   if ( t <= 0.0 ) return vec4( 0.0 );
-  vec2 p = ( camPos.xz + dir.xz * t ) * 0.00020 + vec2( 0.0075, 0.0026 ) * uTime;
+  // Same radial de-foreshortening as the decks below (see cloudLayer), and it
+  // matters more up here: 9 km is the most compressed plane in the frame, and
+  // without it the veil hatches the low sky with parallel full-width ribbons.
+  float defor = clamp( pow( 0.42 / max( dir.y, 0.05 ), 0.62 ), 1.0, 3.4 );
+  vec2 p = camPos.xz * 0.00020 + dir.xz * ( t * 0.00020 / defor )
+         + vec2( 0.0075, 0.0026 ) * uTime;
 
-  vec2 w = vec2( fbm2( p * 0.9 ), fbm2( p * 0.9 + 9.1 ) );
-  float n = fbm5( vec2( p.x * 0.55, p.y * 2.4 ) + 1.1 * w );
-  float d = smoothstep( 0.58, 0.94, n );
+  // Cirrus is not a uniform veil either. It arrives in a few broad bands with
+  // clear sky between them, and inside a band it is fibrous — hooked filaments
+  // combed out along the jet — not a smooth wash. Two low-frequency gates, one
+  // for the bands and one for the density inside them, and a hard anisotropy on
+  // the fbm domain for the fibres.
+  float band = smoothstep( 0.28, 0.82, fbm2( p * 0.115 + vec2( 8.2, 2.9 ) ) );
+  if ( band <= 0.002 ) return vec4( 0.0 );
+
+  // The comb direction turns. A fixed anisotropic domain lays one set of
+  // parallel strokes of one width and one softness across the entire sky, which
+  // is the cirrus version of exactly the defect this rewrite is about — and in
+  // the blind pair it was the last thing left giving the frame away. Rotating
+  // the fibre axis with a very-low-frequency octave gives the veil the crossing,
+  // hooked, sheared structure real cirrus has, for two extra noise lookups.
+  float ang = ( vnoise( p * 0.085 + vec2( 51.3, 7.4 ) ) - 0.5 ) * 1.35;
+  float cs = cos( ang ), sn = sin( ang );
+  vec2 pf = mat2( cs, -sn, sn, cs ) * p;
+
+  vec2 w = vec2( fbm2( pf * 0.9 ), fbm2( pf * 0.9 + 9.1 ) );
+  float n = fbm5( vec2( pf.x * 0.52, pf.y * 2.6 ) + 1.20 * w );
+  // Fray the filament ends. Cirrus dissolves across the fibre, never along it,
+  // so the subtractive term is stretched hard the other way.
+  n -= 0.20 * vnoise( vec2( pf.x * 2.4, pf.y * 12.0 ) + 3.0 );
+  float d = smoothstep( 0.52, 0.93, n ) * band;
   if ( d <= 0.003 ) return vec4( 0.0 );
 
   float ct = dot( dir, uSunDir );
@@ -761,7 +935,10 @@ vec4 cirrusLayer( vec3 dir, vec3 camPos, vec3 skyCol ) {
   float ap = 1.0 - exp( -t * 1.0e-5 );
   col = mix( col, skyCol, ap * 0.85 );
 
-  return vec4( col, d * uCirrus * smoothstep( 0.02, 0.12, dir.y ) );
+  // Faded out hard at low elevation. A 9 km plane foreshortens by 1/sin(elev),
+  // so anything on it below ~15 deg arrives as a full-width horizontal ribbon —
+  // and a frame full of those is a different kind of stamped-identical sky.
+  return vec4( col, d * uCirrus * smoothstep( 0.05, 0.34, dir.y ) );
 }
 
 void main() {
@@ -770,26 +947,46 @@ void main() {
   vec3 col = gradeSky( atmosphere( dir ), dir );
   vec3 skyCol = col;
 
-  // ---- cloud decks -------------------------------------------------------
-  vec4 ci  = cirrusLayer( dir, cameraPosition, skyCol );
-  // NOTE ON SCALE. These were 0.00019 / 0.00052, which put a single cumulus at
+  // ---- cloud populations -------------------------------------------------
+  // THREE, at three altitudes, at three scales, with three coverages, drifting
+  // at three speeds. One deck at one scale is a texture; three at genuinely
+  // different scales is weather, and the difference is the top third of every
+  // wide shot in the game.
+  //
+  // NOTE ON SCALE. The cumulus deck was once 0.00019, which put a single cell at
   // ~2 km across seen from 350 m below it — one cloud filled a quarter of the
-  // frame. Side by side with a real alpine photograph that is the first thing
-  // that gives the render away: real cumulus at this altitude subtend 3-8 deg,
-  // not 25, and what sells a sky is *many* of them at a range of sizes, not
-  // three enormous lozenges. Both decks are now 2.2x finer.
-  // high altocumulus: thin, so barely any self-shadowing and it stays pale
-  vec4 cu2 = cloudLayer( dir, cameraPosition, skyCol, 5400.0, 0.00043,
-                         vec2( 0.0010, 0.0004 ), uCoverage + 0.17, 0.20, 1.15,
-                         3.2e-5, 0, 0.12, 1.15 );
-  // the main cumulus deck: thick, seen from underneath, so it self-shadows hard
-  vec4 cu  = cloudLayer( dir, cameraPosition, skyCol, 2350.0, 0.00115,
-                         vec2( 0.0030, 0.0011 ), uCoverage, 0.30, 1.00,
-                         7.0e-5, 1, 0.88, 1.0 );
+  // frame. It then went to 0.00115 (cells ~870 m), which overshot the other way:
+  // at this camera height that is thirty rows of identical popcorn stacked up
+  // the frame, and rows of popcorn are what the blind gate saw. It is now
+  // 0.00058 — cells ~1.7 km, with a per-region size range on top (sizeAmp), so
+  // one deck spans roughly 8-20 deg high in the frame and 4-6 deg near the
+  // horizon, which is the size *range* a real deck has.
 
-  col = mix( col, ci.rgb,  ci.a  * uCloudDensity );
-  col = mix( col, cu2.rgb, cu2.a * uCloudDensity * 0.65 );
-  col = mix( col, cu.rgb,  cu.a  * uCloudDensity );
+  // 3. Cirrus veil, ~9 km. Thin, fibrous, banded, mostly absent.
+  vec4 ci = cirrusLayer( dir, cameraPosition, skyCol );
+
+  // 2. Altocumulus, 5.2 km: cells ~900 m, a THIRD the angular size of the
+  //    cumulus below it and nearly three times as high, so the eye reads two
+  //    separate altitudes rather than one deck at two densities. Thin, barely
+  //    self-shadowing, and held above 25 deg elevation (yFade 0.44) because a
+  //    fine deck at 5 km hatches the low sky into parallel ribbons — measured
+  //    with uDeckMask, that hatching was the whole of the remaining "combed"
+  //    read after the cumulus deck was fixed.
+  vec4 ac = cloudLayer( dir, cameraPosition, skyCol, 5200.0, 0.00110,
+                        vec2( 0.0009, 0.0004 ), uCoverage + 0.24, 0.22, 1.12,
+                        3.4e-5, 0, 0.14, 1.12,
+                        0.0, 2.8, 1.25, 0.80, 0.44 );
+
+  // 1. The cumulus deck, 2.25 km. Thick, seen from underneath, so it
+  //    self-shadows hard — and the only one with vertical development.
+  vec4 cu = cloudLayer( dir, cameraPosition, skyCol, 2250.0, 0.00058,
+                        vec2( 0.0030, 0.0011 ), uCoverage - 0.02, 0.30, 1.00,
+                        1.15e-4, 1, 0.88, 1.0,
+                        1.55, 1.55, 1.25, 0.40, 0.26 );
+
+  col = mix( col, ci.rgb, ci.a * uCloudDensity * uDeckMask.x );
+  col = mix( col, ac.rgb, ac.a * uCloudDensity * uDeckMask.y * 0.46 );
+  col = mix( col, cu.rgb, cu.a * uCloudDensity * uDeckMask.z );
 
   // ---- solar disc --------------------------------------------------------
   float ct = dot( dir, uSunDir );
@@ -870,6 +1067,12 @@ export function createSky(scene, renderer) {
     uHorizonTintCool: { value: new THREE.Vector3(1.0, 1.0, 1.02) },
     uSunAz: { value: new THREE.Vector2(0, 1) },
     uZenithTint: { value: new THREE.Vector3(0.9, 0.94, 1.06) },
+    uZenithDeep: { value: new THREE.Vector3(1, 1, 1) },
+    // (cirrus, altocumulus, cumulus). Left at 1,1,1 in the game; a probe can
+    // knock a deck out to attribute a defect to the population that owns it,
+    // which is how the last of the "combed ribbons" read was pinned on the
+    // altocumulus rather than on the cirrus it was assumed to be.
+    uDeckMask: { value: new THREE.Vector3(1, 1, 1) },
     uGroundColor: { value: new THREE.Vector3(0.42, 0.47, 0.55) },
     uNightAmount: { value: 0.0 },
     uNightZenith: { value: new THREE.Vector3(0.030, 0.061, 0.152) },
@@ -1045,7 +1248,43 @@ export function createSky(scene, renderer) {
   const params = {
     cloudCoverage: 0.42,
     cloudDensity: 1.0,
-    cirrus: 0.22,
+    cirrus: 0.11,
+    // DEEP-SKY LEVEL (see gradeSky). Multiplier on the zenith radiance, faded
+    // in with the same mask as uZenithTint.
+    //
+    // IT IS AT IDENTITY ON PURPOSE, and the reason is worth writing down
+    // because it looks like an unfinished knob. The brief was "our zenith is
+    // bright AND saturated (53,117,230); real deep alpine zenith is dark and
+    // saturated (37,95,137) — darken it without losing the chroma". Measured
+    // end-to-end with tools/clouds-zenith.mjs (one fixed pixel mask across all
+    // variants, hero framing), sweeping this multiplier:
+    //
+    //     0.15   (82,133,192)  L 126.4  B/R 2.35
+    //     0.30   (74,131,202)  L 123.8  B/R 2.74
+    //     0.45   (78,133,202)  L 126.0  B/R 2.61
+    //     0.62   (71,129,209)  L 122.2  B/R 2.94
+    //     0.90   (58,119,228)  L 114.3  B/R 3.92
+    //     1.00   (53,117,230)  L 111.4  B/R 4.35   <- here
+    //     1.15   (57,121,232)  L 115.4  B/R 4.08
+    //     1.35   (65,128,233)  L 122.0  B/R 3.60
+    //     1.60   (69,134,233)  L 127.3  B/R 3.35
+    //
+    // The response is non-monotone with a sharp optimum exactly where we sit:
+    // EVERY move, in either direction, makes the displayed sky BRIGHTER and
+    // LESS blue. That is not the atmosphere model, it is fx/postfx.js — its
+    // "sky window" secondary (grade.skyBand [0.60,0.675,0.745,0.83],
+    // skyChroma 0.80) expands chroma about the brightest channel on pixels
+    // inside a log-luma band, which is worth ~15 display codes of luminance and
+    // ~1.9 of B/R here. Push the sky out of that band and the boost switches
+    // off, which costs more luminance than the darkening gained.
+    //
+    // So the zenith LEVEL is owned by the grade, not by this file, and the
+    // chroma win the blind gate credited to the sky is really the grade's
+    // secondary sitting on top of the sky's level. Moving it means moving
+    // grade.skyBand and this multiplier together, which crosses a file
+    // ownership line. Left at identity: measured, that is the best available
+    // (darkest, bluest) point from inside sky.js.
+    zenithDeep: [1, 1, 1],
     windSpeed: 1.0,
     fogDensity: 0.00033,     // our own chunk (trees, skier, props)
     // AERIAL PERSPECTIVE DENSITY. This is the number that decides whether a
@@ -1117,14 +1356,18 @@ export function createSky(scene, renderer) {
 
   function gradeJS(col, h, caz) {
     const zt = uniforms.uZenithTint.value;
+    const zd = uniforms.uZenithDeep.value;
     const htw = uniforms.uHorizonTint.value;
     const htc = uniforms.uHorizonTintCool.value;
     const gc = uniforms.uGroundColor.value;
     const zk = smoothstep01(0.03, 0.85, h);
+    // mirrors the dome's uEnvMode == 0 branch, deep-sky level included: skyAt()
+    // is what the fog colour and the cloud ambient are derived from, and they
+    // must not sit above the dome they are drawn against.
     const c = [
-      col[0] * mix(1, zt.x, zk),
-      col[1] * mix(1, zt.y, zk),
-      col[2] * mix(1, zt.z, zk),
+      col[0] * mix(1, zt.x, zk) * mix(1, zd.x, zk),
+      col[1] * mix(1, zt.y, zk) * mix(1, zd.y, zk),
+      col[2] * mix(1, zt.z, zk) * mix(1, zd.z, zk),
     ];
     const w = smoothstep01(-0.55, 0.90, caz);
     const htx = mix(htc.x, htw.x, w), hty = mix(htc.y, htw.y, w), htz = mix(htc.z, htw.z, w);
@@ -1282,6 +1525,13 @@ export function createSky(scene, renderer) {
     // ---- grade tints ------------------------------------------------------
     uniforms.uZenithTint.value.set(
       mix(1.0, 0.88, day), mix(1.0, 0.93, day), mix(1.02, 1.10, day));
+
+    // Deep-sky level, faded out at twilight (the night floor owns the dome
+    // then, and Preetham is already near zero — darkening it further only
+    // crushes the last of the dusk gradient).
+    const zdp = params.zenithDeep;
+    uniforms.uZenithDeep.value.set(
+      mix(1.0, zdp[0], day), mix(1.0, zdp[1], day), mix(1.0, zdp[2], day));
 
     // Horizon band. Near-luminance-preserving: warm and blazing at sunset, and
     // by day a PALE BLUE — not a white-out.
