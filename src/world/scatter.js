@@ -982,8 +982,13 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
       const yy = tr.y + tr.drop * sd * (0.30 + 1.05 * rnd());
       const li = (22 + rnd() * 15 + (1 - sd) * 5) * (1 - haze) + haze * 70;
       g.strokeStyle = `hsl(${hueJ + rnd() * 20}, ${(2 + rnd() * 5) * (1 - haze * 0.8)}%, ${li}%)`;
-      g.lineWidth = 1.2 + rnd() * 2.2;
-      g.globalAlpha = 0.72 + 0.28 * rnd();
+      // Opaque and wide on purpose. These cards are alpha-tested against a
+      // mipmapped atlas, so as a tree shrinks the mip chain averages thin,
+      // semi-transparent strokes toward zero alpha and the cutoff deletes them.
+      // Bright rime strokes are wider and survive, so distance was selectively
+      // stripping the dark needle mass and leaving white spikes.
+      g.lineWidth = 1.9 + rnd() * 2.4;
+      g.globalAlpha = 1.0;
       g.beginPath();
       g.moveTo(cx + sideS * w * (0.06 + 0.34 * rnd()), yy - tr.drop * (0.1 + 0.5 * rnd()));
       g.lineTo(cx + sideS * w, yy);
@@ -996,17 +1001,22 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   // needles do, sitting a little above them, and the dark foliage survives as
   // speckle showing through. Two or three long white bars per whorl — which is
   // what this used to draw — reads as a painted decal.
+  // Rime must never out-draw the needle mass beneath it. At 1.25 strokes per
+  // needle stroke, at 72-90% lightness and up to 0.96 alpha, it buried the
+  // foliage completely and the treeline measured 98% of the snowfield's
+  // luminance — a row of white feather spikes. A snow-laden conifer still reads
+  // as a DARK mass with load caught on the upper faces: target 25-45% of snow.
   for (const tr of tiers) {
-    const nRime = Math.round(perTier * (0.30 + 0.95 * snowAmt));
+    const nRime = Math.round(perTier * (0.06 + 0.30 * snowAmt));
     for (let j = 0; j < nRime; j++) {
       const sd = rnd();
       const sideS = rnd() < 0.5 ? -1 : 1;
       const w = tr.hw * Math.pow(sd, 0.5) * (0.78 + 0.28 * rnd());
       const yy = tr.y + tr.drop * sd * (0.20 + 1.0 * rnd()) - tr.drop * 0.16;
-      const li = (72 + rnd() * 18) * (1 - haze * 0.22) + haze * 16;
+      const li = (58 + rnd() * 16) * (1 - haze * 0.22) + haze * 16;
       g.strokeStyle = `hsl(${210 + rnd() * 14}, ${10 + rnd() * 12}%, ${li}%)`;
-      g.lineWidth = 1.4 + rnd() * 2.6;
-      g.globalAlpha = 0.52 + 0.44 * rnd();
+      g.lineWidth = 1.2 + rnd() * 1.9;
+      g.globalAlpha = 0.26 + 0.32 * rnd();
       g.beginPath();
       g.moveTo(cx + sideS * w * (0.08 + 0.30 * rnd()), yy - tr.drop * (0.08 + 0.42 * rnd()));
       g.lineTo(cx + sideS * w, yy);
@@ -2953,7 +2963,12 @@ export function createScatter(scene, terrain) {
           // Per-instance foliage colour: `vv` runs near-black to bright, `w`
           // runs blue-green (shaded north aspect, spruce) to olive (sunlit
           // pine). Gated by aTint, so only the needles take it.
-          const vv = 0.88 + 0.38 * rn();
+          // `vv` is a MULTIPLIER on the foliage albedo, so it must stay below 1
+          // or the tint brightens instead of varying. It read 0.88..1.26, and
+          // with the blue weight below (up to 1.12x) that scaled foliage by as
+          // much as 1.4x, strongest in blue — which is what turned the treeline
+          // into white-blue ice spikes at distance.
+          const vv = 0.40 + 0.34 * rn();
           const w = rn();
           items.push({
             k: 0, v: vi, x: px, y, z: pz,
