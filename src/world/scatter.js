@@ -240,10 +240,79 @@ function bleedRGB(d, W, H, passes) {
 }
 
 /**
+ * Alpha-coverage-preserving mip chain.
+ *
+ * Half of the white-treeline fix (the other half is the specular kill in
+ * patchFoliage). A stock box-filtered mip chain averages a lace of 2 px needle
+ * strokes toward alpha ~ 0.15 by level 4; the alpha test then cuts everything
+ * under 0.30, so a 200 m spruce loses its dark needle mass while the few dense
+ * (pale, rimed) clusters survive, and what is left is a thin bright skeleton
+ * with sunlit snow showing through it. Measured at the hero framing: the
+ * silhouette the cards actually drew grew from 59 000 to 75 000 px when this
+ * was switched on, at identical instance counts.
+ *
+ * Every level is rescaled so the fraction of texels passing the alpha test
+ * matches level 0 — the standard "alpha-tested coverage" mip fix (Castano).
+ * RGB is averaged alpha-weighted so a shrinking tree keeps its colour instead
+ * of drifting toward its transparent surround.
+ */
+function coverageMipmaps(base, W, H, alphaRef) {
+  const ref = Math.round(alphaRef * 255);
+  const covOf = (d, k) => {
+    let n = 0;
+    for (let i = 3; i < d.length; i += 4) if (Math.min(255, d[i] * k) >= ref) n++;
+    return n / (d.length >> 2);
+  };
+  const target = covOf(base, 1);
+  const mips = [{ data: base, width: W, height: H }];
+  let src = base, w = W, h = H;
+  while (w > 1 || h > 1) {
+    const nw = Math.max(1, w >> 1), nh = Math.max(1, h >> 1);
+    const dst = new Uint8Array(nw * nh * 4);
+    for (let y = 0; y < nh; y++) {
+      const y0 = Math.min(y * 2, h - 1), y1 = Math.min(y * 2 + 1, h - 1);
+      for (let x = 0; x < nw; x++) {
+        const x0 = Math.min(x * 2, w - 1), x1 = Math.min(x * 2 + 1, w - 1);
+        let r = 0, g = 0, b = 0, a = 0, wa = 0;
+        for (const yy of [y0, y1]) for (const xx of [x0, x1]) {
+          const i = (yy * w + xx) * 4, al = src[i + 3];
+          // alpha-weighted colour, but never zero-weighted: the RGB of
+          // transparent texels was already bled outward from the opaque ones,
+          // so it is a usable fallback rather than black
+          const ww = al + 8;
+          r += src[i] * ww; g += src[i + 1] * ww; b += src[i + 2] * ww;
+          a += al; wa += ww;
+        }
+        const o = (y * nw + x) * 4;
+        dst[o] = r / wa; dst[o + 1] = g / wa; dst[o + 2] = b / wa; dst[o + 3] = a * 0.25;
+      }
+    }
+    // solve for the alpha scale that restores level 0's coverage
+    if (target > 0) {
+      let lo = 0.25, hi = 6.0;
+      for (let it = 0; it < 12; it++) {
+        const mid = 0.5 * (lo + hi);
+        if (covOf(dst, mid) < target) lo = mid; else hi = mid;
+      }
+      const k = 0.5 * (lo + hi);
+      if (Math.abs(k - 1) > 0.01) {
+        for (let i = 3; i < dst.length; i += 4) dst[i] = Math.min(255, dst[i] * k);
+      }
+    }
+    mips.push({ data: dst, width: nw, height: nh });
+    src = dst; w = nw; h = nh;
+  }
+  return mips;
+}
+
+/**
  * Canvas -> DataTexture. A CanvasTexture round-trips through premultiplied
  * storage, which destroys the bled RGB of transparent texels; uploading the
  * raw bytes ourselves keeps it. Rows are flipped so UV conventions match
  * CanvasTexture (v = 0 at the bottom of the canvas).
+ *
+ * `opts.alphaRef` switches on the coverage-preserving mip chain above; pass the
+ * material's alphaTest.
  */
 function canvasToTexture(cv, opts = {}) {
   const W = cv.width, H = cv.height;
@@ -258,7 +327,12 @@ function canvasToTexture(cv, opts = {}) {
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.magFilter = THREE.LinearFilter;
   tex.minFilter = THREE.LinearMipmapLinearFilter;
-  tex.generateMipmaps = true;
+  if (opts.alphaRef) {
+    tex.mipmaps = coverageMipmaps(out, W, H, opts.alphaRef);
+    tex.generateMipmaps = false;
+  } else {
+    tex.generateMipmaps = true;
+  }
   tex.anisotropy = 8;
   tex.wrapS = tex.wrapT = opts.wrap || THREE.ClampToEdgeWrapping;
   tex.needsUpdate = true;
@@ -286,6 +360,11 @@ function canvasToTexture(cv, opts = {}) {
 // =============================================================================
 const AT_S = 2048;
 const AT_T = 512;                       // tile size
+// Transparent margin around every sprig tile, as a fraction of the tile. The
+// sprig geometry compensates with 1/SPRIG_SCALE so the foliage keeps its size
+// in metres — only the card's rectangle grows, and it grows into empty alpha.
+const SPRIG_INSET = 0.085;
+const SPRIG_SCALE = 1 - 2 * SPRIG_INSET;
 
 /** Tapered needle as a triangle — round caps read as bristles, not needles. */
 function needleTri(g, x, y, ang, len, w) {
@@ -310,11 +389,22 @@ function paintSprig(g, rnd, ox, oy, cfg) {
   const S = AT_T, cy = oy + S * 0.5;
   g.save();
   g.beginPath(); g.rect(ox, oy, S, S); g.clip();
+  // SPRIG_INSET: everything below is painted into the inner (1 - 2 x inset) of
+  // the tile, so the alpha reaches zero well before the card's own rectangle.
+  // The old art ran straight off all four edges: the clip rectangle *was* the
+  // silhouette, which is why a near frond read as a photograph of foliage
+  // trimmed with scissors. The card geometry is scaled up by 1/SPRIG_SCALE to
+  // compensate, so the foliage is the same size in metres.
+  g.translate(ox + S * SPRIG_INSET, oy + S * SPRIG_INSET);
+  g.scale(SPRIG_SCALE, SPRIG_SCALE);
+  g.translate(-ox, -oy);
 
-  // silhouette envelope: rises off the attachment, wobbles, tapers to the tip
+  // silhouette envelope: rises off the attachment, wobbles, tapers to nothing.
+  // Both ends must reach zero: a residual 14% at s = 1 left a straight vertical
+  // row of needle ends across the card.
   const env = (x, side) => {
     const s = x / S;
-    const along = smoothstep(-0.02, 0.22, s) * (1 - 0.86 * smoothstep(0.55, 1.02, s));
+    const along = smoothstep(0.0, 0.20, s) * (1 - smoothstep(0.50, 1.0, s));
     const rough = 0.40 + 0.82 * fbm2(x * 0.017 + side * 29.3 + cfg.seed, cfg.seed * 2.9, 3);
     return clamp(along * rough, 0, 1);
   };
@@ -327,7 +417,9 @@ function paintSprig(g, rnd, ox, oy, cfg) {
   g.beginPath();
   g.moveTo(ox, wav(ox));
   for (let x = 0; x <= S; x += 24) {
-    g.lineWidth = 7 * (1 - 0.8 * x / S);
+    // taper to nothing at the tip end, and off the attachment end too, so the
+    // shoot never terminates in a flat-cut stub on the card boundary
+    g.lineWidth = 7 * Math.pow(Math.max(0, 1 - x / S), 0.85) * smoothstep(0, 0.05, x / S);
     g.lineTo(ox + x, wav(ox + x));
     g.stroke();
     g.beginPath();
@@ -544,6 +636,11 @@ function paintSprigSnow(g, rnd, ox, oy, cfg) {
   const S = AT_T, cy = oy + S * 0.5;
   g.save();
   g.beginPath(); g.rect(ox + 5, oy + 5, S - 10, S - 10); g.clip();
+  // same inset as paintSprig — the load must not be the thing that reaches the
+  // card boundary either
+  g.translate(ox + S * SPRIG_INSET, oy + S * SPRIG_INSET);
+  g.scale(SPRIG_SCALE, SPRIG_SCALE);
+  g.translate(-ox, -oy);
 
   const env = (x) => {
     const s = (x - ox) / S;
@@ -870,7 +967,8 @@ function makeTreeAtlas() {
   paintDead(g, rnd, ...TXY(2, 3));
   paintSnowTile(g, rnd, ...TXY(3, 3));
 
-  const tex = canvasToTexture(cv, { bleed: 3 });
+  // alphaRef matches protoTree.alphaTest — see coverageMipmaps
+  const tex = canvasToTexture(cv, { bleed: 3, alphaRef: 0.34 });
   // fissure relief exists only on the bark and wood tiles
   const nrm = heightToNormal(hcv, [
     [0, 2, 2.6], [1, 2, 1.7], [2, 2, 1.4], [0, 3, 2.9], [1, 3, 2.4],
@@ -971,6 +1069,31 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
     });
   }
 
+  // ---- crown body ---------------------------------------------------------
+  // An opaque core under the strokes. Strokes alone leave a lace: measured, the
+  // painted crown was only ~60% covered at mip 0, and once the mip chain and
+  // the alpha test had been through it the far treeline was mostly the snow
+  // BEHIND it. A conifer at 200 m is an opaque dark mass with a ragged edge —
+  // the raggedness is the strokes' job, the mass is this pass's. It is also the
+  // crown's ambient occlusion: darkest at the trunk, opening out toward the
+  // tips, which is what gives a card any sense of volume at all.
+  for (const tr of tiers) {
+    const core = tr.hw * 0.78;
+    const li = (10 + rnd() * 5) * (1 - haze) + haze * 50;   // interior is shadowed
+    g.globalAlpha = 1;
+    g.fillStyle = `hsl(${hueJ + rnd() * 12}, ${(3 + rnd() * 4) * (1 - haze * 0.8)}%, ${li}%)`;
+    g.beginPath();
+    g.moveTo(cx, tr.y - tr.drop * 0.45);
+    for (let k = -4; k <= 4; k++) {
+      const t = k / 4;
+      const wob = 0.82 + 0.30 * vnoise2(k * 2.3 + tr.y * 0.03, opt.seed || 0);
+      g.lineTo(cx + t * core * wob,
+        tr.y + tr.drop * (1.02 - t * t * 0.42) * (0.72 + 0.34 * rnd()));
+    }
+    g.closePath();
+    g.fill();
+  }
+
   // ---- needle mass --------------------------------------------------------
   for (const tr of tiers) {
     for (let j = 0; j < perTier; j++) {
@@ -980,7 +1103,11 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
       // Strokes must not share a slope or a baseline, or a whorl renders as a
       // herringbone and a stack of whorls as corrugated iron.
       const yy = tr.y + tr.drop * sd * (0.30 + 1.05 * rnd());
-      const li = (22 + rnd() * 15 + (1 - sd) * 5) * (1 - haze) + haze * 70;
+      // Radial AO: `sd` is how far out the stroke sits, so the tips catch the
+      // light and the mass toward the trunk stays in its own shadow. It used to
+      // be the other way round (+5 * (1 - sd)), which lit the interior and made
+      // the whole card read as one flat value.
+      const li = (13 + rnd() * 8 + sd * 7) * (1 - haze) + haze * 58;
       g.strokeStyle = `hsl(${hueJ + rnd() * 20}, ${(2 + rnd() * 5) * (1 - haze * 0.8)}%, ${li}%)`;
       // Opaque and wide on purpose. These cards are alpha-tested against a
       // mipmapped atlas, so as a tree shrinks the mip chain averages thin,
@@ -1007,16 +1134,16 @@ function paintConifer(g, rnd, cx, baseY, hpx, hwpx, opt) {
   // luminance — a row of white feather spikes. A snow-laden conifer still reads
   // as a DARK mass with load caught on the upper faces: target 25-45% of snow.
   for (const tr of tiers) {
-    const nRime = Math.round(perTier * (0.06 + 0.30 * snowAmt));
+    const nRime = Math.round(perTier * (0.04 + 0.20 * snowAmt));
     for (let j = 0; j < nRime; j++) {
       const sd = rnd();
       const sideS = rnd() < 0.5 ? -1 : 1;
       const w = tr.hw * Math.pow(sd, 0.5) * (0.78 + 0.28 * rnd());
       const yy = tr.y + tr.drop * sd * (0.20 + 1.0 * rnd()) - tr.drop * 0.16;
-      const li = (58 + rnd() * 16) * (1 - haze * 0.22) + haze * 16;
+      const li = (54 + rnd() * 15) * (1 - haze * 0.22) + haze * 16;
       g.strokeStyle = `hsl(${210 + rnd() * 14}, ${10 + rnd() * 12}%, ${li}%)`;
       g.lineWidth = 1.2 + rnd() * 1.9;
-      g.globalAlpha = 0.26 + 0.32 * rnd();
+      g.globalAlpha = 0.20 + 0.26 * rnd();
       g.beginPath();
       g.moveTo(cx + sideS * w * (0.08 + 0.30 * rnd()), yy - tr.drop * (0.08 + 0.42 * rnd()));
       g.lineTo(cx + sideS * w, yy);
@@ -1056,7 +1183,7 @@ function paintConiferMass(g, rnd, cx, baseY, hpx, hwpx, opt) {
     const y = top + u * hpx;
     const hw = hwpx * Math.pow(u, 0.78) * (0.78 + 0.34 * rnd());
     const drop = (hpx / T) * 1.5;
-    const li = 26 * (1 - haze) + haze * 70;
+    const li = 19 * (1 - haze) + haze * 64;
     g.globalAlpha = 1;
     g.fillStyle = `hsl(${opt.hue + rnd() * 18}, ${5 * (1 - haze * 0.8)}%, ${li}%)`;
     g.beginPath();
@@ -1117,10 +1244,10 @@ function makeSingleImpostorAtlas() {
     // step from dark green to white.
     paintConifer(g, rnd, k * CW + CW * 0.5, H - 8, H - 22, CW * c.wide, {
       tiers: c.tiers, hue: c.hue, seed: k * 5.7, taper: c.taper, droop: c.droop,
-      snow: c.snow * 0.7, dens: 1.25, gap: c.gap,
+      snow: c.snow * 0.45, dens: 1.25, gap: c.gap,
     });
   }
-  return canvasToTexture(cv, { bleed: 3 });
+  return canvasToTexture(cv, { bleed: 3, alphaRef: 0.30 });
 }
 
 /**
@@ -1149,7 +1276,9 @@ function makeClusterAtlas(cells, cardW, cardH, baseFrac, seed, haze, big) {
         z: rnd(),                                   // depth within the clump
         h: (0.42 + 0.58 * Math.pow(rnd(), 0.8)),
         sp: rnd(),
-        snow: 0.06 + 1.25 * Math.pow(rnd(), 1.35),
+        // matched to the single-tree band's load (c.snow * 0.45): a stem that
+        // crosses 210 m must not gain a coat of rime on the way
+        snow: (0.06 + 1.25 * Math.pow(rnd(), 1.35)) * 0.5,
       });
     }
     trees.sort((a, b) => b.z - a.z);                 // back to front
@@ -1168,19 +1297,21 @@ function makeClusterAtlas(cells, cardW, cardH, baseFrac, seed, haze, big) {
       else paintConifer(g, rnd, t.x, by, hm * pxy, hw * pxx, opt);
     }
     // a drift banked along the foot of the clump, so the card is bedded into
-    // snow instead of standing on a cut line
-    g.globalAlpha = 0.85;
-    for (let i = 0; i < 60; i++) {
+    // snow instead of standing on a cut line. It must stay *broken*: at 0.85
+    // alpha and 60 overlapping lobes it fused into one continuous white bar and
+    // drew a bright rule under the whole treeline.
+    g.globalAlpha = 0.5;
+    for (let i = 0; i < 42; i++) {
       const x = ox + CW * (0.04 + 0.92 * rnd());
-      const r = CW * (0.03 + 0.09 * rnd());
-      g.fillStyle = rnd() < 0.5 ? '#f6f9fe' : '#dbe4f2';
+      const r = CW * (0.025 + 0.075 * rnd());
+      g.fillStyle = rnd() < 0.5 ? '#eef3fb' : '#ccd8ea';
       g.beginPath();
       g.ellipse(x, baseY + H * 0.012, r, r * (0.22 + 0.2 * rnd()), 0, 0, 7);
       g.fill();
     }
     g.globalAlpha = 1;
   }
-  return canvasToTexture(cv, { bleed: 3 });
+  return canvasToTexture(cv, { bleed: 3, alphaRef: big ? 0.26 : 0.30 });
 }
 
 /** Orange safety netting: a diamond weave with a reinforced hem. */
@@ -1560,12 +1691,20 @@ function buildConifer(rnd, si, lod, opt = {}) {
       // Needles do not get shorter as a branch gets shorter. Without a floor
       // the short upper whorls carry sub-centimetre cards and the top of the
       // crown opens up into a bare stick.
-      const size = Math.max(w * (o.size || 1) * (0.42 + 0.42 * rnd()), 0.05 * (o.size || 1));
+      // 1/SPRIG_SCALE: the tile art now stops short of the tile border, so the
+      // quad has to be that much bigger for the *foliage* to keep its size.
+      const size = Math.max(w * (o.size || 1) * (0.42 + 0.42 * rnd()), 0.05 * (o.size || 1))
+        / SPRIG_SCALE;
       const len = size * (1.8 + 1.1 * rnd());
       const ti = snowy ? (rnd() < 0.5 ? 0 : 1)
         : (rnd() < 0.7 ? o.sprig : (o.sprig + 1 + (rnd() * 3 | 0)) & 3);
       const tile = snowy ? uvSprigSnow : (dead ? uvDeadTile : uvNeedle);
       const mu = rnd() < 0.5;                   // mirror half the cards
+      // Flipping v as well doubles the apparent variety of a repeated card, but
+      // only on bare sprigs: a loaded tile carries its snow on the +v side, and
+      // flipping that puts the load on the underside of the frond.
+      const mvR = rnd();                         // always drawn, so the
+      const mv = !snowy && mvR < 0.5;           // instance stream stays stable
       const flx = clamp((V0.y + 0.35) / H, 0, 1) * (0.30 + 0.7 * s);
       const col = snowy ? [1.0, 1.0, 1.02] : (o.shade ? CD : C);
       const j = 0.84 + 0.30 * rnd();
@@ -1577,7 +1716,7 @@ function buildConifer(rnd, si, lod, opt = {}) {
         const across = (sv - 0.5) * size * 2;
         // the far end of a card droops: no card is perfectly planar
         const sag = -size * 0.30 * su * su;
-        const uv = tile(ti, mu ? 1 - su : su, sv);
+        const uv = tile(ti, mu ? 1 - su : su, mv ? 1 - sv : sv);
         q.push(gb.v(
           px + ax * along + bx * across + ux * sag,
           py + ay * along + by * across + uy * sag,
@@ -1900,12 +2039,37 @@ function buildCard(cell, cells, width, above, below, nq) {
     // BELOW, and a stand rendered as a random mix of white and near-black
     // spikes. Each plane is therefore emitted twice with opposite winding and
     // the same upward normal, and the material is single-sided.
-    const a = gb.v(-dx * hw, -below, -dz * hw, nx * 0.30, 0.94, nz * 0.30, u0, v0, ...c, 0);
-    const b = gb.v(dx * hw, -below, dz * hw, nx * 0.30, 0.94, nz * 0.30, u1, v0, ...c, 0);
-    const d = gb.v(dx * hw, above, dz * hw, nx * 0.30, 0.94, nz * 0.30, u1, v1, ...c, 0.55);
-    const e = gb.v(-dx * hw, above, -dz * hw, nx * 0.30, 0.94, nz * 0.30, u0, v1, ...c, 0.55);
-    gb.quad(a, b, d, e);
-    gb.quad(e, d, b, a);
+    //
+    // The normal is also *cylindrical* across the card rather than constant.
+    // A crown is a body of revolution: its left flank faces left, its right
+    // flank faces right. With one shared normal every card in a stand took the
+    // same N·L and the treeline rendered as a row of identically-lit cut-outs
+    // with no modelling on them at all. Three columns of vertices sweep the
+    // normal from -axis through the plane normal to +axis, with a strong upward
+    // bias because a canopy is still lit mostly from the sky.
+    const cols = [];
+    for (let i = 0; i < 3; i++) {
+      const s = i - 1;                                  // -1, 0, +1
+      const k = Math.abs(s);
+      let ax = nx * (1 - k) + dx * s, az = nz * (1 - k) + dz * s;
+      const al = Math.hypot(ax, az) || 1;
+      ax = (ax / al) * 0.62; az = (az / al) * 0.62;
+      const ny = 0.72;
+      const nl = Math.hypot(ax, ny, az);
+      cols.push({
+        x: dx * hw * s, z: dz * hw * s, u: u0 + (u1 - u0) * (i * 0.5),
+        nx: ax / nl, ny: ny / nl, nz: az / nl,
+      });
+    }
+    for (let i = 0; i < 2; i++) {
+      const L = cols[i], R = cols[i + 1];
+      const a = gb.v(L.x, -below, L.z, L.nx, L.ny, L.nz, L.u, v0, ...c, 0);
+      const b = gb.v(R.x, -below, R.z, R.nx, R.ny, R.nz, R.u, v0, ...c, 0);
+      const d = gb.v(R.x, above, R.z, R.nx, R.ny, R.nz, R.u, v1, ...c, 0.55);
+      const e = gb.v(L.x, above, L.z, L.nx, L.ny, L.nz, L.u, v1, ...c, 0.55);
+      gb.quad(a, b, d, e);
+      gb.quad(e, d, b, a);
+    }
   }
   return gb.geo();
 }
@@ -2412,7 +2576,7 @@ export function createScatter(scene, terrain) {
    * keeps one threshold across both pools, exactly one representation of each
    * tree survives at any distance.
    */
-  function patchFoliage(mat, key) {
+  function patchFoliage(mat, key, spec = 0.04) {
     const uLod = mat.__uLod;
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = uniforms.uTime;
@@ -2483,6 +2647,25 @@ export function createScatter(scene, terrain) {
               if ( aCov < ign ) discard;
             }
           #endif
+        `)
+        // Foliage is not a polished dielectric slab.
+        //
+        // MEASURED: with the card albedo forced to pure black, roughness 1 and
+        // fog off, the 200-400 m stand still rendered at 0.62 x the luminance
+        // of the snow beside it — i.e. most of the "white ice shard" was an
+        // albedo-INDEPENDENT term. It is the F0 = 0.04 dielectric lobe: a card
+        // is a big flat quad whose shading normal points at the sky, so it
+        // collects the specular reflection of a 2000 m alpine sky across its
+        // whole area, which no volume of needles ever does. `envMapIntensity`
+        // cannot be used to fight this — three overwrites it with
+        // `scene.environmentIntensity` for scene.environment (WebGLRenderer,
+        // "material.envMap === null && scene.environment !== null"), so the
+        // only place to kill it is here.
+        .replace('#include <lights_physical_fragment>', /* glsl */`
+          #include <lights_physical_fragment>
+          material.specularColor = vec3( ${spec.toFixed(3)} );
+          material.specularColorBlended = vec3( ${spec.toFixed(3)} );
+          material.specularF90 = ${spec > 0 ? '1.0' : '0.0'};
         `);
     };
     mat.customProgramCacheKey = () => key;
@@ -2522,10 +2705,10 @@ export function createScatter(scene, terrain) {
   }
 
   /** A foliage material bound to one LOD band. Same program, own uniforms. */
-  function bandMat(proto, band, key) {
+  function bandMat(proto, band, key, spec) {
     const m = proto.clone();
     m.__uLod = { value: new THREE.Vector4(band[0], band[1], band[2], band[3]) };
-    return patchFoliage(m, key);
+    return patchFoliage(m, key, spec);
   }
 
   const treeAtlas = makeTreeAtlas();
@@ -2533,8 +2716,11 @@ export function createScatter(scene, terrain) {
   const impTex = makeSingleImpostorAtlas();
   // dense -> sparse cells; the density model picks the cell, which is what
   // turns the treeline into tongues and glades instead of an even soft fade
-  const clTex = makeClusterAtlas([17, 13, 8, 4], CL_W, CL_H, CL_SINK / CL_H, 0xc1a5, 0.06, false);
-  const massTex = makeClusterAtlas([62, 50, 30, 13], MASS_W, MASS_H, MASS_SINK / MASS_H, 0x9a55, 0.30, true);
+  // The baked `haze` is now token: sky.js runs a real per-channel aerial
+  // perspective over these bands, so painting the wash into the atlas as well
+  // double counted it, and was a large part of why the far stands read pale.
+  const clTex = makeClusterAtlas([25, 18, 11, 5], CL_W, CL_H, CL_SINK / CL_H, 0xc1a5, 0.02, false);
+  const massTex = makeClusterAtlas([86, 66, 40, 18], MASS_W, MASS_H, MASS_SINK / MASS_H, 0x9a55, 0.10, true);
   const netTex = makeNetTexture();
 
   // alphaTest is only the *centre* of the stochastic coverage band now (see
@@ -2558,10 +2744,13 @@ export function createScatter(scene, terrain) {
     map: impTex, alphaTest: 0.30, side: THREE.FrontSide, vertexColors: true,
     roughness: 0.9, metalness: 0.0,
   });
-  const matImp = bandMat(protoImp, B_IMP, 'sc-fol');
-  const matCl = bandMat(protoImp, B_CL, 'sc-fol');
+  // spec 0: see the note in patchFoliage. A card is a flat quad standing in
+  // for a volume of needles; the dielectric lobe it would otherwise collect off
+  // the sky is the single largest term in the far treeline's brightness.
+  const matImp = bandMat(protoImp, B_IMP, 'sc-card', 0);
+  const matCl = bandMat(protoImp, B_CL, 'sc-card', 0);
   matCl.map = clTex;
-  const matMass = bandMat(protoImp, B_MASS, 'sc-fol');
+  const matMass = bandMat(protoImp, B_MASS, 'sc-card', 0);
   matMass.map = massTex;
   matMass.alphaTest = 0.26;
 
