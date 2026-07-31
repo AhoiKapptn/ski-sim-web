@@ -111,6 +111,8 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 | Corduroy reads as cross-hatch | Two crossing frequencies | Aliasing of a *single* 7.2 cm comb at 3.6 px/period beating against the pixel grid |
 | Ski tracks as black stripes | Wrong colour | Stock `MeshStandardMaterial` next to a piste using the full snow shader |
 | Conifers as bare poles with floating cards | Foliage generation | LOD1 band starts at 34 m but carried only ~9% of LOD0's foliage |
+| Trees flicker | LOD churn, ring rebuild, mip/alpha-test coverage, billboard flipping — all four eliminated by measurement | **The TAA resolve.** Freeze the sim completely (no wind, no dither, no camera) and accumulate per-pixel temporal SD over the crowns: **6.95 codes shipped, 0.013 with TAA off.** The render was exactly static; the resolve was not. Raising feedback alone fixes a third of it, because the variance box that clips the history is itself built from the jittered current frame |
+| Park kickers read as bumps and launch you late | Two separate defects | **One defect.** The takeoff ramp peaked at **+7.7°** where a park kicker is 25–35°. Too shallow to read as built *and* too shallow to unload the skis — the rider separated 5.3 m past the lip. Raising the ramp fixed both |
 
 ## Interface hazards
 
@@ -126,6 +128,22 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 - `sky.js` patches global `THREE.ShaderChunk`s (fog, `lights_fragment_begin`,
   `shadowmap_pars_fragment`, `aomap_fragment`). If a three upgrade changes those
   chunks, the patches log a warning and fall back rather than failing loudly.
+- **`terrain.depthMaterial` renders nothing in an override pass** — the shadow map
+  leaves it `BackSide`. A depth readback that forgets this returns an empty buffer,
+  not an error.
+- **three's `packDepthToRGBA` is R-major, not A-major.** Unpacking it backwards
+  yields a plausible-looking answer that is ~35 m wrong.
+- **`snData.w` (`expo`) is a shared channel.** `snow-material.js` uses it for
+  `talus -= expo*0.28`, and `terrain.js` now drives it to 5.0 over the snow park to
+  hold the rock mask off 45–50° kicker flanks. A second consumer added without
+  checking will find the park saturating it.
+- **`renderer.info` is reset at the top of every `renderer.render()`.** The post
+  chain calls that a dozen times a frame, so per-frame counters need
+  `autoReset = false` — see trap 6.
+- Instrumentation hook: `window.__harness?.perf?.mark(label, n)` is a no-op unless
+  recording. Tag ring wraps, chunk re-emits and trench commits with it; then
+  `report().marks` contrasts the frame-time tail on marked frames against unmarked
+  ones. That is how a periodic hitch gets attributed without quoting an fps number.
 
 ## Quality baseline — do not regress these
 
