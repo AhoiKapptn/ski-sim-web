@@ -4,6 +4,16 @@
  *   node tools/shoot.mjs --out shots/myrun            # all shots
  *   node tools/shoot.mjs --out shots/x --only hero,ridge
  *   node tools/shoot.mjs --out shots/x --w 1920 --h 1080 --perf
+ *   node tools/shoot.mjs --out shots/x --dpr 2       # the density the user plays at
+ *
+ * --dpr is the backbuffer density. It defaults to 1 so every stored baseline in
+ * shots/ stays comparable, but 1 is NOT what the user sees: `engine.js` does
+ * `setPixelRatio(min(devicePixelRatio, 2))`, so a Retina machine renders
+ * 3200x1800 = 5.76 Mpx where this tool has always rendered 1600x900 = 1.44 Mpx,
+ * and postfx sizes every render target from `renderer.getDrawingBufferSize()`.
+ * The whole post chain is therefore 4x larger in the configuration that was
+ * never once measured here. The value is written into report.json so a shot can
+ * never be silently compared against one taken at a different density.
  *
  * Spawns its own Vite dev server + headless Chrome, so nothing needs to be
  * running beforehand. Exits non-zero on console errors, WebGL context loss, or
@@ -24,6 +34,7 @@ const flag = (k) => argv.includes('--' + k);
 
 const OUT = path.resolve(ROOT, arg('out', 'shots/latest'));
 const W = +arg('w', 1600), H = +arg('h', 900);
+const DPR = +arg('dpr', 1);
 const ONLY = arg('only', '')?.split(',').filter(Boolean);
 const PERF = flag('perf');
 
@@ -68,7 +79,7 @@ const browser = await puppeteer.launch({
 });
 
 const page = await browser.newPage();
-await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
+await page.setViewport({ width: W, height: H, deviceScaleFactor: DPR });
 
 const errors = [];
 page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
@@ -82,7 +93,7 @@ page.on('requestfailed', (r) => { if (!ignorable(r.url())) errors.push('requestf
 await fs.mkdir(OUT, { recursive: true });
 
 let exitCode = 0;
-const report = { url, viewport: [W, H], shots: [], errors, perf: null };
+const report = { url, viewport: [W, H], dpr: DPR, drawingBuffer: null, shots: [], errors, perf: null };
 
 try {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -95,6 +106,16 @@ try {
     return e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'unknown';
   });
   report.gpu = gpu;
+
+  // The real backbuffer, read from the canvas rather than assumed from --dpr:
+  // engine.js clamps at min(devicePixelRatio, 2) and honours ?rscale, so the
+  // requested density and the rendered one are not always the same number.
+  report.drawingBuffer = await page.evaluate(() => {
+    const c = window.__harness.debug.renderer.domElement;
+    return [c.width, c.height];
+  });
+  const mpx = (report.drawingBuffer[0] * report.drawingBuffer[1]) / 1e6;
+  console.log(`   ${W}x${H} @ dpr ${DPR} → backbuffer ${report.drawingBuffer.join('x')} (${mpx.toFixed(2)} Mpx)`);
 
   const names = ONLY.length ? ONLY : Object.keys(SHOTS);
   for (const name of names) {
@@ -126,8 +147,9 @@ try {
     await page.evaluate(() => { window.__harness.frames = 0; window.__setAuto?.(true); });
     await new Promise((r) => setTimeout(r, 4000));
     const frames = await page.evaluate(() => window.__harness.frames);
-    report.perf = { fps: +(frames / 4).toFixed(1) };
-    console.log(`⏱  ${report.perf.fps} fps @ ${W}x${H}`);
+    report.perf = { fps: +(frames / 4).toFixed(1), dpr: DPR, drawingBuffer: report.drawingBuffer };
+    console.log(`⏱  ${report.perf.fps} fps @ ${report.drawingBuffer.join('x')} (dpr ${DPR}) — `
+      + 'vsync-quantised, player nearly stationary. See README "Measuring frame cost".');
   }
 } catch (e) {
   errors.push('harness: ' + (e?.message ?? String(e)));
