@@ -18,9 +18,12 @@
  * and writes the branding atlas out as `atlas.png` so the procedurally
  * composited panels can be A/B'd against the original artwork.
  *
- * Exits non-zero on console errors, a blank frame, or if the real PNGs did not
- * load (a screenshot of the fallback letterforms must never be mistaken for a
- * screenshot of the brand).
+ * Exits non-zero on console errors, a blank frame, if the real PNGs did not load
+ * (a screenshot of the fallback letterforms must never be mistaken for a
+ * screenshot of the brand), or if the module was renderable BEFORE its artwork
+ * was composited — which is the same failure one step earlier, and the only
+ * thing standing between a future main.js and a whole directory of shots that
+ * quietly contain the stand-in letterforms.
  */
 import { createServer } from 'vite';
 import puppeteer from 'puppeteer';
@@ -67,7 +70,11 @@ const url = `http://127.0.0.1:${server.httpServer.address().port}/`;
 
 const browser = await puppeteer.launch({
   headless: true,
-  protocolTimeout: 180000,
+  // 300 s, not 180: at --dpr 2 the drawing buffer is 3200x1800 and
+  // Page.captureScreenshot on this ANGLE/Metal path took longer than 180 s to
+  // return, so every DPR-2 run died in the harness rather than in the render.
+  // The DPR-2 shots are the only ones where the print resolves, so this matters.
+  protocolTimeout: 300000,
   args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist',
     '--enable-unsafe-swiftshader', '--no-sandbox', '--force-color-profile=srgb'],
 });
@@ -104,10 +111,15 @@ try {
       const b = m.createBranding(h.debug.scene, h.debug.terrain, noseam ? null : h.debug.scatter);
       h.debug.branding = b;              // as main.js will expose it
       window.__brand = b;
+      // The module must NOT be renderable before its artwork is composited, or a
+      // capture can silently contain the fallback letterforms. Asserted here so
+      // the guarantee is enforced by the tool and not just by the comment.
+      const hiddenBeforeReady = b.group.visible === false;
       await b.ready;
       h.debug.renderer.info.autoReset = false;
       return {
         loaded: b.loaded, tris: b.debug.tris,
+        gate: { hiddenBeforeReady, visibleAfterReady: b.group.visible === true },
         centreline: b.debug.centrelineCheck(),
         items: b.debug.items,
         // the ambient the panels are actually lit by, so the standalone estimate
@@ -119,12 +131,26 @@ try {
       };
     }, NOSEAM);
     report.branding = info;
-    console.log(`   branding: ${info.loaded}, ${info.tris} tris, `
-      + `centreline via ${info.centreline.source} worst ${info.centreline.worstErrM.toFixed(3)} m `
-      + `(recovered LIFT_OFFSET ${info.centreline.liftOffset?.toFixed(2)})`);
+    const cl = info.centreline;
+    console.log(`   branding: ${info.loaded}, ${info.tris} tris, ${info.items.length} objects`);
+    // --noseam withholds scatter, which makes `centre` the formula itself, so the
+    // check compares the formula against the formula. It used to print
+    // "worst 0.000 m" for that, which reads as a passing validation and is not
+    // one. Say so instead.
+    console.log(cl.validates
+      ? `   centreline: reconstructed from the scatter seam, agrees with the documented`
+        + ` formula to ${cl.worstErrM.toFixed(4)} m (worst at z ${cl.atZ}; recovered`
+        + ` LIFT_OFFSET ${cl.liftOffset?.toFixed(2)})`
+      : `   centreline: FORMULA FALLBACK — scatter was withheld, so there is nothing to`
+        + ` compare against and this run validates no seam`);
     console.log(`   ambient: bounce ${info.radiance.bounce.join('/')}  sky ${info.radiance.sky.join('/')}`);
+    console.log(`   ready gate: hidden before ready ${info.gate.hiddenBeforeReady}, `
+      + `visible after ${info.gate.visibleAfterReady}`);
     const want = FALLBACK ? 'failed' : 'assets';
     if (info.loaded !== want) errors.push(`branding load state ${info.loaded}, expected ${want}`);
+    if (!info.gate.hiddenBeforeReady) errors.push('branding was renderable before ready resolved — '
+      + 'a capture can silently contain the fallback letterforms');
+    if (!info.gate.visibleAfterReady) errors.push('branding never became visible after ready resolved');
 
     // atlas out, so the composited panels can be looked at directly
     const png = await page.evaluate(() => window.__brand.debug.canvas.toDataURL('image/png'));
@@ -132,8 +158,6 @@ try {
 
     for (const it of info.items) {
       const nm = `${it.kind}-z${Math.round(it.z)}`;
-      // stand the player 21 m uphill of the object and a third of the way in
-      // toward the centreline, i.e. roughly where they would really ski past it
       // Stand the player where they would really ski past it: on the corridor,
       // two thirds of the way out toward the object's own offset, ~23 m above it.
       // Two traps here, both of which produced framings with the subject off
@@ -202,7 +226,18 @@ try {
         stats = await page.evaluate((it) => {
           const cam = window.__harness.debug.camera;
           const cy = it.y - it.h * 0.45;
-          cam.position.set(it.x + it.nx * 4.5, cy + 0.35, it.z + it.nz * 4.5);
+          const camX = it.x + it.nx * 4.5, camZ = it.z + it.nz * 4.5;
+          // The eye height has to be measured off the ground UNDER THE CAMERA,
+          // not off the object's. Every panel here faces uphill, so the camera
+          // stands 4.5 m up the fall line where the snow is ~1 m higher, and
+          // `cy + 0.35` therefore buried the eye a metre INSIDE the slope: all
+          // three -face shots came back with a corduroy wall across the
+          // foreground and a view through the terrain's back faces. This is the
+          // one framing whose whole purpose is judging the artwork, so it has to
+          // be the one framing that is not compromised.
+          const y = Math.max(cy + 0.35,
+            window.__harness.debug.terrain.height(camX, camZ) + 1.6);
+          cam.position.set(camX, y, camZ);
           cam.lookAt(it.x, cy, it.z);
           cam.updateMatrixWorld();
           return window.__harness.stats();   // presents WITHOUT running update()
