@@ -36,7 +36,7 @@ ffmpeg -y -i shots/x/hero.png -vf "crop=340:360:1180:110,scale=1020:1080:flags=n
 ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=lavfi.signalstats.YAVG" -f null -
 ```
 
-## Measurement traps — all four produced confident, wrong answers
+## Measurement traps — all seven produced confident, wrong answers
 
 1. **`--perf` absolute numbers are meaningless.** Headless Chrome mode-locks to
    divisions of the refresh rate by machine load. The *same unmodified build* has
@@ -56,6 +56,39 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
    it had done nothing. Verify a rock crop contains rock. Also beware difference
    masks: white cards differed from the snow behind them by ~6 levels and dropped
    out of their own measurement.
+5. **You have never measured the resolution the game is played at.** `engine.js`
+   uses `min(devicePixelRatio, 2)`; headless Chrome reports DPR **1** and
+   `shoot.mjs` pinned `deviceScaleFactor: 1`, so every measurement in this
+   project's history rendered 1600×900 = **1.44 Mpx**. A Retina machine renders
+   3200×1800 = **5.76 Mpx — 4× the fragment work** — and every postfx target is
+   sized from `getDrawingBufferSize()`, so the whole post chain scales with it.
+   Measured: **~5.1 ms per megapixel** plus a ~18.5 ms resolution-independent
+   floor. Use `shoot.mjs --dpr 2` / `perf-ab.mjs --dpr 2`; `report.json` now
+   records `dpr` and the real `drawingBuffer`. Never compare shots across
+   densities.
+6. **`renderer.info.render.calls` reads `1` unless you force `autoReset = false`.**
+   three resets `info` at the top of *every* `renderer.render()`, and the post
+   chain makes a dozen per frame, so the naive read reports the last fullscreen
+   quad. True figure is **527 draw calls/frame**. Anyone who profiles draw calls
+   without knowing this concludes the scene is trivially cheap.
+7. **The GPU timer's absolute value is ~2.5× reality.**
+   `EXT_disjoint_timer_query_webgl2` works on this ANGLE/Metal path, but ANGLE
+   derives it from command-buffer timestamps that include queue and scheduling
+   gaps — it reads above the presented frame interval, which is impossible for
+   real GPU busy time. Narrowing the query to bracket only the render span does
+   not fix it. It is a sensitive *relative* metric: read ratios between the two
+   arms of one A/B, never levels.
+
+`--perf` is a **stationary player at DPR 1**. It is structurally blind to
+motion-dependent cost and to fragment cost. Use `tools/frametime.mjs` (what is
+spiking — p50/p95/p99/max with per-frame attribution) and `tools/perf-ab.mjs`
+(is A faster than B — interleaved ABBA inside one session, per-pair deltas,
+min-of-N, sign test). Both drive a **carving** path by default, because a
+straight coast does not load the spray, trench or g-force systems.
+
+Frame spikes are a **tail** statistic. The vsync mode-lock in trap 1 corrupts
+means, not tails: a 40 ms frame is 40 ms whichever mode the compositor holds.
+Quote p99 and count-over-20 ms, never fps.
 
 ## Never use `git stash`
 
