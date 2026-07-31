@@ -81,6 +81,8 @@ const EDGE_RATE_SET = 2.30;   // rad/s, edge-roll ceiling from flat
 const EDGE_SET_FADE = 0.62;   // ...falling to (1-FADE) of that at full lock
 const EDGE_SET_P = 1.3;       // ...with this shape
 const EDGE_RATE_REL = 4.20;   // rad/s, releasing an edge (standing up is easy)
+const POP_FLAT = 1.30;      // m/s, pop on the flat: an unweight, ~8 cm
+const POP_LIP = 3.20;       // m/s, extra, and only what the terrain earns you
 const AIR_YAW = 2.0;        // rad/s, in-air rotation authority
 const LEG_TRAVEL = 0.45;    // m of leg extension before the skis really leave the snow
 const AIR_REPORT = 0.07;    // s of real flight before `airborne` is published
@@ -328,8 +330,6 @@ export class SkiPhysics {
     // History: this used to be `pending = 3.2 + 4.3 * preload` — a 7.5 m/s launch
     // out of nothing — and it was bound to W as well as Space, so *letting go of
     // the forward key* threw the rider 3.7 m into the air. Never again.
-    const POP_FLAT = 1.30;      // m/s, standing on the flat: an unweight
-    const POP_LIP = 3.20;       // m/s, extra, and only what the terrain earns you
     let popImpulse = 0;
     this.jumpBuf = Math.max(0, this.jumpBuf - dt);
     if (jump) {
@@ -358,19 +358,34 @@ export class SkiPhysics {
       }
     }
 
-    // --- rebound: unloading a loaded turn throws you up ------------------------
+    // --- rebound: unloading a loaded turn extends the LEGS ---------------------
+    // Cross-over rebound is real, and the old code modelled it as a launch: a
+    // straight-to-the-sky impulse whenever a >1.45 g edge was released quickly.
+    // Measured, that put the rider airborne for 12.6% of a 2 s-period linked-carve
+    // run — i.e. "let go of the turn key and jump", the same defect as the old W
+    // binding wearing a physics costume.
+    //
+    // It is fixed by putting the energy where it actually goes. A decambering ski
+    // pushes the rider's mass UP THROUGH THE LEGS; whether that takes the skis off
+    // the snow is not the rebound's decision, it is the suspension's — exactly the
+    // question `gap > LEG_TRAVEL` already answers for terrain. So the rebound only
+    // seeds the free-flight path of the centre of mass (see the suspension block
+    // below) and the existing model decides the rest.
+    //
+    // That makes the guarantee arithmetic rather than a threshold to tune:
+    // separation needs sqrt(2*G*LEG_TRAVEL) = 3.15 m/s, and REBOUND_MAX is 1.8, so
+    // a rebound on even ground CANNOT put the rider in the air — the most it can
+    // do is extend the legs by v^2/2G = 15 cm, a third of their travel, which is
+    // what a rebound looks like. Over a roll, where the snow is already dropping
+    // away and the legs are part-extended, that same 1.8 m/s is enough to tip it
+    // past the travel limit and you fly. Which is when a rebound really does.
+    const REBOUND_MAX = 1.8;   // m/s; < sqrt(2*G*LEG_TRAVEL) = 3.15 by construction
+    let reboundV = 0;
     this.reboundCd = Math.max(0, this.reboundCd - dt);
-    // Real, but it is the *rarest* way to get air, not the default one. The
-    // thresholds are set from measurement: through 40 s of linked carving the
-    // release rate now peaks around -3.0 rad/s and the load at release around
-    // 1.9 g, so requiring BOTH a snapped release and a genuinely over-2 g edge
-    // keeps this out of ordinary turns entirely. Capped at 0.85 m/s — 3 cm and
-    // 0.15 s — because a cross-over unweights the skis, it does not launch them.
-    // (Measured before: 12.6% of a 2 s-period linked run was spent airborne.)
     if (this.grounded && !this.jumpHeld && this.reboundCd === 0 &&
-        dPhi < -3.0 && loadPrev > 2.05 && brake < 0.5) {
-      popImpulse += Math.min(0.85, (loadPrev - 1.95) * 1.1);
-      this.reboundCd = 0.70;
+        dPhi < -2.8 && loadPrev > 1.60 && brake < 0.5) {
+      reboundV = Math.min(REBOUND_MAX, (loadPrev - 1.5) * 1.3);
+      this.reboundCd = 0.50;
       this.nRebound++;
     }
 
@@ -511,6 +526,16 @@ export class SkiPhysics {
         this.yFree += this.vFree * dt;
         this.gap = this.yFree - ghNew;
         if (this.gap <= 0) { this.yFree = ghNew; this.vFree = vSurf; this.gap = 0; }
+      }
+      // Rebound enters here and nowhere else: it is a push through the legs, so it
+      // accelerates the centre of mass along the same free path the terrain uses.
+      // On even ground the legs swallow it (see REBOUND_MAX); where the snow is
+      // already dropping away it can carry the gap past LEG_TRAVEL and the rider
+      // genuinely comes off the roll.
+      if (reboundV > 0) {
+        if (this.gap <= 0) { this.yFree = ghNew; this.vFree = vSurf; }
+        this.vFree += reboundV;
+        this.gap = Math.max(this.gap, 1e-4);
       }
       // How hard the snow is pushing UP into the rider — the other half of the
       // suspension, and what makes a compression feel heavy.
