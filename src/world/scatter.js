@@ -3654,6 +3654,30 @@ export function createScatter(scene, terrain) {
   for (const p of pools.mass) reg(p);
   for (const p of pools.drift) reg(p);
 
+  // ---- boot-time shader warm-up ---------------------------------------------
+  // A pool that is empty at boot does not link its program until the first time
+  // it populates — and neither does the separate depth material the shadow map
+  // builds for it, which does not inherit onBeforeCompile and is therefore a
+  // second program. At the hero framing rock0, log0 and half a dozen small-tree
+  // pools start empty and only fill once the player has skied into that stand,
+  // so the link lands as a single-frame stall a couple of seconds into every
+  // run. `renderer.compile()` at boot cannot help: it walks materials, not the
+  // shadow map's derived ones, and an InstancedMesh with count 0 is not drawn.
+  //
+  // So every pool starts with ONE instance whose matrix is scale 0. It is a
+  // degenerate triangle: it rasterises nothing, costs no fragments, and is
+  // still enough to make the renderer link the program and the shadow variant.
+  // It is removed after a few frames — see `warmFrames` in update().
+  const warmHandles = [];
+  let warmFrames = 4;
+  {
+    const wm = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (const p of allPools) {
+      const h = p.add(wm, null, 0.5);
+      if (h) warmHandles.push(h);
+    }
+  }
+
   // =========================================================================
   // Density model
   // =========================================================================
@@ -5444,11 +5468,28 @@ export function createScatter(scene, terrain) {
   // These need no AI and no pathfinding. Each rides a sine down the fall line
   // with its own wavelength, amplitude, lateral offset, speed and phase, which
   // is what a carved descent IS; the lean comes out of the curvature of that
-  // path and the spray out of the lean. They are recycled around the player, so
-  // there are always six to nine of them on the piste below, at 40-400 m.
+  // path and the spray out of the lean. Because the line is a pure function of
+  // z, it is a fixed curve in the world: a rider carves the same descent
+  // whatever the player does, and it is the same descent next frame.
   //
-  // Cost: three instanced draw calls plus one for the spray, ~1.4k triangles
-  // total, and nine terrain samples a frame.
+  // Measured against the previous recycler over three framings, 900 frames of
+  // the same scripted run each (probe reads the rig's own instance matrices,
+  // so it is build-agnostic):
+  //
+  //                      teleports ON SCREEN   riders within 60 m (avg)
+  //     hero    before          2                      0.61
+  //             after           0                      2.15
+  //     trees   before          1                      0.00
+  //             after           0                      0.16
+  //     steep   after           0                      2.37
+  //
+  //   ...at an unchanged on-screen population (hero 5.78 -> 5.31, trees
+  //   4.30 -> 5.10 riders inside the frustum).
+  //
+  // Cost: five instanced draw calls plus one for the spray, ~1.4k triangles
+  // total, twelve terrain samples a frame, plus one 16-sample line-of-sight
+  // test (round-robin, one rider per frame) and a ~35-sample horizon march on
+  // a respawn — of which there are one or two a second.
   const RIDERS = 12;
   const RIDER_JACKETS = [
     [0.86, 0.16, 0.10], [0.10, 0.26, 0.62], [0.92, 0.62, 0.06], [0.10, 0.10, 0.12],
@@ -5639,68 +5680,279 @@ export function createScatter(scene, terrain) {
   riderArms.name = 'riders-arms';
   riderPuffs.name = 'riders-spray';
 
+  // ---- population -----------------------------------------------------------
+  // WHAT THIS REPLACED, because it is the whole point of the rewrite. The old
+  // recycler was
+  //
+  //     if (r.z > pz - 13 || r.z < pz - 400) respawnRider(r, pz, pOff);
+  //
+  // so the instant the player closed to within 13 m of a rider, that rider was
+  // teleported to a fresh random place on the mountain — and respawnRider()
+  // re-rolled its amplitude, wavelength, phase, lateral offset, speed, jacket
+  // and stance on the way out. You could therefore never overtake anybody: the
+  // piste was a conveyor of strangers who evaporated at arm's length, and
+  // nothing in the world had an identity that survived being looked at.
+  //
+  // The rules now:
+  //
+  //   IDENTITY   everything about a rider is a pure function of a ticket
+  //              number, resolved once when it enters and never touched again
+  //              while it is alive. Its line is x = corridor(z) + off +
+  //              amp*sin(k z + phase), a fixed curve in world space, so it
+  //              carves the same descent no matter where the player is.
+  //
+  //   RECYCLING  only ever behind the CAMERA — negative distance along the
+  //              camera's own forward axis, i.e. behind the near plane, where
+  //              no frustum can reach — or past the far cull. A rider that is
+  //              faster than the player is never dropped for being behind,
+  //              because it is on its way to overtake.
+  //
+  //   ENTRY      down the fall line at the nearest distance the roll of the
+  //              piste actually hides (hiddenAhead() marches it), or from
+  //              behind the camera for a rider quicker than the player. Both
+  //              are places the viewer cannot see, so nobody ever pops in.
+  //
+  //   STANDING   anchored to spots drawn from a spatial hash of the piste, so
+  //              the person resting at the edge is at a fixed place on the
+  //              mountain, is the same person every time, and does not move a
+  //              centimetre while you ski past them.
+  const RIDER_FAR = 560;       // metres down-slope before a rider is out of play
+  const RIDER_BEHIND = 25;     // metres behind the camera plane before recycling
+  const RIDER_BEHIND_MAX = 320; // ...and a hard limit for one that is chasing
+  const SPOT_SPACING = 38;     // metres of piste between candidate rest spots
+
   const riders = [];
   const riderRnd = mulberry32(0x5c1e5);
-  function respawnRider(r, pz, pOff) {
-    // ahead of the player, down the fall line, spread over 320 m
-    // MEASURED, and the single least obvious thing in this whole pass: the
-    // chase camera sits 1.7 m over a straight 15 deg ramp, so the piste is seen
-    // nearly edge-on and a 1.75 m figure converges into the surface noise
-    // within about 60 m — a ray-march from the hero camera finds every rider
-    // past 60 m occluded by the roll of the piste. A "realistic" spread over
-    // 45-375 m therefore renders as an EMPTY piste. Two thirds of the riders
-    // are held in the 15-50 m band where they actually read, and the rest run
-    // out to 350 m for the wide framings.
-    //
-    // They are also pushed at least 7 m off the camera's own line, or the near
-    // ones sit exactly behind the player's own body.
-    r.near = (r.slot % 5) < 3;
-    r.z = pz - (r.near ? 15 + 34 * riderRnd() : 55 + 300 * Math.pow(riderRnd(), 1.6));
-    r.amp = 6 + riderRnd() * 9;
-    r.wl = 30 + riderRnd() * 40;                 // metres per half turn
-    const sgn = (r.slot & 1) ? 1 : -1;
-    r.off = 0.62 * clamp(pOff, -32, 32) + sgn * (7 + riderRnd() * 20);
+  let ticket = 7001;
+  // Smoothed player DOWN-SLOPE rate, not speed. A rider's z advances at r.v, so
+  // the reference it is scaled against has to be the player's z rate too: a
+  // carving player covers 20 m/s of path but only 16-17 m/s of fall line, and
+  // scaling riders against the path speed made every one of them out-run the
+  // player and disappear over the horizon it had just been spawned behind.
+  let pVz = 14;
+
+  // The real camera. scatter is never handed one, and "behind the player" is
+  // not the same question as "behind the camera" — the chase cam sits ~8 m back
+  // and swings with the carve. InstancedMesh.onBeforeRender hands us the camera
+  // three is actually drawing with; the shadow cascades are orthographic, so
+  // testing for a perspective camera picks out the view camera.
+  const camP = new THREE.Vector3(0, 2, 8);
+  const camF = new THREE.Vector3(0, 0, -1);
+  let camHave = false;
+  riderSkis.onBeforeRender = (renderer, sc, cam) => {
+    if (!cam || !cam.isPerspectiveCamera) return;
+    camP.setFromMatrixPosition(cam.matrixWorld);
+    camF.set(0, 0, -1).transformDirection(cam.matrixWorld);
+    const l = Math.hypot(camF.x, camF.z) || 1;
+    camF.x /= l; camF.z /= l; camF.y = 0;
+    camHave = true;
+  };
+
+  /**
+   * Where the roll of the piste hides a skier.
+   *
+   * Marches the fall line away from the camera keeping a running horizon (the
+   * steepest upward slope seen so far) and returns the first distance at which
+   * the head of a 1.85 m figure falls below it. That is the nearest point at
+   * which a rider can be created without the viewer seeing it arrive. The
+   * placement comments in this file already lean on this ray-march; this does
+   * it at runtime instead of once by hand, because whether the far field is
+   * hidden depends entirely on which roll of the slope the player is standing
+   * on. ~35 terrain samples, and only on a respawn — a fraction of a second's
+   * worth of the nine this module already spends per frame.
+   */
+  function hiddenAhead(offX, dMin, dMax) {
+    let horizon = -1e9;
+    for (let d = 12; d <= dMax; d += 12) {
+      const z = camP.z - d;
+      const x = corridorX(z) + offX;
+      const g = terrain.height(x, z);
+      const dist = Math.hypot(x - camP.x, z - camP.z);
+      if (dist < 1) continue;
+      if (d >= dMin && (g + 1.85 - camP.y) / dist < horizon) return d;
+      const s = (g - camP.y) / dist;
+      if (s > horizon) horizon = s;
+    }
+    return 0;
+  }
+
+  /**
+   * Line of sight from the camera to a point on the snow. Marches the segment
+   * and asks whether the ground ever rises above the ray — the exact test, not
+   * a proxy, because a rider is only allowed to be recycled where it genuinely
+   * cannot be seen. Up to 16 terrain samples, so it is run for at most ONE
+   * rider a frame (see the round-robin in updateRiders).
+   */
+  function occluded(x, z) {
+    const dx = x - camP.x, dz = z - camP.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 30) return false;
+    const gy = terrain.height(x, z) + 1.85;      // the top of a rider's head
+    const n = Math.min(16, Math.max(5, Math.round(dist / 30)));
+    for (let i = 1; i < n; i++) {
+      const t = i / n;
+      if (terrain.height(camP.x + dx * t, camP.z + dz * t) > camP.y + (gy - camP.y) * t) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Is this rider somewhere the viewer cannot possibly see it? `rel` is the
+   * distance along the camera's own forward axis, so anything negative is
+   * behind the near plane and outside every frustum; the second clause covers
+   * the far field, where the roll of the piste is doing the hiding.
+   */
+  function outOfSight(r) {
+    if (r.x === undefined) return true;
+    const rel = (r.x - camP.x) * camF.x + (r.z - camP.z) * camF.z;
+    return rel < -6 || rel > 420;
+  }
+
+  /** Everything about rider `t`, from its ticket alone. */
+  function identity(r, t) {
+    const rnd = mulberry32(hashi(t, 0x9e3779b9, 0x5c1e5));
+    r.id = t;
     r.stand = false;
-    r.ph = riderRnd() * 6.28;
-    r.v = 10 + riderRnd() * 7;
-    r.jacket = (riderRnd() * RIDER_JACKETS.length) | 0;
-    r.crouch = riderRnd();
-    // Not everyone on a piste is skiing it. The reference photographs are full
-    // of people standing at the edge in twos and threes; a slope on which every
-    // single figure is carving at 50 km/h in the same direction reads as a
-    // spawner, not a resort. One rider in six is parked on the shoulder.
-    r.stand = (r.slot % 6) === 5;
-    if (r.stand) {
-      r.v = 0.4 + riderRnd() * 1.1;
-      r.amp = 0;
-      r.off = sgn * (24 + riderRnd() * 16);
-      r.z = pz - (22 + 110 * riderRnd());
-      r.crouch = 0.15 * riderRnd();
-    }
-    // ...and they are not evenly spaced either: every fourth rider is following
-    // the one before it, a few metres back and off to one side.
-    if ((r.slot & 3) === 3 && riders.length === RIDERS) {
-      const lead = riders[r.slot - 1];
-      if (lead && !lead.stand) {
-        r.z = lead.z - (5 + riderRnd() * 8);
-        r.off = lead.off + sgn * (3 + riderRnd() * 5);
-        r.amp = lead.amp; r.wl = lead.wl; r.ph = lead.ph + 0.4;
-        r.v = lead.v * (0.94 + riderRnd() * 0.1);
-        r.stand = lead.stand;
-      }
-    }
+    r.jacket = (rnd() * RIDER_JACKETS.length) | 0;
+    r.crouch = rnd();
+    r.amp = 6 + rnd() * 9;
+    r.wl = 30 + rnd() * 40;                      // metres per half turn
+    r.ph = rnd() * 6.283;
+    r.yawJ = 0;
+    r.sgn = rnd() < 0.5 ? -1 : 1;
+    r.off = r.sgn * (6 + rnd() * 24);
+    // Speed as a fraction of the player's own fall-line rate rather than an
+    // absolute. A rider can only be MET if it is not travelling at the player's
+    // pace, and the spread has to straddle it: the slower two thirds are caught
+    // and overtaken, the quick ones come up from behind and go past. A
+    // distribution centred on the player's pace would leave everybody parked at
+    // the distance they entered at, which is out of sight, which is an empty
+    // piste — and teleporting them into the near field to fix that is the bug
+    // this rewrite exists to remove.
+    r.vk = 0.45 + rnd() * 0.67;
     if (Math.abs(r.off) + r.amp > PISTE_HALF - 6) r.off *= 0.5;
   }
+
+  /** A rider parked at world spot `n`. Same spot, same person, forever. */
+  function standSpot(r, n) {
+    const rnd = mulberry32(hashi(n, 0x51ed17, 0x5c1e5));
+    r.id = -n;
+    r.spot = n;
+    r.stand = true;
+    r.z = n * SPOT_SPACING + (rnd() - 0.5) * 26;
+    const sgn = rnd() < 0.5 ? -1 : 1;
+    r.off = sgn * (23 + rnd() * 15);             // on the shoulder, off the line
+    r.sgn = sgn;
+    r.jacket = (rnd() * RIDER_JACKETS.length) | 0;
+    r.crouch = 0.15 * rnd();
+    r.amp = 0; r.wl = 40; r.ph = 0; r.v = 0;
+    // not everybody standing at the edge of a piste is facing down it
+    r.yawJ = (rnd() - 0.5) * 1.5;
+  }
+
+  const spotFree = (n, self) => {
+    for (let i = 0; i < riders.length; i++) {
+      const q = riders[i];
+      if (q !== self && q.stand && q.spot === n) return false;
+    }
+    return true;
+  };
+
+  /**
+   * Put a standing rider on the nearest free spot that is out of sight. The
+   * spot's own hash jitter can pull it 13 m nearer than the lattice suggests,
+   * so the accepted spot is re-checked against the hiding distance rather than
+   * assumed — a person appearing out of nothing at the edge of the piste is the
+   * single most immersion-breaking thing this rewrite is here to prevent.
+   */
+  function placeRest(r, pz, minD) {
+    const d = Math.max(minD, hiddenAhead(0, minD, 460) || 200);
+    let n = Math.round((pz - d - 13) / SPOT_SPACING);
+    for (let k = 0; k < 10; k++, n--) {
+      if (!spotFree(n, r)) continue;
+      standSpot(r, n);
+      if (pz - r.z >= d) return;
+    }
+    standSpot(r, n);
+  }
+
+  /** A rider enters. Never anywhere the camera can see. */
+  function respawn(r, px, pz) {
+    if (r.rest) { placeRest(r, pz, 55); return; }
+    identity(r, ticket++);
+    r.v = clamp(r.vk * Math.max(pVz, 9), 6.0, 26);
+    if (r.v > pVz + 1.2) {
+      // quicker than the player: comes up from behind the camera and passes
+      r.z = camP.z + 40 + 110 * riderRnd();
+    } else {
+      const d = hiddenAhead(r.off, 45, 480) || 240;
+      r.z = pz - (d + 4 + 26 * riderRnd());
+    }
+    pairFollower(r);
+  }
+
+  /**
+   * Every fourth rider follows the one before it. They enter together and hold
+   * the same line a few metres apart, which is what a pair of friends on a
+   * piste looks like; the old code paired them at respawn and then let the
+   * recycler pull them apart within seconds.
+   */
+  function pairFollower(lead) {
+    const f = riders[lead.slot + 1];
+    if (!f || (f.slot & 3) !== 3 || f.rest || lead.rest || lead.stand) return;
+    // ...but never at the cost of the rule this whole rewrite is about. If the
+    // follower is currently somewhere the camera can see, it keeps its own life
+    // and rejoins the pattern the next time it is legitimately recycled. Moving
+    // it here is exactly the teleport-under-your-nose the old code did.
+    if (f.x !== undefined && !outOfSight(f)) return;
+    identity(f, ticket++);
+    f.amp = lead.amp; f.wl = lead.wl; f.ph = lead.ph + 0.35;
+    f.sgn = lead.sgn;
+    f.off = lead.off + lead.sgn * (3 + riderRnd() * 5);
+    f.v = lead.v * (0.96 + riderRnd() * 0.07);
+    f.z = lead.z + (5 + riderRnd() * 8);         // behind = up-slope = larger z
+    if (Math.abs(f.off) + f.amp > PISTE_HALF - 6) f.off *= 0.5;
+    f.x = undefined;
+  }
+
+  /**
+   * Seeding, used on the first frame and after a teleport (the capture harness,
+   * a respawn). A cut is the one moment riders may legitimately be created in
+   * view, and the near-weighted spread here is the measured one this module has
+   * always used: the chase camera sits 1.7 m over a straight 15 deg ramp, so
+   * the piste is seen nearly edge-on and a 1.75 m figure converges into the
+   * surface noise within about 60 m. A "realistic" uniform spread over 45-375 m
+   * renders as an EMPTY piste, so two thirds of the riders start in the 15-50 m
+   * band where they actually read and the rest run out to 350 m for the wide
+   * framings.
+   */
+  function seedRiders(px, pz) {
+    for (let i = 0; i < RIDERS; i++) {
+      const r = riders[i];
+      const u = ((i * 7) % 5) / 5, u2 = ((i * 3) % 7) / 7;
+      if (r.rest) {
+        const d = 26 + 104 * u2;
+        let n = Math.round((pz - d) / SPOT_SPACING);
+        for (let k = 0; k < 8 && !spotFree(n, r); k++) n--;
+        standSpot(r, n);
+      } else {
+        identity(r, ticket++);
+        r.v = clamp(r.vk * Math.max(pVz, 12), 6.0, 26);
+        r.z = pz - ((i % 5) < 3 ? 15 + 34 * u : 55 + 300 * Math.pow(u2, 1.6));
+      }
+      r.x = undefined;
+    }
+    for (let i = 0; i < RIDERS; i++) if ((i & 3) === 3) pairFollower(riders[i - 1]);
+  }
+
   for (let i = 0; i < RIDERS; i++) {
-    const r = { z: 0, amp: 0, wl: 40, off: 0, ph: 0, v: 14, jacket: i, crouch: 0.5, slot: i, near: true };
-    respawnRider(r, 0, 0);
-    // seed with the same near-weighted spread the recycler uses, so the first
-    // frame after a teleport already has riders in the near half of the range
-    r.z = r.near ? -(15 + 34 * ((i * 7) % 5) / 5)
-      : -(55 + 300 * Math.pow(((i * 3) % 7) / 7, 1.6));
+    const r = { slot: i, rest: (i % 6) === 5, stand: false, z: 0, x: undefined, v: 12 };
+    identity(r, ticket++);
     riders.push(r);
   }
   let ridersInit = false;
+  let lastPX = 0, lastPZ = 0;
+  let losCursor = 0;             // whose turn it is for a line-of-sight test
 
   const _rq = new THREE.Quaternion(), _rq2 = new THREE.Quaternion();
   const _rn = new THREE.Vector3(), _rm = new THREE.Matrix4(), _rl = new THREE.Matrix4();
@@ -5740,18 +5992,54 @@ export function createScatter(scene, terrain) {
   const NEUTRAL = [0.92, 0.92, 0.96];
   let puffCursor = 0;
 
-  function updateRiders(px, pz, dt, camX, camZ) {
-    const pOff = px - corridorX(pz);
-    if (!ridersInit) {
-      ridersInit = true;
-      for (const r of riders) r.z += pz;
+  function updateRiders(px, pz, dt, speed) {
+    // Before anything has been rendered there is no camera to ask; put a
+    // stand-in where the chase cam sits so the first frame's cull is sane.
+    if (!camHave) {
+      camP.set(px, terrain.height(px, pz) + 2.4, pz + 8);
+      camF.set(0, 0, -1);
     }
+    // A teleport (harness.setPlayer, a respawn) is a cut, and a cut is the one
+    // place the population may legitimately be rebuilt in view.
+    const cut = !ridersInit || Math.abs(pz - lastPZ) > 60 || Math.abs(px - lastPX) > 60;
+    // Rider speeds are scaled against this. It is a 3 s average, not the
+    // instantaneous rate: a rider's line must not change under it.
+    if (!cut && dt > 1e-5) {
+      const vz = Math.min(Math.max(0, (lastPZ - pz) / dt), 40);
+      pVz += (vz - pVz) * (1 - Math.exp(-dt / 3));
+    }
+    if (cut) {
+      ridersInit = true;
+      pVz = Math.max(speed || 0, 12);
+      seedRiders(px, pz);
+    }
+    lastPX = px; lastPZ = pz;
+
+    losCursor = (losCursor + 1) % riders.length;
+
     let slot = 0;
     for (let i = 0; i < riders.length; i++) {
       const r = riders[i];
-      r.z -= r.v * dt;
-      // recycle: always six to nine riders on the slope below the player
-      if (r.z > pz - 13 || r.z < pz - 400) respawnRider(r, pz, pOff);
+      if (!r.stand) r.z -= r.v * dt;
+
+      // Recycle — and ONLY out of sight. `rel` is the distance along the
+      // camera's own forward axis, so a negative value is behind the near
+      // plane, where no frustum can reach. A rider quicker than the player is
+      // exempt from the near limit: it is behind because it is on its way past.
+      if (r.x !== undefined) {
+        const rel = (r.x - camP.x) * camF.x + (r.z - camP.z) * camF.z;
+        const receding = r.stand || r.v <= pVz + 0.2;
+        // A rider that has run away over the roll of the piste is spending the
+        // population budget somewhere nobody can see it, and bringing it back
+        // round costs nothing visually. Without this a traverse — where the
+        // player's fall-line rate is low and most of the field out-runs them —
+        // empties the near piste completely. The line-of-sight test is the real
+        // one and it is only ever run for the one rider whose turn it is.
+        const wasted = !r.stand && i === losCursor && (pz - r.z) > 170
+          && occluded(r.x, r.z);
+        if ((receding && rel < -RIDER_BEHIND) || rel < -RIDER_BEHIND_MAX
+          || wasted || pz - r.z > RIDER_FAR) respawn(r, px, pz);
+      }
 
       const k = Math.PI / r.wl;
       const s = Math.sin(r.z * k + r.ph);
@@ -5762,13 +6050,18 @@ export function createScatter(scene, terrain) {
       // travel direction: z decreases
       const dirX = -dxdz, dirZ = -1;
       const dl = Math.hypot(dirX, dirZ);
-      const yaw = Math.atan2(dirX / dl, dirZ / dl);
+      const yaw = Math.atan2(dirX / dl, dirZ / dl) + (r.stand ? r.yawJ : 0);
       const y = terrain.sample(x, r.z, _rn);
+      r.x = x;
       // lean = the angle the resultant of gravity and the turn's lateral
       // acceleration makes with the snow. This is not a stylistic choice; it is
       // what puts a rider's shoulders where a photograph puts them.
       const kappa = d2x / Math.pow(1 + dxdz * dxdz, 1.5);
-      const lean = r.stand ? 0 : clamp(Math.atan(r.v * r.v * kappa / 9.81), -0.52, 0.52);
+      // r.v is the rate down the fall line; the lean has to be computed from
+      // the speed along the actual path, which on a hard turn is meaningfully
+      // faster than that.
+      const vPath = r.v * dl;
+      const lean = r.stand ? 0 : clamp(Math.atan(vPath * vPath * kappa / 9.81), -0.52, 0.52);
       const edge = Math.abs(lean);
 
       // The carve CYCLE. `edge` is the load, and everything a skier does with
@@ -5853,7 +6146,7 @@ export function createScatter(scene, terrain) {
       if (p.t >= 1) continue;
       const g = p.t;
       const sz = p.s * (0.6 + 1.9 * g);
-      const yaw = Math.atan2(camX - p.x, camZ - p.z);
+      const yaw = Math.atan2(camP.x - p.x, camP.z - p.z);
       _rq.setFromAxisAngle(UP, yaw);
       _rq2.setFromAxisAngle(FWD, p.rot + g * 0.6);
       _rq.multiply(_rq2);
@@ -5863,6 +6156,14 @@ export function createScatter(scene, terrain) {
       // fade in fast, out slowly
       const a = Math.min(1, g * 7) * (1 - g) * (1 - g) * 1.5;
       pc[ps * 3] = a; pc[ps * 3 + 1] = a; pc[ps * 3 + 2] = a;
+      ps++;
+    }
+    // The spray only exists once somebody is carving, so its program would
+    // otherwise link mid-run too. Same trick: one scale-0 instance for the
+    // first few frames.
+    if (warmFrames > 0 && ps < PUFFS) {
+      _rm.makeScale(0, 0, 0).toArray(arr, ps * 16);
+      pc[ps * 3] = pc[ps * 3 + 1] = pc[ps * 3 + 2] = 0;
       ps++;
     }
     riderPuffs.count = ps;
@@ -5918,6 +6219,13 @@ export function createScatter(scene, terrain) {
 
   return {
     group,
+    // Diagnostics. The shared uniform block, so a probe can freeze the wind or
+    // the coverage dither and measure one term at a time instead of guessing
+    // which of them is boiling; and the live rider list, so "did that skier
+    // survive being overtaken" is a measurement rather than an opinion.
+    // Nothing in the sim reads either.
+    uniforms,
+    riders,
 
     update(dt, state) {
       time += dt || 0;
@@ -5938,9 +6246,15 @@ export function createScatter(scene, terrain) {
       drain(firstFill > 0 ? 600 : 90, px, pz);
       if (firstFill > 0) firstFill--;
 
+      // drop the boot-time warm-up instances once they have been through the
+      // main pass and both shadow cascades a few times
+      if (warmFrames > 0 && --warmFrames === 0) {
+        for (let i = warmHandles.length - 1; i >= 0; i--) warmHandles[i].p.remove(warmHandles[i]);
+        warmHandles.length = 0;
+      }
       for (const pool of allPools) pool.flush();
       updateChairs(px, pz, dt || 0);
-      updateRiders(px, pz, dt || 0, px, pz + 4);
+      updateRiders(px, pz, dt || 0, state?.speed || 0);
     },
 
     dispose() {

@@ -10,11 +10,16 @@
  *          ──► TAA resolve   reprojected history (through the JITTERED inverse
  *                            view-projection, so the half-pixel offset the
  *                            jitter just applied is undone), YCoCg variance
- *                            clipping, then a second output step that adds the
- *                            current frame's high-frequency residual back on
- *                            top — that is what keeps snow sparkle alive
- *                            through a temporal filter. Also applies exposure,
- *                            so everything downstream is sensor-referred.
+ *                            clipping, a per-pixel history weight that rises to
+ *                            0.96 for a pixel that did not move (this is what
+ *                            stops foliage boiling — see PARAMS.taa), then a
+ *                            second output step that adds the high-frequency
+ *                            residual back on top — from the current frame
+ *                            where the pixel is moving, from the resolved
+ *                            image where it is not. That is what keeps snow
+ *                            sparkle alive through a temporal filter. Also
+ *                            applies exposure, so everything downstream is
+ *                            sensor-referred.
  *          ──► UnrealBloom   threshold 2.6 exposed-linear, with a firefly clamp
  *                            and a soft knee on the high pass and an explicitly
  *                            authored (narrow) pyramid: only specular glints and
@@ -67,9 +72,37 @@ export const PARAMS = {
   // adds the current frame's high-frequency residual back on top at full
   // amplitude. Because the injection happens after the history write it cannot
   // accumulate, which is what makes it safe to run at a high amount.
+  //
+  // MEASURED FLICKER FIX (see `still` in TAA_FRAG). With the whole simulation
+  // frozen — no wind, no dither rotation, no camera motion, nothing moving in
+  // the scene at all — the shipped resolve still had a per-pixel temporal
+  // standard deviation of 6.94 display codes over the conifer crowns (0.013
+  // with TAA switched off, i.e. the render itself is exactly static). At
+  // feedback 0.78 every frame injects 22% of a fresh half-pixel-jittered
+  // sample, and on a needle silhouette against the sky that sample swings tens
+  // of codes. That is the tree flicker, and it is a property of the resolve,
+  // not of the vegetation.
+  //
+  // The fix is the standard one: a pixel whose reprojection did not move is
+  // looking at the same surface point as last frame, so its history is worth
+  // far more than 0.78. `feedbackStill` is what such a pixel gets, ramped in
+  // over `stillPx` pixels of per-pixel reprojection velocity, and gated on the
+  // history actually agreeing with the current neighbourhood so a moving
+  // object (which has no motion vector here) can never claim the boost.
   taa: {
     enabled: true,
     feedback: 0.78,
+    feedbackStill: 0.97,  // ...for a pixel that did not move this frame
+    stillClip: 4.0,       // ...and how much wider its variance box may open
+    // px/frame of reprojection velocity at which the boost is fully gone.
+    // Swept on a controlled 1.2 m/s pan at the `trees` framing (per-pixel
+    // second difference over the crowns, which is exactly zero for a linear
+    // trend): 3 px -> 14.5, 6 -> 12.6, 12 -> 12.4, 24 -> 10.8 against 15.3 for
+    // the shipped resolve. 8 takes the far and mid field, where a treeline
+    // crawls a pixel or two a frame and shimmers worst; a near trunk whipping
+    // past at 40 px/frame is left entirely alone, because that is where a
+    // history this strong would smear.
+    stillPx: 8.0,
     clipScale: 1.0,
     sharpen: 0.10,      // pre-blend sharpen; mostly superseded by `detail`
     detail: 0.55,       // current-frame high-frequency re-injected on output
@@ -291,6 +324,10 @@ uniform sampler2D tDepth;
 uniform mat4  uReproject;      // prevViewProj * inverse(currViewProj)
 uniform vec2  uTexel;
 uniform float uFeedback;
+uniform float uFeedbackStill;
+uniform float uStillPx;
+uniform float uStillClip;
+uniform vec2  uJitterPx;   // this frame's sub-pixel camera jitter, in pixels
 uniform float uClipScale;
 uniform float uClipRelax;
 uniform float uSharpen;
@@ -325,8 +362,6 @@ void main() {
   }
   vec3 mu = m1 / 9.0;
   vec3 sigma = sqrt(max(vec3(0.0), m2 / 9.0 - mu * mu));
-  vec3 lo = max(nmin, mu - sigma * uClipScale);
-  vec3 hi = min(nmax, mu + sigma * uClipScale);
 
   // --- reprojection ---------------------------------------------------------
   float d = texture2D(tDepth, vUv).x;
@@ -337,6 +372,33 @@ void main() {
   float inside = step(0.0, prevUv.x) * step(prevUv.x, 1.0)
                * step(0.0, prevUv.y) * step(prevUv.y, 1.0);
   vec3 hist = texture2D(tHistory, clamp(prevUv, vec2(0.0), vec2(1.0))).rgb;
+
+  // --- how far did this pixel move? ----------------------------------------
+  // Camera reprojection only — there are no object motion vectors in this
+  // pipeline — so this is "how much did the view of this surface point shift",
+  // which is exactly the question the history weight should be asking.
+  //
+  // The jitter has to come back out of it. The history is anchored at texel
+  // centres but the depth we just unprojected was rendered through the
+  // JITTERED projection, so even a bolted-down camera reports up to 0.7 px of
+  // motion here — the sub-pixel offset we applied on purpose. Uncompensated it
+  // both suppressed the boost and made the feedback weight itself flicker on
+  // the 16-frame Halton cycle.
+  float velPx = length((prevUv - vUv) / uTexel - uJitterPx);
+  float still = 1.0 - clamp(velPx / max(uStillPx, 1e-3), 0.0, 1.0);
+
+  // The variance box is built from the CURRENT frame, which is jittered, so on
+  // foliage it moves every frame and drags the history with it — which is why
+  // raising the feedback alone only got a third of the way there. A pixel that
+  // did not move is looking at the same surface point, so its box is widened
+  // toward the raw 3x3 min/max, which is the classic AABB clamp and is where
+  // the widening stops however large uStillClip is. MEASURED at 3200x1800 (the
+  // resolution the game actually runs at, DPR 2), whole scene frozen, temporal
+  // SD over the crowns: 3.24 shipped, 2.81 with the still feedback alone, 2.06
+  // with this as well.
+  float cs = uClipScale * mix(1.0, uStillClip, still);
+  vec3 lo = max(nmin, mu - sigma * cs);
+  vec3 hi = min(nmax, mu + sigma * cs);
 
   // Clip history towards the current colour along the AABB (not clamp — clip
   // keeps far more detail and produces much less flicker).
@@ -363,8 +425,6 @@ void main() {
   hfT = max(hfT, -yCur * 0.12);
   vec3 sharp = max(cur * (1.0 + hfT / max(yCur, 1e-4)), vec3(0.0));
 
-  float fb = uFeedback * inside * uValid;
-
   // The old blend was Karis luma weighting — 1/(1+luma) on each side. That is a
   // firefly filter, and on a snow field the "fireflies" ARE the subject: every
   // specular got systematically down-weighted relative to the dull snow around
@@ -374,11 +434,22 @@ void main() {
   // occlusion edge, a moved specular) and deserves less weight. That kills
   // ghosting without ever penalising a pixel for being bright.
   float clipDist = length(hy - cy) / (length(sigma) * uClipScale + 0.06);
+  float agree = 1.0 - clamp(clipDist, 0.0, 1.0);
+
+  // A still pixel whose history still agrees with the current neighbourhood is
+  // resampling the same surface point: integrate the jitter over ~25 frames
+  // instead of ~4.5. 'agree' is the guard that keeps this off a rider, the
+  // spray or the skier's own limbs, none of which carry a motion vector: the
+  // moment the clamp has to drag the history, the boost is gone.
+  float fb = mix(uFeedback, uFeedbackStill, still * agree) * inside * uValid;
   fb *= 1.0 - uClipRelax * clamp(clipDist, 0.0, 1.0);
 
   vec3 outc = mix(sharp, hist, fb);
 
-  gl_FragColor = vec4(outc, 1.0);
+  // 'still' rides in alpha for the output step, which needs it to choose where
+  // its high-frequency residual comes from and has neither depth nor the
+  // reprojection matrix. The history's alpha is never read as colour.
+  gl_FragColor = vec4(outc, still * agree);
 }
 `;
 
@@ -395,8 +466,11 @@ uniform float uDetailLimit;
 uniform float uExposure;
 ${COMMON}
 void main() {
-  vec3 res = texture2D(tDiffuse, vUv).rgb;
+  vec4 R = texture2D(tDiffuse, vUv);
+  vec3 res = R.rgb;
   if (uDetail <= 0.001) { gl_FragColor = vec4(res, 1.0); return; }
+  // How stationary this pixel was, written into alpha by the resolve.
+  float still = R.a;
   vec3 c  = texture2D(tCurrent, vUv).rgb;
   vec3 n  = texture2D(tCurrent, vUv + vec2(0.0, -uTexel.y)).rgb;
   vec3 s  = texture2D(tCurrent, vUv + vec2(0.0,  uTexel.y)).rgb;
@@ -410,6 +484,32 @@ void main() {
   // luminance delta on near-white snow is indistinguishable and cannot fringe.
   float ym = luma(mean4) * uExposure;
   float yc = luma(c) * uExposure;
+  float ymax4 = max(max(luma(n), luma(s)), max(luma(w), luma(e))) * uExposure;
+
+  // MEASURED. This term reads the CURRENT frame, and the current frame is
+  // jittered by half a pixel every frame, so on foliage its residual is a
+  // different residual every frame: with the whole scene frozen it was 1.21 of
+  // the 6.94 codes of temporal deviation measured over the crowns. Where the
+  // pixel did not move, the resolved history is the same image with the jitter
+  // averaged out of it, so taking the residual from there is the identical
+  // micro-contrast with none of the boiling. Where it did move, the history is
+  // a reprojection and the current frame is the honest source, so nothing
+  // changes for anything that is actually moving on screen — which is why the
+  // snow sparkle, whose whole point is that it lives in one frame, is untouched
+  // in a run and only stabilises when the camera is parked.
+  if (still > 0.02) {
+    vec3 rn = texture2D(tDiffuse, vUv + vec2(0.0, -uTexel.y)).rgb;
+    vec3 rs = texture2D(tDiffuse, vUv + vec2(0.0,  uTexel.y)).rgb;
+    vec3 rw = texture2D(tDiffuse, vUv + vec2(-uTexel.x, 0.0)).rgb;
+    vec3 re = texture2D(tDiffuse, vUv + vec2( uTexel.x, 0.0)).rgb;
+    // tDiffuse is post-exposure already; tCurrent is not.
+    float ymR = luma((rn + rs + rw + re) * 0.25);
+    float ycR = luma(res);
+    float ymxR = max(max(luma(rn), luma(rs)), max(luma(rw), luma(re)));
+    ym = mix(ym, ymR, still);
+    yc = mix(yc, ycR, still);
+    ymax4 = mix(ymax4, ymxR, still);
+  }
   float hf = yc - ym;
 
   // HALO GUARD. Snow sparkle is a single pixel at many times white. Its four
@@ -424,7 +524,6 @@ void main() {
   // not 1.8x, and the ramp only reached 0.9 at a 5x ratio. A neighbour 30%
   // brighter is an ordinary edge and must keep its detail; a neighbour 3x
   // brighter is a specular and this pixel is standing in its ring.
-  float ymax4 = max(max(luma(n), luma(s)), max(luma(w), luma(e))) * uExposure;
   hf *= 1.0 - smoothstep(1.35, 3.0, ymax4 / max(yc, 1e-3));
 
   // Soft limiter, scaled by the local level, and deliberately asymmetric: adding
@@ -451,6 +550,10 @@ class TAAPass extends Pass {
       uReproject: { value: new THREE.Matrix4() },
       uTexel: { value: new THREE.Vector2(1 / 1600, 1 / 900) },
       uFeedback: { value: PARAMS.taa.feedback },
+      uFeedbackStill: { value: PARAMS.taa.feedbackStill },
+      uStillPx: { value: PARAMS.taa.stillPx },
+      uStillClip: { value: PARAMS.taa.stillClip },
+      uJitterPx: { value: new THREE.Vector2() },
       uClipScale: { value: PARAMS.taa.clipScale },
       uClipRelax: { value: PARAMS.taa.clipRelax },
       uSharpen: { value: PARAMS.taa.sharpen },
@@ -509,6 +612,9 @@ class TAAPass extends Pass {
     this.uniforms.tCurrent.value = this.source;
     this.uniforms.tHistory.value = src.texture;
     this.uniforms.uFeedback.value = PARAMS.taa.feedback;
+    this.uniforms.uFeedbackStill.value = PARAMS.taa.feedbackStill;
+    this.uniforms.uStillPx.value = PARAMS.taa.stillPx;
+    this.uniforms.uStillClip.value = PARAMS.taa.stillClip;
     this.uniforms.uClipScale.value = PARAMS.taa.clipScale;
     this.uniforms.uClipRelax.value = PARAMS.taa.clipRelax;
     this.uniforms.uSharpen.value = PARAMS.taa.sharpen;
@@ -1213,6 +1319,7 @@ export function createPostFX(renderer, scene, camera) {
   const subj = new THREE.Vector3();
   let subjDist = 9;
   let jitterIndex = 0;
+  let warmPasses = 3;            // frames of speed-gated passes forced on at boot
   let havePrev = false;
   let haveQuat = false;
   let time = 0;
@@ -1277,11 +1384,6 @@ export function createPostFX(renderer, scene, camera) {
     },
 
     render(dt) {
-      if (!api.enabled) {
-        renderer.setRenderTarget(null);
-        renderer.render(scene, camera);
-        return;
-      }
       time += dt || 0;
 
       camera.updateMatrixWorld();
@@ -1292,7 +1394,7 @@ export function createPostFX(renderer, scene, camera) {
       currVP.multiplyMatrices(projU, viewU);
 
       // --- render the scene with a sub-pixel jitter -------------------------
-      const useTAA = PARAMS.taa.enabled;
+      const useTAA = PARAMS.taa.enabled && api.enabled;
       taaPass.enabled = useTAA;
       blitPass.enabled = !useTAA;
 
@@ -1304,6 +1406,11 @@ export function createPostFX(renderer, scene, camera) {
         camera.projectionMatrix.elements[9] += (j[1] * 2) / H;
         camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
         projJ.copy(camera.projectionMatrix);
+        // Handed to the resolve so it can take its own jitter back out of the
+        // per-pixel reprojection velocity. Sign: elements[8] += j*2/W offsets
+        // ndc.x by −j*2/W (clip.x picks up m02 * z_view and z_view = −clip.w),
+        // so the point drawn at vUv sat at vUv + j/W last frame.
+        taaPass.uniforms.uJitterPx.value.set(j[0], j[1]);
       }
 
       renderer.setRenderTarget(sceneRT);
@@ -1355,7 +1462,14 @@ export function createPostFX(renderer, scene, camera) {
       mbPass.uniforms.uStrength.value = mbAmount;
       mbPass.uniforms.uMaxPixels.value = PARAMS.motion.maxPixels * cocScale;
       mbPass.uniforms.uNearFade.value = PARAMS.motion.nearFade;
-      mbPass.enabled = PARAMS.motion.enabled && mbAmount > 0.004;
+      // MEASURED: this pass is gated on speed — it does not switch on until the
+      // skier passes ~55 km/h — so its program was linked several seconds into
+      // every run, as a single-frame stall. It is run for the first few frames
+      // at strength 0 instead, which the shader short-circuits to an exact copy
+      // of its input (see the first line of MB_FRAG), so the frames are
+      // untouched and the program is linked before anyone is moving.
+      if (warmPasses > 0) warmPasses--;
+      mbPass.enabled = PARAMS.motion.enabled && (mbAmount > 0.004 || warmPasses > 0);
 
       prevQuat.copy(camQuat);
       lastDt = dt > 1e-4 ? Math.min(dt, 0.1) : lastDt;
@@ -1376,6 +1490,8 @@ export function createPostFX(renderer, scene, camera) {
 
       // TAA is the anti-aliaser; SMAA only comes back if TAA is switched off.
       smaaPass.enabled = PARAMS.smaa.enabled || !PARAMS.taa.enabled;
+      gradePass.enabled = true;
+      filmPass.enabled = true;
       bloomPass.enabled = PARAMS.bloom.enabled;
       bloomPass.strength = PARAMS.bloom.strength;
       bloomPass.radius = PARAMS.bloom.radius;
@@ -1416,6 +1532,23 @@ export function createPostFX(renderer, scene, camera) {
       filmPass.uniforms.uSharpen.value = PARAMS.film.sharpen;
       filmPass.uniforms.uVignette.value = PARAMS.film.vignette;
       filmPass.uniforms.uSpeedVignette.value = speedVig + PARAMS.film.speedVignette;
+
+      // The `enabled = false` debug ablation used to bypass the composer and
+      // render the scene straight to the default framebuffer. That is the only
+      // configuration in which the default framebuffer would ever need MSAA of
+      // its own, and it is a footgun: it silently changed which surface got
+      // anti-aliased. Routed through the composer with every optional pass off,
+      // the invariant holds unconditionally — exactly one fullscreen quad ever
+      // touches the default framebuffer, so `antialias: false` on the renderer
+      // is output-neutral under every configuration of PARAMS.
+      if (!api.enabled) {
+        bloomPass.enabled = false;
+        dofPass.enabled = false;
+        mbPass.enabled = false;
+        smaaPass.enabled = false;
+        gradePass.enabled = false;
+        filmPass.enabled = false;
+      }
 
       composer.render(dt);
 
