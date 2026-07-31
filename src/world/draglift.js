@@ -59,9 +59,9 @@ const RIDE_SPEED = 3.4;      // m/s — a real T-bar runs 2.5-4 m/s
 
 const STEEL = [0.115, 0.125, 0.145];
 const STEEL_L = [0.26, 0.27, 0.30];
-const PAINT = [0.42, 0.10, 0.06];
+const PAINT = [0.30, 0.075, 0.05];
 const CONCRETE = [0.31, 0.31, 0.30];
-const TIMBER = [0.115, 0.095, 0.078];
+const TIMBER = [0.19, 0.155, 0.125];
 const SNOW = [1.05, 1.07, 1.12];
 const RUBBER = [0.045, 0.045, 0.050];
 const SIGN = [0.72, 0.62, 0.10];
@@ -396,8 +396,13 @@ export function createDragLift(scene, terrain, opts = {}) {
     const wx = p0.x - dTmp.x * 4.5, wz = p0.z - dTmp.z * 4.5;
     const wy = terrain.height(wx, wz);
     b.tube(new THREE.Vector3(wx, wy, wz), new THREE.Vector3(wx, wy + 3.1, wz), 0.16, STEEL, 8);
-    b.wheel(new THREE.Vector3(wx + n0x * STRAND * 0.5, wy + 3.15, wz + n0z * STRAND * 0.5),
-      new THREE.Vector3(0, 1, 0), STRAND * 0.5 + 0.35, STEEL_L, 16);
+    const bwx = wx + n0x * STRAND * 0.5, bwz = wz + n0z * STRAND * 0.5;
+    b.wheel(new THREE.Vector3(bwx, wy + 3.15, bwz), new THREE.Vector3(0, 1, 0),
+      STRAND * 0.5 + 0.35, STEEL_L, 16);
+    // hub + gearbox housing: a bare ring on a pole reads as a floating ellipse
+    b.tube(new THREE.Vector3(bwx, wy + 2.75, bwz), new THREE.Vector3(bwx, wy + 3.30, bwz), 0.26, STEEL_L, 8);
+    b.box(bwx, wy + 2.55, bwz, 0.42, 0.30, 0.42, yaw0, STEEL);
+    b.tube(new THREE.Vector3(wx, wy + 2.6, wz), new THREE.Vector3(bwx, wy + 2.6, bwz), 0.12, STEEL, 6);
     b.box(wx, wy + 0.55, wz, 0.5, 0.55, 0.5, yaw0, PAINT);
 
     // boarding lane: two rails you slide between, and a rubber mat where the
