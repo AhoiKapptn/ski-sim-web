@@ -118,6 +118,12 @@ const LAT_ARM = 1.2;        // m, cross-ski arm used for the contact-plane gradi
 // question. With the band below, an open-piste coast trips the shortened travel
 // on 0.25% of substeps (against 0.42% of the run already spent airborne, i.e.
 // inside the existing noise) while the kickers separate 2.5-3 m earlier.
+//
+// Tried and rejected: probing at 3 m as well and taking the smaller drop, on the
+// theory that boulder terrain fools a single 6 m extrapolation. It changed the
+// off-piste behaviour not at all (the ridge line really is falling away at both
+// distances — it is a cliff band) and cost 1.5 m of take-off sharpness on the
+// kickers. One probe.
 const LOOK_AHEAD = 6.0;     // m, lip probe: how far ahead the ground must stay gone
 const LIP_DROP0 = 0.12;     // ...below this, the ground ahead is still there
 const LIP_DROP1 = 0.30;     // ...above this, the ski is bridging a hole
@@ -430,13 +436,18 @@ export class SkiPhysics {
     // below) and the existing model decides the rest.
     //
     // That makes the guarantee arithmetic rather than a threshold to tune:
-    // separation needs sqrt(2*G*LEG_TRAVEL) = 3.15 m/s, and REBOUND_MAX is 1.8, so
-    // a rebound on even ground CANNOT put the rider in the air — the most it can
-    // do is extend the legs by v^2/2G = 15 cm, a third of their travel, which is
-    // what a rebound looks like. Over a roll, where the snow is already dropping
-    // away and the legs are part-extended, that same 1.8 m/s is enough to tip it
-    // past the travel limit and you fly. Which is when a rebound really does.
-    const REBOUND_MAX = 1.8;   // m/s; < sqrt(2*G*LEG_TRAVEL) = 3.15 by construction
+    // separation on even ground needs sqrt(2*G*LEG_TRAVEL) = 3.15 m/s and
+    // REBOUND_MAX is 1.25, so a rebound there CANNOT put the rider in the air —
+    // the most it can do is extend the legs by v^2/2G = 7 cm, which is what a
+    // rebound looks like. Over a roll, where the snow is already dropping away
+    // and the legs are part-extended, the same 1.25 m/s can carry the gap past
+    // the travel limit and you fly. Which is when a rebound really does.
+    //
+    // Measured over 40 s of 2 s-period linked carving: it fires 16 times and the
+    // run is 3.3% airborne, essentially all of it terrain the carve crosses at
+    // speed (the same line spends 0.7% airborne with no input at all). The old
+    // launch-impulse version fired every turn and spent 12.6% airborne.
+    const REBOUND_MAX = 1.25;  // m/s; < sqrt(2*G*LEG_TRAVEL) = 3.15 by construction
     let reboundV = 0;
     this.reboundCd = Math.max(0, this.reboundCd - dt);
     if (this.grounded && !this.jumpHeld && this.reboundCd === 0 &&
