@@ -41,8 +41,9 @@
  *
  * The snow park
  * -------------
- * Six hand-authored jump features — two rollers, two kickers, a booter and a
- * hip — are swept down the piste corridor between z = 645 and z = -20. They are
+ * Six hand-authored jump features — a roller, a step-down, two kickers, a
+ * booter and a hip — are swept down the piste corridor, their lips between
+ * z = 645 and z = -120 and their run-outs reaching z = 659 to -212. They are
  * NOT in the bake: at 8 m per texel a 12 m kicker smears into a ramp. They are
  * an analytic member of the micro-detail layer, generated once into GLSL from
  * the same resolved knot table the CPU sampler reads, so the physics surface
@@ -52,12 +53,14 @@
  * `terrain.jumps` is the public description of that line, one entry per
  * feature, all in world units:
  *
- *   { name, kind, size,            'roller' | 'kicker' | 'booter'; small/medium/large
- *     x, z, y,                     the lip
+ *   { name, kind, size,            roller|stepdown|hip|kicker|booter; small..xl
+ *     x, z, y,                     THE LIP — the crest of the ramp, t = 0
  *     dir, ax, az,                 axis heading (physics convention) and unit vector
  *     m0,                          grade the feature was cut for
  *     lipH, deckH, deckLen,        lip height over grade, table height, table length
+ *     lipT,                        crest offset from t = 0; 0 by construction
  *     landingX, landingZ,          where the landing crosses grade — the aim point
+ *     landingT,                    ...as a distance along the axis
  *     lipZ, runOut, width,
  *     t0, t1, w0, w1, iwf,         extent along/across the axis
  *     kt, ks, kd }                 resolved profile knots (t, dD/dt, D)
@@ -928,10 +931,26 @@ const PISTE_HALF = 200;
 //
 // The first version of this table had a 5-degree break at the lip and a 6 m
 // table, and the rider measurably rode the deck and dropped off the KNUCKLE —
-// separation at t = 8.9 m on a feature whose lip is at t = 0. So the kickers
-// carry a hard break (0.17-0.30 of slope inside 1.2 m) and short decks: the
-// lip has to throw you off it, and the table has to be short enough that
-// separation happens before the knuckle rather than at it.
+// separation at t = 8.9 m on a feature whose lip is at t = 0. The second put a
+// 0.15 break at the lip and still lost: the ramp under it only reached
+// +7.7 degrees, so the rider left 5.2-5.4 m past the lip on all three kickers,
+// pointing DOWNHILL (-4 to -7 degrees at separation). A jump you leave going
+// down is a roll, whatever the table says.
+//
+// The kickers now break 0.52 of slope inside 0.9 m off a 25-degree ramp — 190
+// m/s^2 of ground falling away at 19 m/s. Measured against physics.js driven
+// headless down each feature's own axis:
+//
+//   feature   separation past the lip   angle at separation
+//   kicker1        0.90 m                   +19.4 deg
+//   booter         1.26 m                   +13.6 deg
+//   kicker2        1.10 m                   +19.3 deg
+//
+// The residual metre is the 1.7 m contact footprint, not the profile: the skis
+// bridge the lip and the body is still being carried by an averaged surface for
+// half a ski length after the snow has gone. It also costs about 6 degrees of
+// launch angle against the ramp, which is why the numbers above are 19 and not
+// 25. Sharpening the break further only fights the footprint.
 //
 // Why the kickers are as big as they are
 // --------------------------------------
@@ -964,11 +983,28 @@ const PISTE_HALF = 200;
 //    that closes without digging a trench across the piste, and it costs
 //    nothing in landing violence that the steep one would have saved.
 //
-// What a steeper lip does cost, honestly: separation moves from 5.3 m past the
-// lip to ~1.5 m (the point of the exercise), the gap roughly doubles, and the
-// landing goes from ~7 m/s of closing speed to ~12. That is a real price and it
-// is charged by the hill, not by the table: at a 21 m/s approach a 25-degree
-// takeoff is a 45 m flight whatever is built under it.
+// What a steeper lip costs, honestly and in full. Measured, old -> new:
+//
+//   kicker1  gap 28 -> 52 m, air 1.4 -> 2.8 s, touchdown 7.4 -> 12.4 m/s into
+//            the snow, speed kept against sqrt(v^2 + 2gh) 80% -> 60%
+//   kicker2  gap 28 -> 45 m, 5.6 -> 12.3 m/s,  85% -> 61%
+//   booter   gap 22 -> 22 m, 6.9 -> 7.1 m/s,   81% -> 80%
+//
+// The booter is the control that proves where the cost comes from. It has the
+// steepest ramp of the three and it costs nothing, because it sits on the
+// mellowest anchor and follows kicker1, so it arrives at 20 m/s instead of 23.5
+// and leaves its (taller) lip at 14 m/s instead of 20. On a slope the ONLY way
+// to arrive at a lip slower is to arrive higher, so lip height is the speed
+// control and the whole design space is one-dimensional: taller lip -> slower
+// takeoff -> shorter gap -> softer landing. Priced over the sweep, kicker1 at
+// 8.8 m of lip costs 40% and at 12.5 m of lip costs 33% while going to 25 m
+// tall in footprint — 7 points is not worth a jump you can see from the lift,
+// so this table stops at 8.8.
+//
+// The brief's fallback — "if the speed cost rises, shorten the feature" — works
+// BACKWARDS here for that same reason, and it is worth writing down so nobody
+// re-derives it: shortening the ramp lowers the lip, which speeds the takeoff
+// up, which lengthens the flight and hardens the landing.
 const PARK_PROFILES = {
   // Roller. No lip worth the name — a smooth convex crest, 1.6 m proud of the
   // piste, that unweights you and gives about a metre of float. This is the
@@ -1014,7 +1050,7 @@ const PARK_PROFILES = {
   ],
   // The kicker. A real park takeoff, in the order a shaper builds it:
   //
-  //   -25..-15   flat compacted run-in, at grade, moguls tilled off it
+  //   -22..-15   flat compacted run-in, at grade, moguls tilled off it
   //   -15..-13   the run-in flattens off to 7 deg — the last bit of speed you
   //              can still scrub, and the foot of the transition
   //   -13..-6    the transition, 7 m of it, sweeping 32 degrees. That is
@@ -1031,10 +1067,12 @@ const PARK_PROFILES = {
   //              away and the legs are out of travel 1.5 m later.
   //    0..2.4    the table. Dead level, because a table is level.
   //   2.4..4.8   the knuckle, rolling over into the landing.
-  //   4.8..52    the landing at grade + 11.3 deg. Long, because the flight is
-  //              44-47 m; shallow, because steeper does not reduce the mismatch
-  //              (see the note above) and does dig a trench.
-  //     52..64   the compression, then the solved run-out.
+  //   4.8..58    the landing at grade + 11.3 deg. Long, because the measured
+  //              flight is 45 m on kicker2 and 52 m on kicker1 and the rider has
+  //              to touch down ON it; shallow, because steeper does not reduce
+  //              the mismatch (see above) and does dig a trench. As built it
+  //              bottoms out 1.8 m under grade on kicker1, 3.2 m on kicker2.
+  //     58..70   the compression, then the solved run-out.
   kicker: [
     [-22, null], [-17, null],
     [-15, 0.12],
@@ -1050,8 +1088,8 @@ const PARK_PROFILES = {
   // The booter. The same grammar two degrees steeper and half a metre longer in
   // every section. It sits on the mellowest anchor in the park (13.2 deg) and
   // follows kicker1, so it is the SLOWEST feature on the line despite being the
-  // biggest — which is why its gap is 27 m against the kickers' 45 and why it
-  // is the one that reads best from the side.
+  // biggest — which is why its gap is 22 m against the kickers' 45-52 and why it
+  // is the one that keeps 80% of its speed where they keep 60.
   booter: [
     [-24, null], [-18, null],
     [-15, 0.10],
@@ -1078,12 +1116,17 @@ const PARK_PROFILES = {
  *    354 m off the corridor and nowhere near the park), trees (157,90, 117 m
  *    off), steep (-24,-338), closeup (58,457) — the last two are the tight
  *    ones, hence the gaps at z ~ 460-500 and below z ~ -110.
- *  - 40-90 m of clean piste between the end of one run-out and the start of the
- *    next transition, so there is room to set the speed and the line.
+ *  - clean piste between the end of one run-out and the start of the next
+ *    transition, so there is room to set the speed and the line. The 25-degree
+ *    takeoffs cost most of the slack that used to be here: the features are now
+ *    100-113 m long instead of 55-105, and the gaps run 38, 47, 41, 62 m down
+ *    the line (they were 40-90). 38 m at 21 m/s is under two seconds, which is
+ *    the tightest link on the hill and the first thing to give if anything else
+ *    in the park grows.
  *  - Every big feature is offset from the centreline and none is wider than
- *    38 m, so a rider holding a line 25 m to either side goes past it. The two
- *    rollers sit close to the middle on purpose: they are the ones you are
- *    allowed to take by accident.
+ *    36 m, so a rider holding a line 25 m to either side goes past it. The
+ *    roller and the step-down sit close to the middle on purpose: they are the
+ *    ones you are allowed to take by accident.
  */
 // Flank angle is the constraint on the widths, and it is a hard one. The bank
 // down the side of a feature is 1.5 * height / feather at its steepest, and the
@@ -2132,6 +2175,29 @@ export class Terrain {
    * That is deliberate on both counts: the CPU twin has no fade either (so the
    * surfaces agree *identically*, not just near the player), and a park you
    * cannot see from 400 m up the run is a park nobody aims at.
+   *
+   * How to check the two are still the same surface — and two traps in doing it
+   * ----------------------------------------------------------------------------
+   * Point an OrthographicCamera straight down at the park, render the terrain
+   * group with a depth material as `scene.overrideMaterial`, read the target
+   * back and compare against `height()`. For an ortho camera the packed depth is
+   * linear: y = camY - (near + d * (far - near)). Both traps cost an hour:
+   *
+   *  - `terrain.depthMaterial` will render NOTHING in that pass. It has been
+   *    through the shadow map, which leaves `side` on BackSide, and a top-down
+   *    pass then culls every triangle. Build a fresh one from
+   *    `material.userData.createDepthMaterial()` and set it DoubleSide. A blank
+   *    (clear-coloured) readback is this, not a broken displacement.
+   *  - three's `packDepthToRGBA` puts the MOST significant byte in R, not in A:
+   *    d = (255/256) * (r + g/256 + b/65536 + a/16777216) with each channel in
+   *    0..1. Getting that backwards reads as a plausible-looking 35 m error with
+   *    no correlation to height at all.
+   *
+   * Last measured over 60 x 60 m windows at 512^2, against no-park control
+   * windows of plain piste on the same run: mean |error| 0.25-0.45 cm over the
+   * features against 0.34-0.44 cm on the controls, max 3.4-4.2 cm against
+   * 2.9-3.8 cm. The residual is clipmap triangle chord error, not a difference
+   * between the two evaluations.
    */
   _jumpGLSL() {
     const J = this.jumps;
