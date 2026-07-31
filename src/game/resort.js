@@ -565,11 +565,13 @@ function buildInterior(b) {
   const steamB = new Bld();
   {
     const p = P(DRINK_A, DRINK_C, 0);
+    // Small and faint on purpose. At three times this size the quads read as a
+    // grey arrow pointing at the ceiling rather than as steam.
     for (let i = 0; i < 3; i++) {
-      const w2 = 0.030 + i * 0.016, y = TY + 0.19 + i * 0.075;
+      const w2 = 0.017 + i * 0.007, y = TY + 0.175 + i * 0.055;
       steamB.quad(
         new THREE.Vector3(p.x - w2, y, p.z), new THREE.Vector3(p.x + w2, y, p.z),
-        new THREE.Vector3(p.x + w2 * 0.7, y + 0.075, p.z), new THREE.Vector3(p.x - w2 * 0.7, y + 0.075, p.z),
+        new THREE.Vector3(p.x + w2 * 0.55, y + 0.052, p.z), new THREE.Vector3(p.x - w2 * 0.55, y + 0.052, p.z),
         [0.95, 0.95, 0.95]);
     }
   }
@@ -834,7 +836,7 @@ export function createResort(opts) {
   let phase = 'ride';           // 'board' | 'ride' | 'off' inside a lift mode
   let modeT = 0, phaseT = 0;
   let rideS = 0, rideTotal = 0, rideSpeed = 0, rideKind = '', rideName = '';
-  let pan = 0, panV = 0, sway = 0, tilt = 0;
+  let pan = 0, panV = 0, sway = 0, tilt = 0, hutPan = 0;
   let veil = 0, veilTarget = 0, glowFlash = 0;
   let skipHold = 0, skipping = false;
   let warmth = 1;
@@ -1207,6 +1209,13 @@ export function createResort(opts) {
       }
     }
 
+    // Look around inside with the steer axis. Without it the hut is whatever the
+    // one framing shows and the bar, the coffee machine and the second table
+    // might as well not exist — which is the difference between a room and a
+    // diorama.
+    const panT = clamp((state.input?.steer ?? 0), -1, 1);
+    hutPan += (panT - hutPan) * Math.min(1, dt * 2.4);
+
     // ordering
     if (phase === 'sit') {
       if (io.pick === 1 && drink !== 'coffee') serve(state, 'coffee');
@@ -1224,7 +1233,7 @@ export function createResort(opts) {
       steamMesh.visible = on;
       if (on) {
         const t = drinkT % 2.2;
-        steamMesh.material.opacity = 0.21 * Math.max(0, Math.sin((t / 2.2) * Math.PI)) * (0.6 + 0.4 * Math.sin(drinkT * 3.1));
+        steamMesh.material.opacity = 0.15 * Math.max(0, Math.sin((t / 2.2) * Math.PI)) * (0.6 + 0.4 * Math.sin(drinkT * 3.1));
         steamMesh.position.set(0, lift + (t / 2.2) * 0.16, 0);
       }
     }
@@ -1238,7 +1247,7 @@ export function createResort(opts) {
       drink,
       served: rise,
       run: lastRun,
-      hint: 'E · step back onto the snow',
+      hint: 'A/D look around · E step back onto the snow',
     };
   }
 
@@ -1304,6 +1313,14 @@ export function createResort(opts) {
       camera.position.set(p.x + bx + dx, p.y + by, p.z + bx * 0.6 + dz);
       _aim.copy(a);
       _aim.x -= dx * 1.9; _aim.z -= dz * 1.9;            // sweep, not a slide
+      // steer pans the head: rotate the aim about the eye
+      if (Math.abs(hutPan) > 1e-3) {
+        const ang = hutPan * 1.15;
+        const ex = _aim.x - camera.position.x, ez = _aim.z - camera.position.z;
+        const ca2 = Math.cos(ang), sa2 = Math.sin(ang);
+        _aim.x = camera.position.x + ex * ca2 - ez * sa2;
+        _aim.z = camera.position.z + ez * ca2 + ex * sa2;
+      }
       // the drink comes up towards the lens: follow it a touch
       const rise = drink ? Math.min(1, drinkT / T_SIP) : 0;
       _aim.y += Math.sin(rise * Math.PI) * 0.05;
@@ -1417,6 +1434,9 @@ export function createResort(opts) {
       blend = 0;
       return { x, z: zz };
     },
+
+    /** Probe hook: the warmth tank takes eleven minutes to drain honestly. */
+    setWarmth(v) { warmth = clamp(v, 0, 1); return warmth; },
 
     info() {
       return {
