@@ -46,13 +46,88 @@ const MU_LAT_EDGE = 3.20;   // grip per sin(phi): ~2.3 g at 30 deg, ~3.5 g laid 
 const MU_SNOW = 0.045;      // kinetic snow friction, running flat
 const DRAG_UP = 0.0042;     // 1/m, upright (terminal ~20 m/s on a 12 deg pitch, 28 on 20)
 const DRAG_TUCK = 0.0020;   // 1/m, tucked  (terminal ~29 m/s on a 12 deg pitch, 40 on 20)
-const EDGE_W = 13.0;        // rad/s, edge-angle spring (weight transfer ~0.25 s)
-const EDGE_RATE_MAX = 9.0;  // rad/s
+// ---- edge dynamics ---------------------------------------------------------
+// The edge angle is not a slider the input writes; it is where the rider's mass
+// is, and mass takes time to move. Two nested limits model that:
+//
+//   EDGE_W        a critically damped spring that TRACKS the commanded edge. Set
+//                 high (18 rad/s) on purpose — it is not the thing that slows the
+//                 turn down, it just must not lag or ring. Making the spring slow
+//                 instead produced a t^2 onset: the first 100 ms were dead and
+//                 then it slammed, which is the worst of both.
+//   EDGE_RATE_*   the real limit — how fast the edge angle itself can change.
+//                 Tipping the ski from flat is quick; laying it further over once
+//                 you are already inclined at 2 g means moving the whole body
+//                 across the skis against that load, and it gets progressively
+//                 harder. So the ceiling FADES with edge angle:
+//
+//                     rate_max(phi) = EDGE_RATE_SET * (1 - FADE * (|phi|/PHI_MAX)^P)
+//
+//                 2.30 rad/s flat (132 deg/s) down to 0.87 rad/s at full lock.
+//                 That single line is what turns "tap = instant 60 deg" into an
+//                 arc that keeps tightening for the better part of a second:
+//                 ~8 deg at 100 ms, 30 deg at 300 ms, 90% at 0.61 s, lock at 0.79 s.
+//                 The ceiling is untouched — full lock is still full lock.
+//
+//                 Releasing is the reverse move and gravity helps, so it gets its
+//                 own, higher limit. It stays well short of the old 7.5 /s snap so
+//                 that letting go of a turn no longer trips the rebound pop.
+//
+// Note it is a function of |phi| ONLY, never of load: load differs between a left
+// and a right turn on any traverse, and the input->edge chain has to be exactly
+// mirror-symmetric.
+const EDGE_W = 18.0;          // rad/s, edge-angle tracking spring
+const EDGE_RATE_SET = 2.30;   // rad/s, edge-roll ceiling from flat
+const EDGE_SET_FADE = 0.62;   // ...falling to (1-FADE) of that at full lock
+const EDGE_SET_P = 1.3;       // ...with this shape
+const EDGE_RATE_REL = 4.20;   // rad/s, releasing an edge (standing up is easy)
+const POP_FLAT = 1.30;      // m/s, pop on the flat: an unweight, ~8 cm
+const POP_LIP = 3.20;       // m/s, extra, and only what the terrain earns you
 const AIR_YAW = 2.0;        // rad/s, in-air rotation authority
 const LEG_TRAVEL = 0.45;    // m of leg extension before the skis really leave the snow
 const AIR_REPORT = 0.07;    // s of real flight before `airborne` is published
 const SKI_LEN = 1.7;        // m, contact footprint — a ski bridges sub-metre holes
 const LAT_ARM = 1.2;        // m, cross-ski arm used for the contact-plane gradient
+// ---- lips ------------------------------------------------------------------
+// The leg-travel model below is what stopped the rider skipping like a stone
+// (64% of a straight coast used to be "airborne"), and it works because it
+// refuses to call anything a take-off until the body has floated the whole
+// 0.45 m. On a kicker that refusal costs 5 m: the rider was measured riding the
+// deck past the knuckle and only separating 2-5 m late, which is the "floaty"
+// take-off. Both are the same number doing two jobs.
+//
+// So the travel is not a constant — it is how far the legs can extend BEFORE THE
+// SKI RUNS OUT OF SNOW, and that depends on whether there is any snow ahead:
+//
+//   * over a ripple or a mogul crest the ground comes back up to meet the ski,
+//     the ski is supported the whole way, and the rider gets all 0.45 m;
+//   * over a knuckle the ground is simply gone for twenty metres, the ski is
+//     bridging a hole, and the travel that matters is nearly none.
+//
+// `lipDrop` (see `_contact`) is that test, measured rather than guessed: how far
+// the ground 6 m ahead has fallen below the plane the ski is riding on, in slope
+// units. Measured distributions — this is the whole reason for the look-ahead:
+//
+//                        open piste (p95 / p99 / max)     kickers, at the knuckle
+//   contact convexity        0.136 / 0.164 / 0.198              0.17 - 0.21
+//   lipDrop                  0.151 / 0.202 / 0.222              0.24 - 0.34
+//
+// Convexity alone cannot tell a mogul from a take-off — the ranges overlap
+// completely, and thresholding it would put the rider in the air off bumps.
+// lipDrop separates them, because "does the ground come back" is exactly the
+// question. With the band below, an open-piste coast trips the shortened travel
+// on 0.25% of substeps (against 0.42% of the run already spent airborne, i.e.
+// inside the existing noise) while the kickers separate 2.5-3 m earlier.
+//
+// Tried and rejected: probing at 3 m as well and taking the smaller drop, on the
+// theory that boulder terrain fools a single 6 m extrapolation. It changed the
+// off-piste behaviour not at all (the ridge line really is falling away at both
+// distances — it is a cliff band) and cost 1.5 m of take-off sharpness on the
+// kickers. One probe.
+const LOOK_AHEAD = 6.0;     // m, lip probe: how far ahead the ground must stay gone
+const LIP_DROP0 = 0.12;     // ...below this, the ground ahead is still there
+const LIP_DROP1 = 0.30;     // ...above this, the ski is bridging a hole
+const LIP_BITE = 0.85;      // fraction of the leg travel a full lip takes away
 const SUBSTEP = 1 / 120;
 const MAX_START_TRAVERSE = 0.60;  // rad (34 deg) — a reset points down a mellow run
 const MAX_START_STEEP = 1.22;     // rad (70 deg) — ...but you traverse a steep face
@@ -89,6 +164,8 @@ export class SkiPhysics {
     this.preload = 0;        // jump pre-load charge 0..1
     this.jumpHeld = false;
     this.reboundCd = 0;
+    this.nPop = 0;         // diagnostics: how often each air source actually fires
+    this.nRebound = 0;
     this.compression = 0;    // suspension compression 0..1 (landings + turn load)
     this.landImpact = 0;
     this.lastAirTime = 0;
@@ -103,6 +180,9 @@ export class SkiPhysics {
     this.yFree = 0;          // shadow ballistic path of the centre of mass
     this.vFree = 0;
     this.squash = 0;         // legs compressed by the snow pushing up, 0..1
+    this.convex = 0;         // contact-line curvature, slope units (+ = crest)
+    this.lipDrop = 0;        // how far the ground ahead falls below the ski plane
+    this.lipS = 0;           // smoothed lip signal that shortens the leg travel
 
     // --- smoothed / display ---------------------------------------------------
     this.nSmooth = new THREE.Vector3(0, 1, 0);
@@ -179,10 +259,11 @@ export class SkiPhysics {
     this.phi = 0; this.phiRate = 0; this.grounded = true;
     this.aLat = 0; this.aLatS = 0; this.aLong = 0; this.omega = 0; this.slip = 0; this.slipAngle = 0;
     this.turnRadius = Infinity; this.skidding = false; this.gripPenalty = 0;
-    this.preload = 0; this.jumpHeld = false; this.reboundCd = 0;
+    this.preload = 0; this.jumpHeld = false; this.reboundCd = 0; this.nPop = 0; this.nRebound = 0;
     this.compression = 0; this.landImpact = 0; this.lastAirTime = 0; this.gSpike = 0;
     this.roughness = 0; this.incline = 0; this.airT = 0; this.jumpBuf = 0; this.pending = 0;
     this.vSurf = state.vel.y; this.gap = 0; this.squash = 0;
+    this.convex = 0; this.lipDrop = 0; this.lipS = 0;
     this.yFree = state.pos.y; this.vFree = state.vel.y;
     this.nSmooth.copy(n);
     this.pitchS = Math.asin(clamp(this._f.y, -1, 1));
@@ -229,9 +310,28 @@ export class SkiPhysics {
     const fl = Math.hypot(fx, fz);
     if (fl > 1e-6) { fx /= fl; fz /= fl; } else { fx = 0; fz = -1; }
 
+    const h0 = T.height(x, z);
     const hFa = T.height(x + fx * a, z + fz * a), hBa = T.height(x - fx * a, z - fz * a);
     const hFb = T.height(x + fx * b, z + fz * b), hBb = T.height(x - fx * b, z - fz * b);
-    const h = 0.34 * T.height(x, z) + 0.22 * (hFa + hBa) + 0.11 * (hFb + hBb);
+    const h = 0.34 * h0 + 0.22 * (hFa + hBa) + 0.11 * (hFb + hBb);
+
+    // ---- lip geometry, for the separation test in `_step` -------------------
+    // Convexity of the contact line, in slope units: how much the ground breaks
+    // between the tail half of the ski and the tip half. Zero on any straight
+    // face however steep, positive over a crest, negative in a compression. Free
+    // — the four samples are already here.
+    const sTail = (h0 - hBb) / b;
+    this.convex = (sTail - (hFb - h0) / b);
+    // ...but convexity alone cannot tell a kicker's knuckle from a mogul crest:
+    // measured on the open piste, convexity reaches 0.20 and the kickers only
+    // peak at 0.17-0.21. What separates them is what happens NEXT. A mogul crest
+    // is followed by a trough that comes back up to meet the ski; a knuckle is
+    // followed by twenty metres of nothing. So look ahead one ski-length-plus and
+    // ask how far the ground has fallen BELOW the plane the ski is currently on:
+    // that is the gap the ski would have to bridge, and it is the difference
+    // between a bump and a take-off.
+    const hAhead = T.height(x + fx * LOOK_AHEAD, z + fz * LOOK_AHEAD);
+    this.lipDrop = (h0 + sTail * LOOK_AHEAD - hAhead) / LOOK_AHEAD;
 
     if (outN) {
       const rx = -fz, rz = fx;                       // r = f x up  (see header)
@@ -259,14 +359,40 @@ export class SkiPhysics {
     const loadPrev = Math.abs(this.aLat) / G;
     const phiTarget = steer * PHI_MAX * (1 - 0.45 * brake);
     const acc = EDGE_W * EDGE_W * (phiTarget - this.phi) - 2 * EDGE_W * this.phiRate;
-    this.phiRate = clamp(this.phiRate + acc * dt, -EDGE_RATE_MAX, EDGE_RATE_MAX);
+    let phiRate = this.phiRate + acc * dt;
+    // Rolling further ONTO the edge (rate and angle the same sign) is the move
+    // that gets progressively harder; coming back off it, or crossing over to the
+    // other edge, is not.
+    const aNorm = Math.abs(this.phi) / PHI_MAX;
+    const rateCap = phiRate * this.phi >= 0
+      ? EDGE_RATE_SET * (1 - EDGE_SET_FADE * Math.pow(aNorm, EDGE_SET_P))
+      : EDGE_RATE_REL;
+    this.phiRate = clamp(phiRate, -rateCap, rateCap);
     this.phi = clamp(this.phi + this.phiRate * dt, -PHI_MAX, PHI_MAX);
     const absPhi = Math.abs(this.phi);
     const dPhi = (absPhi - phiPrev) / dt;
 
-    // --- jump pre-load: squat while held, release the spring on let-go --------
-    // Coyote time + a short release buffer: skimming a roller for 40 ms must
-    // never eat the player's pop.
+    // --- the pop: an UNWEIGHT that modulates a takeoff, never a jump ----------
+    // You cannot jump your way into the air on skis. What a rider actually does
+    // is extend at the lip, and what that buys is proportional to what the
+    // terrain was already giving them. So the pop is scaled by how much the snow
+    // is doing the launching at the moment it fires:
+    //
+    //   lipNow   the ground has already started falling away — the legs are
+    //            extending into the suspension travel. This is the lip.
+    //   rampNow  the contact surface is still moving UP (vSurf > 0), i.e. the
+    //            rider is on the face of a kicker or the back of a roller. On the
+    //            open piste vSurf is negative (the hill descends), so this is
+    //            zero and cannot be farmed on flat ground.
+    //   coyote   already off the lip by a frame or two — full credit.
+    //
+    // On flat ground the whole authority is POP_FLAT: 1.30 m/s, an 8 cm hop that
+    // reads as an unweight. Off a lip it adds up to 4.5 m/s and roughly doubles a
+    // kicker's hang time, which is the skill the button is there to reward.
+    //
+    // History: this used to be `pending = 3.2 + 4.3 * preload` — a 7.5 m/s launch
+    // out of nothing — and it was bound to W as well as Space, so *letting go of
+    // the forward key* threw the rider 3.7 m into the air. Never again.
     let popImpulse = 0;
     this.jumpBuf = Math.max(0, this.jumpBuf - dt);
     if (jump) {
@@ -274,29 +400,61 @@ export class SkiPhysics {
       this.preload = Math.min(1, this.preload + dt / 0.28);  // legs load, air or not
     } else if (this.jumpHeld) {
       this.jumpHeld = false;
-      this.pending = 3.2 + 4.3 * this.preload;              // charged pop
-      this.jumpBuf = 0.80;   // fires on the next contact, so a float never eats it
+      this.pending = 0.30 + 0.70 * this.preload;            // charge, 0.30..1
+      this.jumpBuf = 0.45;   // fires on the next contact, so a float never eats it
       this.preload = 0;
     } else {
       this.preload = Math.max(0, this.preload - dt * 3);
     }
     if (this.pending > 0) {
       if (this.grounded || this.airT < 0.12) {              // coyote time
-        popImpulse = this.pending; this.pending = 0; this.jumpBuf = 0;
+        // Evaluated when it FIRES, not when the key was released, so the buffer
+        // lets a slightly early release still catch the lip.
+        const lipNow = clamp(this.gap / (LEG_TRAVEL * 0.5), 0, 1);
+        const rampNow = clamp(this.vSurf / 2.5, 0, 1);
+        const lip = this.grounded ? clamp(Math.max(lipNow, 0.7 * rampNow), 0, 1) : 1;
+        popImpulse = this.pending * (POP_FLAT + POP_LIP * lip);
+        this.nPop++;
+        this.pending = 0; this.jumpBuf = 0;
       } else if (this.jumpBuf === 0) {
         this.pending = 0;                                   // buffer expired
       }
     }
 
-    // --- rebound: unloading a loaded turn throws you up ------------------------
+    // --- rebound: unloading a loaded turn extends the LEGS ---------------------
+    // Cross-over rebound is real, and the old code modelled it as a launch: a
+    // straight-to-the-sky impulse whenever a >1.45 g edge was released quickly.
+    // Measured, that put the rider airborne for 12.6% of a 2 s-period linked-carve
+    // run — i.e. "let go of the turn key and jump", the same defect as the old W
+    // binding wearing a physics costume.
+    //
+    // It is fixed by putting the energy where it actually goes. A decambering ski
+    // pushes the rider's mass UP THROUGH THE LEGS; whether that takes the skis off
+    // the snow is not the rebound's decision, it is the suspension's — exactly the
+    // question `gap > LEG_TRAVEL` already answers for terrain. So the rebound only
+    // seeds the free-flight path of the centre of mass (see the suspension block
+    // below) and the existing model decides the rest.
+    //
+    // That makes the guarantee arithmetic rather than a threshold to tune:
+    // separation on even ground needs sqrt(2*G*LEG_TRAVEL) = 3.15 m/s and
+    // REBOUND_MAX is 1.25, so a rebound there CANNOT put the rider in the air —
+    // the most it can do is extend the legs by v^2/2G = 7 cm, which is what a
+    // rebound looks like. Over a roll, where the snow is already dropping away
+    // and the legs are part-extended, the same 1.25 m/s can carry the gap past
+    // the travel limit and you fly. Which is when a rebound really does.
+    //
+    // Measured over 40 s of 2 s-period linked carving: it fires 16 times and the
+    // run is 3.3% airborne, essentially all of it terrain the carve crosses at
+    // speed (the same line spends 0.7% airborne with no input at all). The old
+    // launch-impulse version fired every turn and spent 12.6% airborne.
+    const REBOUND_MAX = 1.25;  // m/s; < sqrt(2*G*LEG_TRAVEL) = 3.15 by construction
+    let reboundV = 0;
     this.reboundCd = Math.max(0, this.reboundCd - dt);
-    // Real cross-over unweights; it does not launch you every turn. Firing this
-    // on any 1 g turn put the rider airborne for ~30% of a linked-carve run and
-    // taxed him a touchdown each time, so it wants a genuinely loaded edge.
     if (this.grounded && !this.jumpHeld && this.reboundCd === 0 &&
-        dPhi < -2.6 && loadPrev > 1.45 && brake < 0.5) {
-      popImpulse += Math.min(1.1, (loadPrev - 1.35) * 1.1);
-      this.reboundCd = 0.45;
+        dPhi < -2.8 && loadPrev > 1.60 && brake < 0.5) {
+      reboundV = Math.min(REBOUND_MAX, (loadPrev - 1.5) * 1.3);
+      this.reboundCd = 0.50;
+      this.nRebound++;
     }
 
     // --- ground sample --------------------------------------------------------
@@ -437,11 +595,26 @@ export class SkiPhysics {
         this.gap = this.yFree - ghNew;
         if (this.gap <= 0) { this.yFree = ghNew; this.vFree = vSurf; this.gap = 0; }
       }
+      // Rebound enters here and nowhere else: it is a push through the legs, so it
+      // accelerates the centre of mass along the same free path the terrain uses.
+      // On even ground the legs swallow it (see REBOUND_MAX); where the snow is
+      // already dropping away it can carry the gap past LEG_TRAVEL and the rider
+      // genuinely comes off the roll.
+      if (reboundV > 0) {
+        if (this.gap <= 0) { this.yFree = ghNew; this.vFree = vSurf; }
+        this.vFree += reboundV;
+        this.gap = Math.max(this.gap, 1e-4);
+      }
       // How hard the snow is pushing UP into the rider — the other half of the
       // suspension, and what makes a compression feel heavy.
       this.squash += (clamp(-need / (G * 1.6), 0, 1) - this.squash) * Math.min(1, dt * 12);
 
-      if (popImpulse > 0 || this.gap > LEG_TRAVEL) {
+      // How much travel the legs actually have here — full on ground that comes
+      // back, almost none where the ski is bridging a hole. See LIP_* above.
+      const travel = LEG_TRAVEL * (1 - LIP_BITE * smoothstep(this.lipDrop, LIP_DROP0, LIP_DROP1));
+      this.lipS = 1 - travel / LEG_TRAVEL;
+
+      if (popImpulse > 0 || this.gap > travel) {
         this.grounded = false;
         this.airT = 0;
         // Leave the lip on the path the body was already on.
@@ -611,6 +784,11 @@ export class SkiPhysics {
 
     m.aLong = this.aLong;
     m.grip = this.gripPenalty;
+    m.nPop = this.nPop;
+    m.nRebound = this.nRebound;
+    m.convex = this.convex;
+    m.lipDrop = this.lipDrop;
+    m.lipS = this.lipS;
   }
 
   /** Never let a NaN escape into the rest of the engine. */

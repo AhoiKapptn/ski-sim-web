@@ -6,9 +6,25 @@
  * physics' business.
  *
  *   A / D, ←/→ or left stick X   steer   (-1 right .. +1 left)
- *   S / ↓ / Shift or RT          tuck    (0..1 analogue)
- *   Space / W / ↑ or A-button    jump    (hold to pre-load, release to pop)
+ *   W / ↑ / S / ↓ / Shift or RT  tuck    (0..1 analogue — get low, go faster)
  *   Ctrl / X or LT               brake   (0..1, hockey stop)
+ *   Space or A-button            pop     (hold to pre-load, release to unweight)
+ *
+ * There is no "forward" in skiing — gravity is the throttle — so both the
+ * "forward" key (W/↑) and the "get low" key (S/↓/Shift) drive the same tuck
+ * channel. Whichever mental model the player brings, the key that should make
+ * them faster does.
+ *
+ * ### Space is a pop, not a jump, and NOTHING else touches it
+ *
+ * W/↑ used to be bound to `jump` alongside Space, and physics.js fires its pop on
+ * key *release*. So the most natural key in the scheme — hold to go, let go to
+ * coast — launched the rider 3.7 m into the air. That binding is gone and must
+ * not come back: air is earned from terrain (see the leg-travel/`gap` model in
+ * physics.js), not from a keystroke. Space itself now only *modulates* a takeoff;
+ * on flat ground its whole authority is a ~8 cm unweight.
+ *
+ * If you add a key here, ask what happens when the player *releases* it.
  *
  * `window.__inputOverride = {steer,crouch,jump,brake}` lets tools/motion-trace.mjs
  * drive a scripted run; set it to null to hand control back.
@@ -31,6 +47,29 @@ function ramp(cur, target, attack, release, dt) {
   const m = rate * dt;
   return Math.abs(d) <= m ? target : cur + Math.sign(d) * m;
 }
+
+// --- steering feel -----------------------------------------------------------
+// A digital key has to stand in for a stick, and the shape of that stand-in is
+// most of what "how a turn feels" means.
+//
+//   STEER_ATTACK   how fast holding the key builds *commitment*. Was 4.2 /s, so
+//                  a tap reached full lock in ~0.24 s and the turn read as a
+//                  switch: on, 60 deg of edge, 10 m radius. 2.2 /s spreads the
+//                  build over ~0.45 s and the physics' edge-rate limit stretches
+//                  it further, so the arc keeps tightening the longer you hold.
+//   STEER_RELEASE  weight transfer really is asymmetric — standing up out of a
+//                  turn is far quicker than moving your mass inside one. Kept
+//                  ~2.7x the attack rate, but no longer so violent that it trips
+//                  the physics' rebound pop.
+//   STEER_KICK     the *anti*-lag term, and the reason slowing the ramp does not
+//                  make the controls mushy: the instant a steer key goes down the
+//                  skis tip onto a small edge. Real too — tipping the ski is
+//                  instant, it is moving the body inside the arc that takes time.
+//                  Applied BEFORE the speed shaping below, so the initial bite is
+//                  ~0.2 g at any speed rather than a fixed edge angle.
+const STEER_ATTACK = 2.2;
+const STEER_RELEASE = 6.0;
+const STEER_KICK = 0.16;
 
 export function createControls() {
   const keys = Object.create(null);
@@ -92,16 +131,22 @@ export function createControls() {
       if (g && Math.abs(g.steer) > 0.02) {
         steer = g.steer;                                    // analogue: direct
       } else {
-        steer = ramp(steer, kSteer, 4.2, 7.5, step);        // keyboard: shaped ramp
+        steer = ramp(steer, kSteer, STEER_ATTACK, STEER_RELEASE, step);
+        // Tip the skis at once, then build. Only from (near) flat — coming off
+        // the opposite edge the ramp has to walk through zero on its own or the
+        // cross-over would snap.
+        if (kSteer !== 0 && Math.abs(steer) < STEER_KICK) steer = kSteer * STEER_KICK;
       }
 
       // --- tuck / brake -----------------------------------------------------
-      const kTuck = k('KeyS', 'ArrowDown', 'ShiftLeft', 'ShiftRight') ? 1 : 0;
+      // W/↑ are tuck, NOT jump. See the header: their release used to launch the
+      // rider, which is the one thing a ski sim must never do.
+      const kTuck = k('KeyW', 'ArrowUp', 'KeyS', 'ArrowDown', 'ShiftLeft', 'ShiftRight') ? 1 : 0;
       const kBrake = k('ControlLeft', 'ControlRight', 'KeyX') ? 1 : 0;
       tuck = ramp(tuck, g ? Math.max(g.tuck, kTuck) : kTuck, 3.0, 4.5, step);
       brake = ramp(brake, g ? Math.max(g.brake, kBrake) : kBrake, 5.0, 7.0, step);
 
-      const jump = k('Space', 'KeyW', 'ArrowUp') || !!(g && g.jump);
+      const jump = k('Space') || !!(g && g.jump);
 
       // --- speed-shaped steering --------------------------------------------
       // The same stick travel means very different things at 5 m/s and at 30 m/s:
