@@ -933,20 +933,42 @@ const PISTE_HALF = 200;
 // lip has to throw you off it, and the table has to be short enough that
 // separation happens before the knuckle rather than at it.
 //
-// Why the jumps are as big as they are, and why the lips are not steeper
-// ---------------------------------------------------------------------
-// Both are set by the hill, not by taste. The trajectory always arrives at
-// roughly (slope + 17 deg) below horizontal for a launch 20 degrees off the
-// slope, so on a 14-degree piste a *matched* landing is 30 degrees — and a
-// landing pitched 16 degrees steeper than the ground it is cut into digs
-// 0.29 m per metre. Thirty metres of landing is therefore a 4 m excavation,
-// which is the real, physical reason a park is built on a 20-degree pitch and
-// not a 14-degree one. Steepening the lips past ~13 degrees pushes the arrival
-// angle past 40 degrees, which is a landing this hill cannot hold.
+// Why the kickers are as big as they are
+// --------------------------------------
+// The takeoff angle is the design input — 25 degrees above horizontal on the
+// kickers, 27 on the booter, held straight over the last 5 m — and everything
+// else in the feature falls out of it. Two consequences are worth stating
+// because both look like mistakes until you do the arithmetic:
 //
-// It also does not buy much: a taller lip is a hill the rider has to climb, and
-// the speed it costs very nearly cancels the extra launch angle. The booter's
-// lip is twice the kicker's and its gap is 4 m longer.
+// 1. A 25-degree ramp on a 17-degree pitch is a TALL structure. The ramp climbs
+//    away from the grade at tan(25) + m0 = 0.76 m per metre, and the transition
+//    under it contributes half its own length at the same rate, so
+//        lipH ~= (tan(theta) + m0) * (L_straight + L_transition/2)
+//    With the 5 m straight the user's brief asks for and a transition long
+//    enough to stay under ~3.5 g at 21 m/s (7 m), that is 7.9 m of lip on
+//    kicker1. There is no way to have all three of a 25-degree ramp, a 5 m
+//    straight section and a 4 m lip on this pitch — the first cut of this table
+//    tried, and needed a 3 m transition, which is 10 g. Real parks solve it the
+//    other way: a big-air takeoff IS a 6-9 m structure, and the ones that are
+//    4 m tall have 2 m straights behind a long transition.
+//
+// 2. THE LANDING ANGLE IS NOT A FREE VARIABLE and steepening it buys nothing.
+//    The arrival angle for a launch theta onto a surface falling at beta is
+//    atan(tan(theta) + 2 tan(beta)), so the *mismatch* the rider eats is
+//        f(beta) = atan(tan(theta) + 2 tan(beta)) - beta
+//    and df/dbeta is about -0.04 near beta = 15 deg: essentially flat. Measured
+//    over the whole design sweep (landing pitched grade+11 to grade+18, landing
+//    length 46 to 54 m) the touchdown mismatch never left 28-31 degrees, while
+//    the excavation went from 1.4 m to 9.6 m and the feature grew 60 m. So the
+//    landing here is pitched at the SHALLOW end of that band — it is the one
+//    that closes without digging a trench across the piste, and it costs
+//    nothing in landing violence that the steep one would have saved.
+//
+// What a steeper lip does cost, honestly: separation moves from 5.3 m past the
+// lip to ~1.5 m (the point of the exercise), the gap roughly doubles, and the
+// landing goes from ~7 m/s of closing speed to ~12. That is a real price and it
+// is charged by the hill, not by the table: at a 21 m/s approach a 25-degree
+// takeoff is a 45 m flight whatever is built under it.
 const PARK_PROFILES = {
   // Roller. No lip worth the name — a smooth convex crest, 1.6 m proud of the
   // piste, that unweights you and gives about a metre of float. This is the
@@ -974,10 +996,13 @@ const PARK_PROFILES = {
     [26, 0.15, 1],
     [null, null],
   ],
-  // The kicker. ~2.8 m lip at 6 degrees up, a 2.4 m table, then a knuckle and
-  // 34 m of landing at grade + 12 degrees. ~25 m gap, 1.3 s, 2.3 m over the
-  // take-off plane.
-  kicker: [
+  // The mellow kicker, kept for the hip. This is the pre-2026-07 kicker shape:
+  // a 6-degree ramp that never really breaks, so the rider drifts off the
+  // knuckle 5 m past the lip rather than being thrown at the lip. As a KICKER
+  // that is the defect this pass exists to fix; as a HIP it is right, because a
+  // hip is taken across the fall line at half the approach speed and its whole
+  // point is that you can carry a line over it rather than boost off it.
+  hip: [
     [-16, null], [-11, null],
     [-6.5, 0.06], [-2.0, -0.05],       // transition, then the ramp
     [0, -0.05], [1.2, 0.10],           // lip: 0.15 of slope in 1.2 m
@@ -987,18 +1012,56 @@ const PARK_PROFILES = {
     [46, 0.22, 1],
     [null, null],
   ],
-  // The booter. ~3.9 m lip at 15.6 degrees up, a 4.9 m table with a 5 m knuckle
-  // to case, 37 m of landing. ~28 m gap, 1.6 s, 3.4 m up. Its landing is
-  // deliberately 11 degrees shallower than the arrival angle rather than
-  // matched: overshooting the biggest jump on the hill should cost something.
+  // The kicker. A real park takeoff, in the order a shaper builds it:
+  //
+  //   -25..-15   flat compacted run-in, at grade, moguls tilled off it
+  //   -15..-13   the run-in flattens off to 7 deg — the last bit of speed you
+  //              can still scrub, and the foot of the transition
+  //   -13..-6    the transition, 7 m of it, sweeping 32 degrees. That is
+  //              ~0.084 /m of curvature: 3.4 g at 21 m/s, which is what a big
+  //              kicker's transition actually pulls. Shorter is not "punchier",
+  //              it is a kink the suspension eats and the eye reads as a fold.
+  //    -6..-0.9  THE RAMP: 5.1 m dead straight at 25 degrees above horizontal.
+  //              This is the whole point of the feature. It is what the rider
+  //              leaves on and what the silhouette is made of.
+  //   -0.9..0    the lip. The surface angle runs from +25 deg to exactly 0 in
+  //              0.9 m — 0.52 of slope, four times the old table's break — so
+  //              the crest sits precisely at t = 0 and `terrain.jumps[].x/z/y`
+  //              is honest. At 19 m/s that break is 190 m/s^2 of ground falling
+  //              away and the legs are out of travel 1.5 m later.
+  //    0..2.4    the table. Dead level, because a table is level.
+  //   2.4..4.8   the knuckle, rolling over into the landing.
+  //   4.8..52    the landing at grade + 11.3 deg. Long, because the flight is
+  //              44-47 m; shallow, because steeper does not reduce the mismatch
+  //              (see the note above) and does dig a trench.
+  //     52..64   the compression, then the solved run-out.
+  kicker: [
+    [-22, null], [-17, null],
+    [-15, 0.12],
+    [-6, -0.4663],                     // tan 25 deg
+    [-0.9, -0.4663],                   // 5.1 m of straight ramp
+    [0, 0.0],                          // the lip: crest exactly at t = 0
+    [2.4, 0.0],                        // level table
+    [4.8, -0.20, 1],                   // knuckle
+    [58, -0.20, 1],                    // landing, grade + 11.3 deg
+    [70, 0.22, 1],
+    [null, null],
+  ],
+  // The booter. The same grammar two degrees steeper and half a metre longer in
+  // every section. It sits on the mellowest anchor in the park (13.2 deg) and
+  // follows kicker1, so it is the SLOWEST feature on the line despite being the
+  // biggest — which is why its gap is 27 m against the kickers' 45 and why it
+  // is the one that reads best from the side.
   booter: [
-    [-20, null], [-14, null],
-    [-8, 0.03], [-2.4, -0.16],
-    [0, -0.16], [1.4, 0.08],
-    [5.2, 0.08],
-    [7.6, -0.26, 1],
-    [40, -0.24, 1],
-    [52, 0.24, 1],
+    [-24, null], [-18, null],
+    [-15, 0.10],
+    [-6.6, -0.5095],                   // tan 27 deg
+    [-1.0, -0.5095],                   // 5.6 m of straight ramp
+    [0, 0.0],
+    [3.0, 0.0],                        // table
+    [5.8, -0.22, 1],                   // knuckle
+    [54, -0.22, 1],                    // landing, grade + 12.4 deg
+    [66, 0.24, 1],
     [null, null],
   ],
 };
@@ -1025,26 +1088,93 @@ const PARK_PROFILES = {
 // Flank angle is the constraint on the widths, and it is a hard one. The bank
 // down the side of a feature is 1.5 * height / feather at its steepest, and the
 // rock mask's macro term switches on at 0.55 rad — 31.5 degrees. Take the
-// booter's 4.2 m deck to a 7.5 m feather, as a real 12 m-wide kicker would, and
-// the flank stands at 40 degrees, `macroGate` opens, and the sides of the jump
-// render as bedrock. So every feather here is at least 2.6 x the deck height,
-// and `terrJumps` additionally biases the rock-exposure channel down over the
-// park (see GLSL_DISPLACE_BODY) so there is margin on top of that.
+// booter's deck to a 7.5 m feather, as a real 12 m-wide kicker would, and the
+// flank stands at 40 degrees, `macroGate` opens, and the sides of the jump
+// render as bedrock.
+//
+// The 25-degree ramps made this binding rather than academic: a 7.9 m lip needs
+// a 24 m feather to hold 31.5 degrees, which is a 58 m wide jump, and that is
+// absurd. So the trade was taken the other way — the feathers here hold the
+// flanks at 39-42 degrees, which is what a shaped kicker's side actually stands
+// at, and `terrJumps` now emits a SECOND coverage channel that saturates across
+// the whole flank and biases the rock-exposure channel by 3x more than the old
+// one did. Measured with the mask arithmetic in snow-material.js: worst-case
+// talus threshold over the flank 0.89 rad against a 0.73 rad surface, i.e. 9
+// degrees of headroom where the old bias left -6.
 const JUMP_DATA = [
   { name: 'roller',   kind: 'roller',   z: 645, off: 0, w0: 4.5, w1: 11, yaw: 0 },
   // 150 m of clean piste here: the `closeup` framing spawns at z 480 and
   // settles to 457, and it has to settle onto flat groomed snow.
-  { name: 'kicker1',  kind: 'kicker',   z: 400, off: 10, w0: 5.0, w1: 15, yaw: 0 },
-  { name: 'booter',   kind: 'booter',   z: 260, off: -14, w0: 5.5, w1: 16.5, yaw: 0 },
-  { name: 'hip',      kind: 'kicker',   z: 125, off: 20, w0: 5.0, w1: 13, yaw: -0.30 },
+  { name: 'kicker1',  kind: 'kicker',   z: 400, off: 12, w0: 5.0, w1: 17.5, yaw: 0 },
+  { name: 'booter',   kind: 'booter',   z: 260, off: -16, w0: 5.5, w1: 18.0, yaw: 0 },
+  { name: 'hip',      kind: 'hip',      z: 125, off: 20, w0: 5.0, w1: 13, yaw: -0.30 },
   { name: 'stepdown', kind: 'stepdown', z: 5, off: -6, w0: 4.5, w1: 11, yaw: 0.10 },
-  // ...and stops at z -200, well clear of the `steep` framing at -260/-338.
-  { name: 'kicker2',  kind: 'kicker',   z: -120, off: 8, w0: 5.0, w1: 15, yaw: 0 },
+  // ...and stops at z -215, well clear of the `steep` framing at -260/-338.
+  { name: 'kicker2',  kind: 'kicker',   z: -120, off: 8, w0: 5.0, w1: 15.5, yaw: 0 },
 ];
 
 /** Metres over which the mogul suppression fades in at each end of a feature. */
 const PARK_FADE = 6.0;
 const PARK_IFADE = 1 / PARK_FADE;
+
+/**
+ * Lateral window weight at which the rock-exposure bias is already at full
+ * strength. The bank down a kicker's flank is steepest where W ~ 0.5, so the
+ * bias has to saturate well outside that or it is at half strength exactly
+ * where the mask is closest to opening. See `_jumpGLSL`.
+ */
+const PARK_ROCK_W = 0.30;
+
+/**
+ * The cross-section of a feature — and the reason the first cut of this park
+ * photographed as a snow dome rather than as a kicker.
+ *
+ * The lateral window used to be a plain cubic smoothstep, whose gradient is
+ * zero at the deck edge, peaks half way down and returns to zero at the toe.
+ * That is a *hill*: there is no line anywhere on it, so from the side, from the
+ * landing, from anywhere except straight up the ramp, the feature reads as a
+ * natural mound with a flat bit on top. Every reference photograph of a park
+ * kicker has exactly one strong line in it — the deck edge, where the machine
+ * stopped and the shovel started — and a long flat-ish bank under it.
+ *
+ * So the window is now built from its DERIVATIVE, as a trapezoid: the bank
+ * angle ramps in over the first `R` of the feather, holds dead constant (a
+ * planar bank — the thing that catches the light as one facet), then eases out
+ * over the last `S` into the snow. Height is the integral, so it is piecewise
+ * quadratic and C1 exactly as before; only the curvature is redistributed, out
+ * of the middle of the bank and into a 1.6 m shoulder at the deck edge.
+ *
+ * K normalises it so the window still falls from 1 to 0 across the feather:
+ *   K = 1 / (1 - R/2 - S/2).
+ * The peak lateral gradient is K*D/feather rather than 1.5*D/feather, so a
+ * crisper edge is also a slightly *shallower* flank for the same width.
+ */
+const PARK_WIN_R = 0.12;                                   // shoulder, fraction of the feather
+const PARK_WIN_S = 0.42;                                   // toe
+const PARK_WIN_K = 1 / (1 - PARK_WIN_R * 0.5 - PARK_WIN_S * 0.5);
+/**
+ * How far the park pushes the rock-exposure channel down, in units of the
+ * rock-exposure channel. snow-material.js spends it at `talus -= expo * 0.28`.
+ *
+ * Sized from the mask arithmetic rather than by eye. The steepest surface
+ * measured anywhere on the new features is 0.85 rad (49 deg — the bank half way
+ * down a flank, where the lateral fall of the feather adds to the landing's own
+ * pitch). At that inclination `macroGate` is 0.96, i.e. fully open, and the
+ * worst-case stack of the fine terms in snow-material.js is
+ *
+ *   0.735 (base) - 0.78 (macro, macroBin 0) - 0.09 (rFrac) - 0.045 (curv)
+ *        - 0.045 (lee/wind) - 0.06 (streak)  =  -0.285 rad of threshold,
+ *
+ * and `alti` contributes nothing at 400 m, 240 m under the snow line. To clear
+ * a 0.85 rad surface with 0.15 rad of margin the bias has to be worth 1.13 rad,
+ * i.e. 5.0 * 0.28 = 1.40 → threshold 1.115 rad, margin 0.265 (15 degrees).
+ *
+ * The old value was 1.0, which was sized for 28-degree flanks and a *shut*
+ * gate; it is worth 0.28 rad and would leave the new flanks 0.5 rad short.
+ * `expo` has exactly one consumer, that one line, so there is nothing else for
+ * a large value here to disturb.
+ */
+const PARK_ROCK_BIAS = 5.0;
 
 /** GLSL float literal with enough digits that the GPU reads the CPU's number. */
 function glf(v) {
@@ -1842,8 +1972,9 @@ export class Terrain {
         kt, ks, kd,
         // Read-only description for anything that wants to sign, decorate or
         // announce the park. Nothing in this repo consumes it yet.
-        size: d.kind === 'roller' ? 'small' : d.kind === 'kicker' ? 'medium' : 'large',
-        lipH: 0, deckH: 0, deckLen: 0, runOut,
+        size: d.kind === 'roller' || d.kind === 'stepdown' ? 'small'
+          : d.kind === 'hip' ? 'medium' : d.kind === 'kicker' ? 'large' : 'xl',
+        lipH: 0, deckH: 0, deckLen: 0, runOut, lipT: 0,
         lipZ: z0, landingZ: 0, width: d.w1 * 2,
       };
       // Descriptive numbers, read straight off the resolved profile.
@@ -1851,14 +1982,50 @@ export class Terrain {
         if (kt[i] === 0) j.lipH = kd[i];
         if (kd[i] > j.deckH) { j.deckH = kd[i]; j.deckLen = kt[i]; }
       }
+      // Where the LIP actually is, as opposed to where the table says it is.
+      //
+      // This is not bookkeeping. `x, z, y` is documented as "the lip" and it is
+      // the anchor every future consumer — signage, an AI line, a HUD cue —
+      // will trust. A C1 profile rounds its crest over the segment in which the
+      // slope changes sign, so the crest is at the zero of the *offset* slope
+      // minus the grade, `s = m0`, and there is no reason for that to land on a
+      // knot unless the table is written to put it there. The shape this file
+      // shipped with had the ramp still climbing at t = 0 and the crest 0.93 m
+      // downhill of it — measured on the built surface, height still rising
+      // from t = 0 to t = +1. Every kicker table here now ends its ramp with a
+      // knot at exactly (0, absolute slope 0), so the crest is the knot, and
+      // this check fails loudly if an edit breaks that again.
+      for (let i = 0; i < n - 1; i++) {
+        const s0 = ks[i] - m0, s1 = ks[i + 1] - m0;
+        if (s0 > 0 && s1 <= 0 && kt[i] > -12 && kt[i] < 12) {
+          j.lipT = kt[i] + (kt[i + 1] - kt[i]) * (s0 / (s0 - s1));
+          break;
+        }
+      }
+      if (Math.abs(j.lipT) > 0.05 && (d.kind === 'kicker' || d.kind === 'booter')) {
+        console.warn(`[terrain] park "${d.name}": the crest is ${j.lipT.toFixed(2)} m from t = 0, `
+          + 'so jumps[].x/z/y is not the lip. Fix the ramp knots, not this check.');
+      }
       // Where the landing surface crosses the natural grade again — the point a
-      // well-judged jump is aimed at.
+      // well-judged jump is aimed at. Solved inside the segment rather than
+      // interpolated between its ends: the landing is one 53 m segment and D is
+      // quadratic across it, so the chord is out by metres.
       for (let i = 1; i < n; i++) {
         if (kd[i - 1] > 0 && kd[i] <= 0) {
-          const f = kd[i - 1] / (kd[i - 1] - kd[i]);
-          const tl = kt[i - 1] + (kt[i] - kt[i - 1]) * f;
+          const h = kt[i] - kt[i - 1], ds = ks[i] - ks[i - 1];
+          // kd[i-1] + h*(ks[i-1]*u + ds*u^2/2) = 0, u in [0,1]
+          const A = 0.5 * h * ds, B = h * ks[i - 1], C = kd[i - 1];
+          let u;
+          if (Math.abs(A) < 1e-9) u = -C / B;
+          else {
+            const disc = Math.sqrt(Math.max(0, B * B - 4 * A * C));
+            const u1 = (-B + disc) / (2 * A), u2 = (-B - disc) / (2 * A);
+            u = (u1 >= 0 && u1 <= 1) ? u1 : u2;
+          }
+          const tl = kt[i - 1] + clamp(u, 0, 1) * h;
           j.landingZ = z0 + az * tl;
           j.landingX = x0 + ax * tl;
+          j.landingT = tl;
           break;
         }
       }
@@ -1903,13 +2070,24 @@ export class Terrain {
       const aq = q < 0 ? -q : q;
       if (aq >= j.w1) continue;
 
-      // Lateral window: flat over the deck, smoothstep down the flanks, zero
-      // value AND zero slope at both ends so the shoulder never creases.
+      // Lateral window: flat deck, a short shoulder, a planar bank, a long toe.
+      // Zero value AND zero slope at both ends so nothing creases. See
+      // PARK_WIN_R — this is the shape that makes it read as built.
       let W = 1, dW = 0;
       if (aq > j.w0) {
         const a = (aq - j.w0) * j.iwf;
-        W = 1 - a * a * (3 - 2 * a);
-        dW = -6 * a * (1 - a) * j.iwf * (q < 0 ? -1 : 1);
+        const sg = (q < 0 ? -j.iwf : j.iwf);
+        if (a < PARK_WIN_R) {
+          W = 1 - PARK_WIN_K * a * a / (2 * PARK_WIN_R);
+          dW = -PARK_WIN_K * (a / PARK_WIN_R) * sg;
+        } else if (a < 1 - PARK_WIN_S) {
+          W = 1 - PARK_WIN_K * (a - PARK_WIN_R * 0.5);
+          dW = -PARK_WIN_K * sg;
+        } else {
+          const b = (1 - a) / PARK_WIN_S;
+          W = PARK_WIN_K * PARK_WIN_S * b * b * 0.5;
+          dW = -PARK_WIN_K * b * sg;
+        }
       }
 
       const kt = j.kt, ks = j.ks, kd = j.kd;
@@ -1958,19 +2136,36 @@ export class Terrain {
   _jumpGLSL() {
     const J = this.jumps;
     if (!J || J.length === 0) {
-      return '\nvoid terrJumps( vec2 P, inout float h, inout vec2 g, out float amt ) { amt = 0.0; }\n';
+      return '\nvoid terrJumps( vec2 P, inout float h, inout vec2 g, out float amt, out float rock )'
+        + ' { amt = 0.0; rock = 0.0; }\n';
     }
     const b = this._parkBox;
     let s = `
 // ---- snow park (generated by Terrain._placeJumps) ----------------------------
 // Twin of Terrain._jumpsAt. Do not hand-edit: it is emitted from the same
 // resolved knot table the CPU sampler reads.
-void terrJumps( vec2 P, inout float h, inout vec2 g, out float amt ) {
+//
+// Two coverage channels come out of here and they are NOT the same number:
+//
+//   amt  — the lateral window itself, tapered along the axis. Drives the mogul
+//          suppression, so it has to go to zero exactly where the feature's
+//          height does, or a mogul field appears out of nothing at the seam.
+//          Its CPU twin is _jumpsAt's out[3].
+//   rock — the same coverage SATURATED across the flank. The rock mask needs a
+//          different shape: the steepest surface on a kicker is the bank half
+//          way down its flank, which is exactly where the window weight is 0.5,
+//          so a bias keyed on amt is at half strength precisely where it is
+//          needed most. Saturating at W = 0.30 puts the full bias over
+//          everything from the deck to well down the feather and still lets it
+//          reach zero at the outer edge, where the feature has no height and no
+//          gradient and there is nothing to protect.
+void terrJumps( vec2 P, inout float h, inout vec2 g, out float amt, out float rock ) {
   amt = 0.0;
+  rock = 0.0;
   if ( P.x < ${glf(b[0])} || P.x > ${glf(b[1])} ||
        P.y < ${glf(b[2])} || P.y > ${glf(b[3])} ) return;
   vec2 d;
-  float t, q, aq, W, dW, S, D, u, a;
+  float t, q, aq, W, dW, S, D, u, a, b, f;
 `;
     for (const j of J) {
       const kt = j.kt, ks = j.ks, kd = j.kd, n = kt.length;
@@ -1985,8 +2180,18 @@ void terrJumps( vec2 P, inout float h, inout vec2 g, out float amt ) {
       W = 1.0; dW = 0.0;
       if ( aq > ${glf(j.w0)} ) {
         a = ( aq - ${glf(j.w0)} ) * ${glf(j.iwf)};
-        W = 1.0 - a * a * ( 3.0 - 2.0 * a );
-        dW = -6.0 * a * ( 1.0 - a ) * ${glf(j.iwf)} * sign( q );
+        f = ${glf(j.iwf)} * sign( q );
+        if ( a < ${glf(PARK_WIN_R)} ) {
+          W = 1.0 - ${glf(PARK_WIN_K / (2 * PARK_WIN_R))} * a * a;
+          dW = -${glf(PARK_WIN_K / PARK_WIN_R)} * a * f;
+        } else if ( a < ${glf(1 - PARK_WIN_S)} ) {
+          W = 1.0 - ${glf(PARK_WIN_K)} * ( a - ${glf(PARK_WIN_R * 0.5)} );
+          dW = -${glf(PARK_WIN_K)} * f;
+        } else {
+          b = ( 1.0 - a ) * ${glf(1 / PARK_WIN_S)};
+          W = ${glf(PARK_WIN_K * PARK_WIN_S * 0.5)} * b * b;
+          dW = -${glf(PARK_WIN_K)} * b * f;
+        }
       }
 `;
       for (let i = 0; i < n - 1; i++) {
@@ -2004,7 +2209,10 @@ void terrJumps( vec2 P, inout float h, inout vec2 g, out float amt ) {
       g += vec2( ${glf(j.ax)}, ${glf(j.az)} ) * ( S * W )
          + vec2( ${glf(-j.az)}, ${glf(j.ax)} ) * ( D * dW );
       a = min( min( t - ${glf(j.t0)}, ${glf(j.t1)} - t ) * ${glf(PARK_IFADE)}, 1.0 );
-      amt = max( amt, W * a * a * ( 3.0 - 2.0 * a ) );
+      a = a * a * ( 3.0 - 2.0 * a );
+      amt = max( amt, W * a );
+      f = min( W * ${glf(1 / PARK_ROCK_W)}, 1.0 );
+      rock = max( rock, f * f * ( 3.0 - 2.0 * f ) * a );
     }
   }
 `;
@@ -2885,10 +3093,10 @@ const GLSL_FRAG_REFINE = /* glsl */`
     // true P, never at the warped Pd: that warp exists to ragged a *snowline*,
     // and wobbling a built feature with it would undo the one thing it has to
     // be, which is straight.
-    float jAmt;
+    float jAmt, jRock;
     {
       float jh = md.x;
-      terrJumps( P.xz, jh, mg, jAmt );
+      terrJumps( P.xz, jh, mg, jAmt, jRock );
     }
 
     float mSteep = atan( length( mg ) );
@@ -2909,7 +3117,8 @@ const GLSL_FRAG_REFINE = /* glsl */`
     }
     vec3 mn = normalize( vec3( -mg.x, 1.0, -mg.y ) );
     Ng = normalize( mix( Ng, mn, mMix ) );
-    snData = mix( snData, vec4( mSteep, md.y, md.z, md.w - cornAmt * 1.6 - jAmt ), mMix );
+    snData = mix( snData, vec4( mSteep, md.y, md.z,
+                                md.w - cornAmt * 1.6 - jRock * ${glf(PARK_ROCK_BIAS)} ), mMix );
   }
 }
 `;
@@ -3042,10 +3251,13 @@ const GLSL_DISPLACE_BODY = /* glsl */`
   // lines and the corduroy are both fully retired, so a kicker's ramp and its
   // landing come out smooth and salted while the flat run-in either side of
   // them keeps its comb — which is exactly what a shaped feature looks like.
-  // It cannot cost us the rock mask: the steepest surface in the park is 30
-  // degrees and the mask's macro term does not even switch on until 31.5.
-  float jAmt;
-  terrJumps( P, h, g, jAmt );
+  // The rock mask is a live problem here rather than a theoretical one — see
+  // the rock channel in the generated terrJumps, and PARK_ROCK_BIAS. A ramp is
+  // 0.44 rad on its own and its flank stands at 0.73, well past the 0.55 rad
+  // where macroGate opens, so the bias is what keeps the sides of the kickers
+  // white; without it they render as bedrock ribs down both flanks.
+  float jAmt, jRock;
+  terrJumps( P, h, g, jAmt, jRock );
 
   // Slope used for the rock blend. Deliberately excludes the metre-scale
   // detail: a mask keyed on the full normal snaps to LOD triangle edges,
@@ -3079,9 +3291,9 @@ const GLSL_DISPLACE_BODY = /* glsl */`
   // talus threshold rises there and the lip stays white.
   // ...and the rock-exposure channel is pushed down over the park for the same
   // reason a cornice pushes it down: this is snow a machine put here, and a
-  // 28-degree flank is not a talus slope however the mask reads the angle.
-  // Worth +0.28 of talus, i.e. about 16 degrees of headroom on the threshold.
-  dspD = vec4( coarseSteep, mdata.y, mdata.z, mdata.w - cornAmt * 1.6 - jAmt );
+  // 42-degree flank is not a talus slope however the mask reads the angle.
+  dspD = vec4( coarseSteep, mdata.y, mdata.z,
+               mdata.w - cornAmt * 1.6 - jRock * ${glf(PARK_ROCK_BIAS)} );
   // LOD skirt. Only has to swallow the sub-cell reconstruction difference
   // between neighbouring levels, so it is kept to about one cell: a deep skirt
   // on a 100 m coarse level hangs hundreds of metres and pokes out of the
