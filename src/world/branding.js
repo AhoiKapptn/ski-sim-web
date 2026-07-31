@@ -1,37 +1,61 @@
 /**
  * Slope-side branding — sponsor boards at the piste edge.
  *
- * Five objects on a 1.4 km run: two A-frame sandwich boards (AhoiKapptn!, dark
- * face), two low advertising banners on posts standing in front of the B-net
- * runs (BTM, white PVC), and one feather flag near the start (AhoiKapptn!).
- * Nothing else. The brief was "keep it very subtle", which is read here as a
- * hard constraint: this is what a sponsored piste looks like from the chair, not
- * an ad hoarding. Sizes, tints and counts are all set against that, and the
- * numbers are in the block comment above PLACEMENTS.
+ * Four objects on a 1.4 km run: two A-frame sandwich boards (AhoiKapptn!, the
+ * black lockup printed on a light panel) and two low advertising banners on
+ * posts standing in front of the B-net runs (BTM, white PVC). Nothing else. The
+ * brief was "keep it very subtle", which is read here as a hard constraint: this
+ * is what a sponsored piste looks like from the chair, not an ad hoarding.
+ * Sizes, tints and counts are all set against that, and the numbers are in the
+ * block comment above PLACEMENTS.
+ *
+ * A fifth object — a feather flag near the start — was built and then DELETED.
+ * Two measured reasons, both fatal, neither rescuable by tuning:
+ *   * its blade tapered to 0.30 of full chord at foot and tip while the print
+ *     spanned the whole atlas region on every row, so the artwork was squeezed
+ *     3.3x in the letter-height direction at both ends. "AhoiKapp" read and
+ *     "tn!" was a sheared smear. Real feather-flag artwork is laid out TO the
+ *     blade outline; it is never stretched into the taper. The old comment
+ *     claiming otherwise was simply wrong about how flags are made.
+ *   * at 40 m the roll of the piste hid all but 5 px of its 289 px silhouette,
+ *     and its print was illegible past ~8 m.
+ * Most cost of the five, least delivered. Do not re-add it without laying the
+ * artwork out to the blade outline — and note that "nothing flutters" is NOT a
+ * defect worth fixing either: at the 21x47 px the flag actually occupied, a
+ * 2-3 px sway is indistinguishable from the TAA shimmer already in the frame.
  *
  * ---------------------------------------------------------------------------
- * BINARY ASSET EXCEPTION — `public/brand/btm.png`, `public/brand/ahoikapptn.png`
+ * BINARY ASSET EXCEPTION — `public/brand/btm.png`
+ *                          `public/brand/ahoikapptn-black.png`
  *
  * This project has no binary art assets and that rule still stands for
  * everything else: no other downloaded texture, no new dependency, every other
  * texture in the repo is generated in code. These two files are a deliberate,
  * scoped exception granted by the owner of the marks, because they are HIS
  * BRAND and an approximation of a wordmark is not the same object as the
- * wordmark. They are the only two images in the repo. Do not read them as the
- * start of an asset pipeline.
+ * wordmark. They are the only two images in the repo — exactly two, both used;
+ * the white-on-black AhoiKapptn! lockup the first build shipped with is gone,
+ * because the colourway it forced could not survive this scene's light (below).
+ * Do not read these as the start of an asset pipeline.
  *
  * Both are loaded, composited onto a printed panel on an offscreen canvas, and
- * uploaded as ONE atlas. Neither file has a usable alpha channel for
- * compositing (BTM is ink on transparency, AhoiKapptn! is white on opaque
- * black), so nothing is keyed out: each is treated as PRINT on a panel, which
- * is how both would really be produced for a slope —
+ * uploaded as ONE atlas. Their alpha channels are NOT alike and that difference
+ * is load-bearing:
  *
- *   BTM           source-over onto a white PVC banner  (transparent -> white)
- *   AhoiKapptn!   composite 'lighter' onto a dark board, so the black
- *                 background adds nothing and only the white mark lands
+ *   btm.png              ink on transparency, coarse edges. Drawn source-over
+ *                        onto a white PVC banner, so transparent -> white and
+ *                        the panel is what fills the alpha. See paintBtmInk().
+ *   ahoikapptn-black.png the official inverted lockup: black artwork on REAL
+ *                        alpha. Also drawn source-over, onto a light slate
+ *                        panel. It must NOT go through the `globalCompositeOp =
+ *                        'lighter'` trick the first build used for the
+ *                        white-on-black file — black added to anything adds
+ *                        nothing, so that path renders a blank board.
  *
- * That also means no alphaTest anywhere in this file: no coverage mip chain, no
- * stochastic dither, no cut-out fringe to alias. A printed panel is opaque.
+ * Either way nothing is keyed out at render time: each mark is PRINT on an
+ * opaque panel, which is how both would really be produced for a slope. So
+ * there is no alphaTest anywhere in this file: no coverage mip chain, no
+ * stochastic dither, no cut-out fringe to alias.
  * ---------------------------------------------------------------------------
  *
  * Hazards this file is written against — each one is a diagnosis this project
@@ -42,19 +66,29 @@
  *    dielectric specular reflection of the whole dome. `envMapIntensity` cannot
  *    fight it (three overwrites it with `scene.environmentIntensity`), so
  *    `material.specularColor` is forced to 0 in the fragment shader, exactly as
- *    `matCl`/`matImp` in scatter.js do it.
- *  * The sky IBL has an empty lower hemisphere, so an unlit face integrates to
- *    almost nothing and a dark board becomes a hole in the snow. Same bounce +
- *    sky-fill ambient as scatter's `matBuild`, driven off the SAME uniform
- *    objects when scatter exposes them, so a board is lit by the identical
- *    radiance as the hut behind it.
- *  * Thin geometry below one pixel of width shimmers. The banner posts and the
- *    flag pole carry `aRad` and the same screen-space width floor as scatter's
- *    props.
+ *    `matCl`/`matImp` in scatter.js do it. Verified to hold out to 77 deg off
+ *    normal at every sun elevation.
+ *  * NO PRINTED FACE IN THIS MODULE EVER RECEIVES DIRECT SUN, and that is not a
+ *    bug to be lit away — it is the geometry of the feature. sky.js pins the
+ *    time of day at tod = 0.302 (sun ~23 deg) and every panel here is
+ *    deliberately turned UPHILL at the descending player, so N.L < 0 on all of
+ *    them, always. The printed face is lit by snowfield bounce and sky fill and
+ *    nothing else. The first build printed the mark white on a #39404a board
+ *    and measured L* 9-14 — a luminance ratio of 0.027 against the snow beside
+ *    it, where CLAUDE.md's protected treeline band is 0.25-0.45. That is a hole
+ *    cut in the slope. A 5.6%-albedo panel cannot be rescued by an ambient
+ *    tweak, so the fix was ALBEDO: light panel, dark mark. See AK_BASE for the
+ *    numbers this actually lands on. The bounce + sky-fill ambient below is
+ *    still needed (an unlit face integrates to almost nothing against an IBL
+ *    with an empty lower hemisphere) and still runs off scatter's OWN uniform
+ *    objects when they are exposed, so a board is lit by the identical radiance
+ *    as the hut behind it.
+ *  * Thin geometry below one pixel of width shimmers. The banner posts carry
+ *    `aRad` and the same screen-space width floor as scatter's props.
  *  * Fine high-contrast print at a few px/period beats against the pixel grid
  *    (the corduroy cross-hatch). Mitigated by area: no logo is ever drawn at a
  *    scale where its letterforms are a few px, because the panels are small and
- *    the print sits inside a wide quiet margin, so the mip average of a distant
+ *    the print sits inside a quiet margin, so the mip average of a distant
  *    banner is pale off-white rather than a comb. Trilinear + aniso 8, no
  *    alpha test, no repeat wrapping.
  *  * The centreline is NOT re-derived. `corridorX0` lives in terrain.js and
@@ -63,9 +97,12 @@
  *    scatter's public placement seam instead: the lift towers give the SHAPE
  *    (they are on `corridorX(z) + LIFT_OFFSET`) and any building gives the
  *    constant (`b.x - b.off` is `corridorX(b.z)` exactly). Agreement with the
- *    formula is a measurement, see `debug.centrelineCheck`.
+ *    formula is a measurement, see `debug.centrelineCheck` — 9.18 mm worst case
+ *    over the whole run.
+ *  * A capture must never quietly contain the fallback letterforms. The mesh is
+ *    therefore HIDDEN until `ready` resolves; see the note at `scene.add`.
  *
- * Everything is merged into one geometry with one material: 1 draw call, ~330
+ * Everything is merged into one geometry with one material: 1 draw call, ~230
  * triangles, no per-frame work beyond copying three uniforms.
  */
 import * as THREE from 'three';
@@ -76,20 +113,33 @@ import * as THREE from 'three';
 // still finds them.
 const BASE = (typeof import.meta !== 'undefined' && import.meta.env?.BASE_URL) || '/';
 const SRC_BTM = BASE + 'brand/btm.png';
-const SRC_AK = BASE + 'brand/ahoikapptn.png';
+const SRC_AK = BASE + 'brand/ahoikapptn-black.png';
 
 // --------------------------------------------------------------------- panels --
 // metres. Everything is deliberately small: a real piste banner is knee-high
 // and 2.5 m long, and a sandwich board is a metre wide.
-// Each aspect ratio MATCHES its atlas region exactly (see R_* below) so no print
-// is stretched. Sized from a measured pass rather than by eye: at the ~20 m the
-// player actually goes by a board, 1.30 m of width is 53 px and the logo band
-// inside it is 40 px — recognisable for the second it is there, and 0.11% of the
-// frame. The first build used 1.05 x 0.62 m and the mark mipped away to a grey
+// Each aspect ratio MATCHES its atlas region to within 0.05% (see R_* below) so
+// no print is stretched. Sized from a measured pass rather than by eye: at the
+// ~30 m the player actually goes by a banner, 2.30 m of width is 75 px.
+// The first build used 1.05 x 0.62 m panels and the mark mipped away to a grey
 // smear at every distance the game is ever played at.
-const BANNER_W = 2.30, BANNER_H = 0.70, BANNER_TOP = 1.16;
-const BOARD_W = 1.30, BOARD_H = 0.76, BOARD_LEAN = 0.20;   // rad from vertical
-const FLAG_W = 0.62, FLAG_H = 1.695, FLAG_BASE = 0.34;     // blade bottom, m
+//
+// BANNER_H went 0.70 -> 0.86 to make the mark bigger, which is the whole reason
+// for the number. The mark is HEIGHT-limited inside the banner (its content box
+// is 1.47:1 against a 2.7:1 panel), so the only two levers on how big it reads
+// are the vertical margin and the panel height; widening the panel does nothing.
+// Margin 0.11 -> 0.06 is worth +12.8% linear on its own, and the extra 16 cm of
+// panel takes the total to +38.6% (readable mark height 0.546 -> 0.757 m). It
+// also drops the bottom hem from 0.46 m clear of the snow to 0.30 m, which is
+// the difference between an obviously floating banner and a plausible one.
+const BANNER_W = 2.30, BANNER_H = 0.86, BANNER_TOP = 1.16;
+// BOARD_LEAN 0.20 -> 0.34 rad. At 0.20 the A-frame read as a flat rectangle at
+// every distance the player passes it: 0.15 m of base half-spread is under a
+// pixel of parallax at 28 m, and both faces are in shade so the ridge produced
+// no value break either. 0.34 rad is 0.25 m half-spread (a 0.51 m base under a
+// 1.30 m board, which is what a real sandwich board does) and the two faces now
+// carry slightly different tints so the ridge is visible as a step.
+const BOARD_W = 1.30, BOARD_H = 0.76, BOARD_LEAN = 0.34;   // rad from vertical
 
 /**
  * Where the branding stands, as (z along the fall line, metres off the corridor
@@ -97,27 +147,37 @@ const FLAG_W = 0.62, FLAG_H = 1.695, FLAG_BASE = 0.34;     // blade bottom, m
  * the order it is met.
  *
  * The offsets are picked to sit in the gaps in scatter.js' own furniture, which
- * is why they are these numbers and not round ones:
+ * is why they are these numbers and not round ones. Re-read off scatter.js, not
+ * off the previous version of this comment:
  *
- *   13..21 m  slalom gates            26 m      THESE BOARDS (piste edge)
- *   38..43 m  piste marker poles      41..47 m  snow guns
- *   49..50 m  THESE BANNERS           52.5 m    B-net back stays
- *   54 m      B-net line
+ *   13..21 m  slalom gates            26 m       THESE BOARDS (piste edge)
+ *   38..43 m  piste marker poles      41..47 m   snow guns
+ *              (scatter.js:4583)                  (:4607, PISTE_HALF-5 + 0..6)
+ *   49.5 m    THESE BANNERS           54 m       B-net line (:4735)
+ *   54..55.5 m  B-net posts and their back stays, which lean OUTBOARD, away
+ *               from the piste — so nothing of the net structure comes inboard
+ *               of 54 m and a banner at 49.5 m has 4.5 m of clear snow in front
+ *               of the fence. (The old table said the stays were at 52.5 m,
+ *               i.e. inboard. They are not.)
  *
- * so a banner stands ~4.5 m in front of the safety net, which is exactly where
- * a race hoarding goes, and a sandwich board sits well inside the marker line on
- * groomed snow, 5 m outside the gate line the player actually skis — close
- * enough that the mark resolves for the second it is alongside, and far enough
- * that it is never in the ski line.
+ * A banner therefore stands ~4.5 m in front of the safety net, which is exactly
+ * where a race hoarding goes, and a sandwich board sits well inside the marker
+ * line on groomed snow, 5 m outside the gate line the player actually skis —
+ * close enough that the mark resolves for the second it is alongside, and far
+ * enough that it is never in the ski line.
+ *
+ * Both banners are in front of a real B-net run: scatter's runs are
+ * (sgn +1, z 560..300) and (sgn -1, z 120..-170), which is what fixes the SIGN
+ * of the two banner offsets.
  */
 const PLACEMENTS = [
-  { kind: 'flag', z: 662, off: -31.0, yaw: 0.16, tint: 0.94 },
-  // z 648 and not 634: GROOMERS[0] is parked at (z 620, off 40) and a board at
-  // 634 sat squarely behind its blade from every uphill camera. Verified in the
-  // shot, not reasoned about.
-  { kind: 'board', z: 648, off: 26.0, yaw: -0.34, tint: 0.92 },
+  // The run's first object. It stands where the deleted feather flag stood
+  // (z 662, off -31), because that slot was already verified clear from the hero
+  // framing and it is the only object the player meets in the first 200 m; a
+  // board at the flag's old z on the board's own -26 m offset keeps that.
+  { kind: 'board', z: 664, off: -26.0, yaw: 0.36, tint: 0.96 },
   { kind: 'banner', z: 516, off: 49.5, yaw: -0.20, tint: 0.97 },
-  { kind: 'board', z: 128, off: -26.0, yaw: 0.40, tint: 0.90 },
+  { kind: 'board', z: 128, off: -26.0, yaw: 0.40, tint: 0.93 },
   { kind: 'banner', z: -104, off: -49.5, yaw: 0.26, tint: 0.95 },
 ];
 
@@ -187,13 +247,18 @@ function centrelineFromSeam(scatter) {
 // y = 0 at the TOP of the canvas; `uvR` flips because CanvasTexture uploads
 // with flipY.
 const AT = 1024;
-const R_BTM   = [0, 0, 1024, 312];      // 3.29:1, the banner face
-const R_AK    = [0, 320, 512, 300];     // 1.71:1, the sandwich-board face
-const R_FLAG  = [512, 320, 256, 700];   // 1:2.73, the feather blade
-const R_BACK  = [0, 628, 256, 128];     // banner reverse, unprinted PVC
-const R_DARK  = [0, 764, 256, 128];     // board reverse
-const R_SNOW  = [0, 900, 240, 120];     // crust along a top edge
-const R_PAINT = [264, 628, 240, 128];   // galvanised post / frame
+// The feather flag's 256x700 region went with the flag, and all of it went into
+// the two regions that carry print — which is the only place resolution does
+// anything. R_AK is 3.5x the pixels it had (960x561 against 512x300, i.e. 1.87x
+// linear) and R_BTM is 1.23x. The four unprinted regions are flat procedural
+// noise with no structure in them at all, so they lost half their area and cost
+// nothing for it; R_PAINT is sampled along a single row and R_SNOW along two.
+const R_BTM    = [0, 0, 1024, 383];     // 2.674:1, the banner face
+const R_AK     = [0, 391, 960, 561];    // 1.711:1, the sandwich-board face
+const R_BACK   = [0, 958, 248, 66];     // banner reverse, unprinted PVC
+const R_BOARDB = [256, 958, 248, 66];   // board reverse, unprinted panel
+const R_SNOW   = [512, 958, 248, 66];   // crust along a top edge, drift at a foot
+const R_PAINT  = [768, 958, 248, 66];   // galvanised post / frame
 
 /** s,t in 0..1 across a region; t = 0 is its BOTTOM edge in world terms. */
 function uvR(r, s, t) {
@@ -251,6 +316,13 @@ function fitBox(rx, ry, rw, rh, a, mx, my) {
  * rained on, snow has collected in its bottom edge, and it is lit by the same
  * sun as everything else. The last part is the shader's job; the first three
  * are painted here, into the texture, where they cost nothing.
+ *
+ * `crust` is opt-OUT and every caller must think about it, because it paints
+ * settled snow along the panel's bottom edge and that is only true if the panel
+ * HAS a bottom edge on the ground. The BTM banner's hem hangs 0.30 m clear of
+ * the snow, so its crust was snow settled on thin air — plainly visible in the
+ * atlas dump. It gets `crust: false` and a geometric drift at its post feet
+ * instead (see snowDrift), which is where the real ground contact is.
  */
 function weather(g, x, y, w, h, rnd, opts = {}) {
   const dark = opts.dark ? 1 : 0;
@@ -350,8 +422,14 @@ function drawBtmFallback(g, x, y, w, h) {
   g.restore();
 }
 
-function drawAkFallback(g, x, y, w, h) {
-  const WH = '#eef2f6';
+/**
+ * `ink` is a parameter and not a constant because the board colourway inverted:
+ * the mark is now black artwork on a light panel, so a hard-coded off-white
+ * fallback would have been invisible on exactly the path that exists to be
+ * visible. It is passed AK_INK from the one place that knows the panel colour.
+ */
+function drawAkFallback(g, x, y, w, h, ink) {
+  const WH = ink;
   const mh = h * 0.98, mx = x + h * 0.02;          // hexagon block is square-ish
   g.save();
   g.strokeStyle = WH; g.fillStyle = WH;
@@ -394,6 +472,74 @@ function drawAkFallback(g, x, y, w, h) {
   g.font = `700 ${fs}px system-ui, sans-serif`;
   g.fillText('Kapptn!', tx + wA, y + h * 0.52);
   g.restore();
+}
+
+// -------------------------------------------------------------- the two inks --
+/**
+ * The AhoiKapptn! board's colourway. Both numbers exist for one measured
+ * reason, recorded here because it is the fix for the module's worst defect:
+ * no printed face in this file ever sees the sun (see the header), so a panel
+ * has snowfield bounce and sky fill and nothing else. The first build's
+ * #39404a board with a white mark rendered at L* 9-14 and a luminance ratio of
+ * 0.027 against the snow beside it, against CLAUDE.md's protected 0.25-0.45
+ * band — a hole cut in the slope, 13x below the floor. No ambient term rescues
+ * a 5.6%-albedo panel; only albedo does. Hence a light panel and the owner's
+ * official INVERTED (black-on-transparent) lockup.
+ *
+ * WHAT IT NOW MEASURES, at 1600x900 DPR 1. Denominator throughout is the ONE
+ * validated near-piste snow crop in this project, (400,600) 300x120 on the hero
+ * frame — linear relative luminance Y = 0.480, L* 73.6 / sd 10.8, which is the
+ * documented 73.1/12.6 reproduced. Numerators are crops verified to contain only
+ * board (CLAUDE.md trap 4):
+ *
+ *   board z 664, 27.7 m   24x8 at (853,474)   L* 42.6   Y 0.130   ratio 0.271
+ *   board z 664 in hero   24x8 at (736,494)   L* 41.8   Y 0.127   ratio 0.265
+ *   board z 128, 28.2 m   28x8 at (600,479)   L* 49.6   Y 0.183   ratio 0.381
+ *
+ * 0.27-0.38, inside the 0.25-0.45 band, against 0.027 before — 10x. For scale,
+ * the scene's own shaded anchors are the hut wall at L* 31 and the near conifers
+ * at L* 25, so the board is now a light object in shade and no longer darker
+ * than the darkest thing on the hillside.
+ *
+ * If either number is touched, re-measure — do not reason about it. The two
+ * crops are printed by tools/brand-shot.mjs (`rects`) and the denominator is the
+ * hero crop above; note that a crop box tuned at 1600x900 lands on completely
+ * different content in a DPR-2 PNG.
+ */
+const AK_BASE = '#b8bfc7';   // panel base; measured ratio 0.27-0.38, see above
+const AK_INK = '#1c1f24';    // fallback letterforms only; the PNG carries its own
+
+// ------------------------------------------------------------------ BTM ink --
+/**
+ * THE ONE PLACE the BTM ink is treated. Every decision about how that yellow
+ * lands on the panel is in this function and nowhere else, deliberately.
+ *
+ * PENDING DECISION, do not pre-empt it: the artwork's #F0EC00 arrives on screen
+ * at about L* 61, rgb(145,151,70) — olive-grey, not yellow. That is physically
+ * correct for a shaded panel under a blue sky fill and it is being put to the
+ * owner as a question, because "the brand yellow does not read as yellow" may
+ * matter more than the realism does. If the answer comes back yes, this is the
+ * lever: raise BTM_INK_LIFT. It overprints the ink with itself in 'lighter', so
+ * only pixels the artwork actually covers move and the white PVC field is
+ * untouched — no mask to maintain, no second region.
+ *
+ * Its ceiling is the 8-bit map: #F0EC00 is already at 240/236 in R/G, so a lift
+ * much past ~0.06 only saturates and starts eating the ink's shape. If the
+ * decision needs more than that, the real instrument is an emissiveMap keyed off
+ * this image's alpha — and this is still the function to build it in, because it
+ * is the only code in the module that knows where the ink is.
+ */
+const BTM_INK_LIFT = 0.0;
+function paintBtmInk(g, img, bb, dx, dy, dw, dh) {
+  if (!img) { drawBtmFallback(g, dx, dy, dw, dh); return; }
+  g.drawImage(img, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
+  if (BTM_INK_LIFT > 0) {
+    g.save();
+    g.globalCompositeOperation = 'lighter';
+    g.globalAlpha = BTM_INK_LIFT;
+    g.drawImage(img, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
+    g.restore();
+  }
 }
 
 // ===========================================================================
@@ -504,6 +650,32 @@ function snowLip(gb, o, u, v, w, h, depth, col) {
   for (let i = 0; i < n; i++) gb.quad(a[i], a[i + 1], b[i + 1], b[i]);
 }
 
+/**
+ * A low mound of settled snow round a post foot. This is the banner's GROUND
+ * CONTACT cue, and it exists because the banner's hem hangs 0.30 m clear of the
+ * snow: the previous build painted a snow crust along that hem instead, which is
+ * snow settled on thin air. Snow does not collect on a free edge in mid-air; it
+ * collects where something enters the snowpack, and that is the two posts.
+ *
+ * A fan, not a shell: 7 triangles a foot, one draw call's worth of nothing. Wound
+ * CLOCKWISE in the (x,z) plane, which is the winding that faces UP — a
+ * PlaneGeometry rotated -PI/2 about x maps +y in its own plane to -z in the
+ * world, so the familiar CCW-is-front rule inverts when you lay a fan out with
+ * atan2(z,x).
+ */
+function snowDrift(gb, x, y, z, r, h, col) {
+  const n = 7;
+  const c = gb.v(x, y + h, z, 0, 1, 0, ...uvR(R_SNOW, 0.5, 0.5), col, 0);
+  const ring = [];
+  for (let i = 0; i <= n; i++) {
+    const a = ((i % n) / n) * Math.PI * 2;
+    const rr = r * (0.70 + 0.30 * Math.sin(a * 2.0 + x * 0.6));
+    ring.push(gb.v(x + Math.cos(a) * rr, y, z + Math.sin(a) * rr, 0, 1, 0,
+      ...uvR(R_SNOW, 0.5 + 0.45 * Math.cos(a), 0.5 + 0.45 * Math.sin(a)), col, 0));
+  }
+  for (let i = 0; i < n; i++) gb.tri(c, ring[i + 1], ring[i]);
+}
+
 // ===========================================================================
 export function createBranding(scene, terrain, scatter) {
   const group = new THREE.Group();
@@ -527,14 +699,17 @@ export function createBranding(scene, terrain, scatter) {
     g2.fillStyle = '#eeefeb';
     g2.fillRect(...R_BTM);
     {
-      // Pushed left with the quiet field to its right: that is how a hoarding is
-      // laid out, and it holds the ink (and therefore the chroma) to about a
-      // quarter of the banner instead of filling it.
+      // Centred, with the margins as tight as the panel can carry. The previous
+      // build pushed the mark hard left inside a 0.055/0.11 margin and left 70%
+      // of a 2.3 m banner as empty white: 348 of 1024 atlas px, a readable mark
+      // ~0.55 m tall, which is the single biggest reason it never resolved at
+      // the 20-30 m and 60-70 km/h the player actually passes it. The mark is
+      // HEIGHT-limited here (content box 1.47:1 in a 2.67:1 panel), so `my` is
+      // the lever that matters and `mx` does nothing at all; 0.11 -> 0.06 is
+      // +12.8% linear, and the taller BANNER_H takes it to +38.6%.
       const bb = imgs?.btm ? contentBox(imgs.btm, 'alpha') : { w: 1.43, h: 1 };
-      const [, dy, dw, dh] = fitBox(...R_BTM, bb.w / bb.h, 0.055, 0.11);
-      const dx = R_BTM[0] + R_BTM[2] * 0.055;
-      if (imgs?.btm) g2.drawImage(imgs.btm, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
-      else drawBtmFallback(g2, dx, dy, dw, dh);
+      const [dx, dy, dw, dh] = fitBox(...R_BTM, bb.w / bb.h, 0.03, 0.06);
+      paintBtmInk(g2, imgs?.btm, bb, dx, dy, dw, dh);
     }
     // grommets along the top and bottom hems
     for (let i = 0; i <= 6; i++) {
@@ -544,44 +719,32 @@ export function createBranding(scene, terrain, scatter) {
         g2.beginPath(); g2.arc(px, py, 3.4, 0, 6.2832); g2.stroke();
       }
     }
-    weather(g2, ...R_BTM, rnd, { dark: false });
+    // crust: false — the hem hangs 0.30 m clear of the snow, see weather()
+    weather(g2, ...R_BTM, rnd, { dark: false, crust: false });
 
-    // --- AhoiKapptn!: white on opaque black -> 'lighter' onto a dark board -
-    for (const [reg, rot, base] of [[R_AK, false, '#39404a'], [R_FLAG, true, '#434b56']]) {
-      // Dark slate rather than the artwork's own black. MEASURED: at #2b2f35 a
-      // board 29 m away rendered at L* 10.0 against snow at L* 89.9 — 1.5% of
-      // the snow's luminance, where even the treeline sits at 36% — and it read
-      // as a hole cut in the slope rather than as an object standing on it. A
-      // vertical panel gets about a third of the irradiance the horizontal snow
-      // does (measured on the white banner: albedo 0.71 -> rendered Y 0.246), so
-      // the albedo has to carry it. The flag is a shade lighter again: it is a
-      // single ply of cloth, so a good part of what lands on the far side comes
-      // through it, and a flag is never as dark as an opaque board.
-      g2.fillStyle = base;
-      g2.fillRect(...reg);
-      const bb = imgs?.ak ? contentBox(imgs.ak, 'luma') : { w: 4.35, h: 1 };
-      g2.save();
-      if (rot) {          // the blade is printed to read bottom-to-top, mark low
-        g2.translate(reg[0] + reg[2] * 0.5, reg[1] + reg[3] * 0.5);
-        g2.rotate(-Math.PI / 2);
-      }
-      const box = rot ? [-reg[3] / 2, -reg[2] / 2, reg[3], reg[2]] : reg;
-      const [dx, dy, dw, dh] = fitBox(...box, bb.w / bb.h, rot ? 0.06 : 0.07, 0.10);
-      if (imgs?.ak) {
-        g2.globalCompositeOperation = 'lighter';   // the black background adds 0
-        g2.drawImage(imgs.ak, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
-      } else {
-        drawAkFallback(g2, dx, dy, dw, dh);
-      }
-      g2.restore();
-      weather(g2, ...reg, rnd, { dark: true, crust: reg === R_AK });
+    // --- AhoiKapptn!: the black lockup source-over onto a light board -------
+    {
+      // See AK_BASE for why this is light and not the slate the first build
+      // used. The compositing is a plain source-over because this asset has
+      // REAL alpha: the 'lighter' trick that the white-on-black file needed
+      // would render a blank board here, since black adds nothing.
+      g2.fillStyle = AK_BASE;
+      g2.fillRect(...R_AK);
+      const bb = imgs?.ak ? contentBox(imgs.ak, 'alpha') : { w: 4.61, h: 1 };
+      const [dx, dy, dw, dh] = fitBox(...R_AK, bb.w / bb.h, 0.06, 0.10);
+      if (imgs?.ak) g2.drawImage(imgs.ak, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
+      else drawAkFallback(g2, dx, dy, dw, dh, AK_INK);
+      // dark:false now that the panel is light — the grit has to be darker than
+      // what it lands on. Crust stays ON: unlike the banner, a board's bottom
+      // edge really is 2 cm off the snow.
+      weather(g2, ...R_AK, rnd, { dark: false });
     }
 
     // --- unprinted regions -------------------------------------------------
     noiseFill(g2, R_BACK, '#dfe1de', [110, 108, 100], rnd);
-    weather(g2, ...R_BACK, rnd, { dark: false });
-    noiseFill(g2, R_DARK, '#343b44', [190, 196, 204], rnd);
-    weather(g2, ...R_DARK, rnd, { dark: true });
+    weather(g2, ...R_BACK, rnd, { dark: false, crust: false });
+    noiseFill(g2, R_BOARDB, '#a9b0b8', [92, 96, 102], rnd);
+    weather(g2, ...R_BOARDB, rnd, { dark: false });
     noiseFill(g2, R_SNOW, '#eef3f8', [214, 222, 232], rnd);
     noiseFill(g2, R_PAINT, '#8d9298', [58, 60, 64], rnd);
   }
@@ -694,12 +857,18 @@ export function createBranding(scene, terrain, scatter) {
         _a.set(p.x, p.y - 0.45, p.z);
         _b.set(p.x, top + 0.05, p.z);
         tube(gb, _a, _b, 0.055, gcol, 6);
+        // the ground-contact cue, in geometry where the contact actually is
+        // 0.22 m / 0.075 m. The first attempt at 0.185 / 0.042 rendered but was
+        // invisible: 4 cm is inside the snow surface's own noise, so the mound
+        // never broke the silhouette. Bigger than this and it reads as a white
+        // plastic blob rather than drifted snow.
+        snowDrift(gb, p.x, p.y - 0.02, p.z, 0.22, 0.075, scol);
       }
       const o = new THREE.Vector3(p0.x, top - BANNER_H, p0.z);
       panel(gb, o, u, v, BANNER_W, BANNER_H, R_BTM, R_BACK, col, 0.035, 5);
       snowLip(gb, o, u, v, BANNER_W, BANNER_H, 0.030, scol);
       items.push({ kind: P.kind, x: bx, z: P.z, off: P.off, cx: bx - P.off, nx: -u.z, nz: u.x, y: top, w: BANNER_W, h: BANNER_H });
-    } else if (P.kind === 'board') {
+    } else {
       // A-frame: two leaning printed faces meeting at a ridge, snow on the ridge
       const gy = Math.min(
         ground(bx - u.x * BOARD_W * 0.5, P.z - u.z * BOARD_W * 0.5),
@@ -717,52 +886,21 @@ export function createBranding(scene, terrain, scatter) {
           P.z - us.z * BOARD_W * 0.5 + nrm.z * s * foot);
         const vv = new THREE.Vector3(-nrm.x * s * Math.sin(BOARD_LEAN), Math.cos(BOARD_LEAN),
           -nrm.z * s * Math.sin(BOARD_LEAN));
-        panel(gb, o, us, vv, BOARD_W, BOARD_H, R_AK, R_DARK, col, 0, 2);
+        // The far face is tinted down 12%. Lean alone does not make an A-frame
+        // read as an A-frame: both faces are in shade (nothing here is ever
+        // sunlit) so they integrate to the same radiance and the ridge produced
+        // no value break at all — at 28 m the object was a flat rectangle. The
+        // step is what makes the fold visible.
+        const fcol = s > 0 ? col : [col[0] * 0.88, col[1] * 0.88, col[2] * 0.90];
+        panel(gb, o, us, vv, BOARD_W, BOARD_H, R_AK, R_BOARDB, fcol, 0, 2);
       }
       const oR = new THREE.Vector3(bx - u.x * BOARD_W * 0.5, gy + 0.02 + ridge - 0.001, P.z - u.z * BOARD_W * 0.5);
-      snowLip(gb, oR, u, v, BOARD_W, 0, foot * 1.15, scol);
+      // foot * 0.8, not foot * 1.15: the cap has to sit INSIDE the A's own base
+      // half-spread or it overhangs the printed faces and the board grows a
+      // white brim. At lean 0.20 the old factor gave +-0.174 m against a
+      // half-spread of 0.151 m, i.e. it always overhung.
+      snowLip(gb, oR, u, v, BOARD_W, 0, foot * 0.8, scol);
       items.push({ kind: P.kind, x: bx, z: P.z, off: P.off, cx: bx - P.off, nx: -u.z, nz: u.x, y: gy + ridge, w: BOARD_W, h: BOARD_H });
-    } else {
-      // Feather flag. The silhouette is carried by the GEOMETRY, not by an alpha
-      // cut-out: the blade is sleeved on the pole at its leading edge, widens to
-      // full chord a third of the way up and tapers into the pole again at the
-      // top, which is the shape that stops it reading as a black monolith
-      // standing in the snow. Measured on the first build: a straight rectangle
-      // at 27 m was a 22 x 52 px dark slab and nothing about it said "flag".
-      const gy = ground(bx, P.z);
-      _a.set(bx, gy - 0.35, P.z);
-      _b.set(bx, gy + FLAG_BASE + FLAG_H + 0.06, P.z);
-      tube(gb, _a, _b, 0.045, gcol, 6);
-      const nrm = new THREE.Vector3(-u.z, 0, u.x);
-      const nj = 7;
-      const rowsF = [], rowsB = [];
-      for (let j = 0; j <= nj; j++) {
-        const t = j / nj;
-        // chord: 0.30 at the foot, full by t = 0.34, tapering to 0.30 at the tip
-        const chord = FLAG_W * clamp(Math.min(0.30 + t / 0.34 * 0.70,
-          1.0 - Math.pow(Math.max(0, t - 0.72) / 0.28, 1.6) * 0.70), 0.28, 1.0);
-        const bow = Math.sin(t * Math.PI) * 0.07 + t * t * 0.05;   // catches the wind
-        const rF = [], rB = [];
-        for (let i = 0; i <= 1; i++) {
-          const s = i;
-          const px = bx + u.x * s * chord + nrm.x * bow;
-          const pz = P.z + u.z * s * chord + nrm.z * bow;
-          const py = gy + FLAG_BASE + t * FLAG_H;
-          // UV spans the WHOLE region on every row, so the print squeezes with
-          // the taper the way cloth cut to a blade outline does. Mapping it to
-          // `s * chord / FLAG_W` instead — which looks more correct on paper —
-          // crops the artwork to the left of the region and threw away two
-          // thirds of the wordmark; caught in the 13 m shot.
-          rF.push(gb.v(px, py, pz, nrm.x, 0, nrm.z, ...uvR(R_FLAG, s, t), col, 0));
-          rB.push(gb.v(px, py, pz, -nrm.x, 0, -nrm.z, ...uvR(R_FLAG, 1 - s, t), col, 0));
-        }
-        rowsF.push(rF); rowsB.push(rB);
-      }
-      for (let j = 0; j < nj; j++) {
-        gb.quad(rowsF[j][0], rowsF[j][1], rowsF[j + 1][1], rowsF[j + 1][0]);
-        gb.quad(rowsB[j + 1][0], rowsB[j + 1][1], rowsB[j][1], rowsB[j][0]);
-      }
-      items.push({ kind: P.kind, x: bx, z: P.z, off: P.off, cx: bx - P.off, nx: -u.z, nz: u.x, y: gy + FLAG_BASE + FLAG_H, w: FLAG_W, h: FLAG_H });
     }
   }
 
@@ -772,23 +910,40 @@ export function createBranding(scene, terrain, scatter) {
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   group.add(mesh);
+  // HIDDEN UNTIL THE ARTWORK IS IN THE ATLAS. This is a correctness gate, not a
+  // load-order nicety, and it replaces `window.__brandingReady`:
+  //
+  // the panels are already painted with the fallback letterforms, so nothing is
+  // racing a blank texture — but the mesh used to join the scene ~200 ms before
+  // the real PNGs landed, and any capture taken inside that window silently
+  // contained the STAND-IN artwork with nothing to say so. Today the review is
+  // reliable only because tools/brand-shot.mjs awaits `ready` and hard-fails
+  // unless `loaded === 'assets'`; the moment main.js wires this module up
+  // without awaiting anything, every shoot.mjs capture would quietly be of the
+  // fallback. So: a premature capture shows NOTHING, which is loud, instead of
+  // the wrong artwork, which is silent.
+  //
+  // `ready` resolves whichever way the load goes, so the fallback path still
+  // renders after a genuine failure (tools/brand-shot.mjs --fallback).
+  group.visible = false;
   scene.add(group);
 
   // --------------------------------------------------------- the real images --
-  // Async, and the panels are already painted with the fallback, so no frame is
-  // ever blank and a capture tool can never screenshot an empty banner. The
-  // promise is exposed twice — on the returned object and as
-  // `window.__brandingReady` — because main.js flips `harness.ready` itself and
-  // a reviewer's screenshot has to be deterministic.
+  // One `Promise.all`, so there is no torn one-image state, and `paint()` is
+  // synchronous, so no screenshot can interleave with a half-composited atlas.
   const loader = new THREE.ImageLoader();
   loader.setCrossOrigin('anonymous');
   const load = (url) => new Promise((res) => loader.load(url, res, undefined, () => res(null)));
   const ready = Promise.all([load(SRC_BTM), load(SRC_AK)]).then(([btm, ak]) => {
-    if (!btm && !ak) { api.loaded = 'failed'; return api; }
-    paint({ btm, ak });
-    painted = btm && ak ? 'assets' : 'partial';
-    tex.needsUpdate = true;
-    api.loaded = painted;
+    if (btm || ak) {
+      paint({ btm, ak });
+      painted = btm && ak ? 'assets' : 'partial';
+      tex.needsUpdate = true;
+      api.loaded = painted;
+    } else {
+      api.loaded = 'failed';       // `painted` stays 'fallback' — that is what
+    }                              // is actually on the canvas
+    group.visible = true;          // the gate above
     return api;
   });
 
@@ -823,15 +978,24 @@ export function createBranding(scene, terrain, scatter) {
    * Did the reconstructed centreline actually land on the corridor? Compares it
    * against the documented formula over the run. This is the check that says the
    * placement seam was read correctly rather than plausibly.
+   *
+   * `validates` is false when the seam was withheld, because then `centre` IS
+   * `corridorFormula` and the comparison is the formula against itself: it
+   * returns 0.000 m and proves nothing whatsoever. Callers must print that case
+   * differently or they are reporting a validation that did not happen.
    */
   function centrelineCheck() {
+    if (!cx) {
+      return { source: 'formula fallback', validates: false,
+        worstErrM: null, atZ: null, liftOffset: null };
+    }
     let worst = 0, at = 0;
     for (let z = -900; z <= 900; z += 5) {
       const e = Math.abs(centre(z) - corridorFormula(z));
       if (e > worst) { worst = e; at = z; }
     }
-    return { source: cx ? 'scatter seam' : 'formula fallback', worstErrM: worst, atZ: at,
-      liftOffset: cx ? cx.liftOffset : null };
+    return { source: 'scatter seam', validates: true, worstErrM: worst, atZ: at,
+      liftOffset: cx.liftOffset };
   }
 
   const api = {
@@ -850,6 +1014,5 @@ export function createBranding(scene, terrain, scatter) {
       scene.remove(group);
     },
   };
-  if (typeof window !== 'undefined') window.__brandingReady = ready;
   return api;
 }
