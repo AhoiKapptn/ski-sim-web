@@ -88,6 +88,40 @@ const LEG_TRAVEL = 0.45;    // m of leg extension before the skis really leave t
 const AIR_REPORT = 0.07;    // s of real flight before `airborne` is published
 const SKI_LEN = 1.7;        // m, contact footprint — a ski bridges sub-metre holes
 const LAT_ARM = 1.2;        // m, cross-ski arm used for the contact-plane gradient
+// ---- lips ------------------------------------------------------------------
+// The leg-travel model below is what stopped the rider skipping like a stone
+// (64% of a straight coast used to be "airborne"), and it works because it
+// refuses to call anything a take-off until the body has floated the whole
+// 0.45 m. On a kicker that refusal costs 5 m: the rider was measured riding the
+// deck past the knuckle and only separating 2-5 m late, which is the "floaty"
+// take-off. Both are the same number doing two jobs.
+//
+// So the travel is not a constant — it is how far the legs can extend BEFORE THE
+// SKI RUNS OUT OF SNOW, and that depends on whether there is any snow ahead:
+//
+//   * over a ripple or a mogul crest the ground comes back up to meet the ski,
+//     the ski is supported the whole way, and the rider gets all 0.45 m;
+//   * over a knuckle the ground is simply gone for twenty metres, the ski is
+//     bridging a hole, and the travel that matters is nearly none.
+//
+// `lipDrop` (see `_contact`) is that test, measured rather than guessed: how far
+// the ground 6 m ahead has fallen below the plane the ski is riding on, in slope
+// units. Measured distributions — this is the whole reason for the look-ahead:
+//
+//                        open piste (p95 / p99 / max)     kickers, at the knuckle
+//   contact convexity        0.136 / 0.164 / 0.198              0.17 - 0.21
+//   lipDrop                  0.151 / 0.202 / 0.222              0.24 - 0.34
+//
+// Convexity alone cannot tell a mogul from a take-off — the ranges overlap
+// completely, and thresholding it would put the rider in the air off bumps.
+// lipDrop separates them, because "does the ground come back" is exactly the
+// question. With the band below, an open-piste coast trips the shortened travel
+// on 0.25% of substeps (against 0.42% of the run already spent airborne, i.e.
+// inside the existing noise) while the kickers separate 2.5-3 m earlier.
+const LOOK_AHEAD = 6.0;     // m, lip probe: how far ahead the ground must stay gone
+const LIP_DROP0 = 0.12;     // ...below this, the ground ahead is still there
+const LIP_DROP1 = 0.30;     // ...above this, the ski is bridging a hole
+const LIP_BITE = 0.85;      // fraction of the leg travel a full lip takes away
 const SUBSTEP = 1 / 120;
 const MAX_START_TRAVERSE = 0.60;  // rad (34 deg) — a reset points down a mellow run
 const MAX_START_STEEP = 1.22;     // rad (70 deg) — ...but you traverse a steep face
@@ -140,6 +174,9 @@ export class SkiPhysics {
     this.yFree = 0;          // shadow ballistic path of the centre of mass
     this.vFree = 0;
     this.squash = 0;         // legs compressed by the snow pushing up, 0..1
+    this.convex = 0;         // contact-line curvature, slope units (+ = crest)
+    this.lipDrop = 0;        // how far the ground ahead falls below the ski plane
+    this.lipS = 0;           // smoothed lip signal that shortens the leg travel
 
     // --- smoothed / display ---------------------------------------------------
     this.nSmooth = new THREE.Vector3(0, 1, 0);
@@ -220,6 +257,7 @@ export class SkiPhysics {
     this.compression = 0; this.landImpact = 0; this.lastAirTime = 0; this.gSpike = 0;
     this.roughness = 0; this.incline = 0; this.airT = 0; this.jumpBuf = 0; this.pending = 0;
     this.vSurf = state.vel.y; this.gap = 0; this.squash = 0;
+    this.convex = 0; this.lipDrop = 0; this.lipS = 0;
     this.yFree = state.pos.y; this.vFree = state.vel.y;
     this.nSmooth.copy(n);
     this.pitchS = Math.asin(clamp(this._f.y, -1, 1));
@@ -266,9 +304,28 @@ export class SkiPhysics {
     const fl = Math.hypot(fx, fz);
     if (fl > 1e-6) { fx /= fl; fz /= fl; } else { fx = 0; fz = -1; }
 
+    const h0 = T.height(x, z);
     const hFa = T.height(x + fx * a, z + fz * a), hBa = T.height(x - fx * a, z - fz * a);
     const hFb = T.height(x + fx * b, z + fz * b), hBb = T.height(x - fx * b, z - fz * b);
-    const h = 0.34 * T.height(x, z) + 0.22 * (hFa + hBa) + 0.11 * (hFb + hBb);
+    const h = 0.34 * h0 + 0.22 * (hFa + hBa) + 0.11 * (hFb + hBb);
+
+    // ---- lip geometry, for the separation test in `_step` -------------------
+    // Convexity of the contact line, in slope units: how much the ground breaks
+    // between the tail half of the ski and the tip half. Zero on any straight
+    // face however steep, positive over a crest, negative in a compression. Free
+    // — the four samples are already here.
+    const sTail = (h0 - hBb) / b;
+    this.convex = (sTail - (hFb - h0) / b);
+    // ...but convexity alone cannot tell a kicker's knuckle from a mogul crest:
+    // measured on the open piste, convexity reaches 0.20 and the kickers only
+    // peak at 0.17-0.21. What separates them is what happens NEXT. A mogul crest
+    // is followed by a trough that comes back up to meet the ski; a knuckle is
+    // followed by twenty metres of nothing. So look ahead one ski-length-plus and
+    // ask how far the ground has fallen BELOW the plane the ski is currently on:
+    // that is the gap the ski would have to bridge, and it is the difference
+    // between a bump and a take-off.
+    const hAhead = T.height(x + fx * LOOK_AHEAD, z + fz * LOOK_AHEAD);
+    this.lipDrop = (h0 + sTail * LOOK_AHEAD - hAhead) / LOOK_AHEAD;
 
     if (outN) {
       const rx = -fz, rz = fx;                       // r = f x up  (see header)
@@ -541,7 +598,12 @@ export class SkiPhysics {
       // suspension, and what makes a compression feel heavy.
       this.squash += (clamp(-need / (G * 1.6), 0, 1) - this.squash) * Math.min(1, dt * 12);
 
-      if (popImpulse > 0 || this.gap > LEG_TRAVEL) {
+      // How much travel the legs actually have here — full on ground that comes
+      // back, almost none where the ski is bridging a hole. See LIP_* above.
+      const travel = LEG_TRAVEL * (1 - LIP_BITE * smoothstep(this.lipDrop, LIP_DROP0, LIP_DROP1));
+      this.lipS = 1 - travel / LEG_TRAVEL;
+
+      if (popImpulse > 0 || this.gap > travel) {
         this.grounded = false;
         this.airT = 0;
         // Leave the lip on the path the body was already on.
@@ -713,6 +775,9 @@ export class SkiPhysics {
     m.grip = this.gripPenalty;
     m.nPop = this.nPop;
     m.nRebound = this.nRebound;
+    m.convex = this.convex;
+    m.lipDrop = this.lipDrop;
+    m.lipS = this.lipS;
   }
 
   /** Never let a NaN escape into the rest of the engine. */
