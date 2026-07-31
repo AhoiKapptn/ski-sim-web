@@ -9,8 +9,15 @@ pnpm install
 pnpm dev            # http://127.0.0.1:5199
 ```
 
-Controls: **A/D** or **←/→** steer · **S/↓** or **Shift** tuck · **W/↑** pop ·
-**Space** brake. Gamepad supported.
+Controls: **A/D** or **←/→** steer · **W/↑**, **S/↓** or **Shift** tuck ·
+**Ctrl/X** brake · **Space** pop. Gamepad supported.
+
+There is no "forward" key — gravity is the throttle, so the key that should make
+you faster tucks. **Space is a pop, not a jump**: on flat ground its whole
+authority is a ~9 cm unweight. Air is earned from terrain. Ski the park —
+`terrain.jumps` places a roller, a hip, a step-down and three kickers down the
+corridor — and time the pop at the lip to extend it (kicker1: 2.1 s of air
+becomes 2.83 s if you hit it right).
 
 ## What's in it
 
