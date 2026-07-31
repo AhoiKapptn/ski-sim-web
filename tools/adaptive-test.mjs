@@ -27,6 +27,14 @@
  *                    resolutionScale, so ?rscale=0.6 stepped "down" to 0.90.
  *  7 pixelratio-pin  gfx.setPixelRatio(2) must survive a controller step. A step
  *                    used to null the pin, silently rescaling perf-ab's dpr arm.
+ *
+ * RUN THIS ALONE. It cost a debugging cycle to learn: with another headless
+ * Chrome hammering the GPU in parallel, Chrome throttles rAF in the loser, the
+ * controller never accumulates its 45-frame window, and `step-down`/`step-up`
+ * fail with `lastDecision === null` — which looks exactly like a dead code path
+ * and is not one. If a case fails, check `gfx.info()._nSamples` and `_graceMs`
+ * before believing it: a stalled `_nSamples` means the page is not being
+ * scheduled, not that the controller is broken.
  */
 import {
   startServer, launch, boot, installPath, sleep, makeArgs,
@@ -105,7 +113,9 @@ try {
   // --- 5: frozen during a measurement --------------------------------------
   {
     const s = await session(2, '?adaptive=1');
-    await sleep(3500);
+    // Long enough that the controller has ALREADY stepped before we freeze it.
+    // Freezing from a state where nothing had happened yet proves much less.
+    await sleep(9000);
     // (a) perf.recording
     await s.page.evaluate(() => window.__harness.perf.start({ gpuTimer: false }));
     const a0 = await s.info();

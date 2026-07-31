@@ -39,20 +39,40 @@
  *   - `gl.finish()` DOES NOT DRAIN THE GPU on Chrome's command-buffer path.
  *     Measured with the known-answer `dpr` preset: quadrupling the pixel count
  *     moved the presented interval +18.35 ms in 6/6 pairs and moved the
- *     gl.finish()-bracketed render span by 0.00 ms. `--sync-gpu` is therefore
- *     not a GPU proxy on this machine, whatever perf-ab.mjs' header claims.
- *   - EXT_disjoint_timer_query_webgl2 over-attributes cost to a chain of MANY
- *     SMALL PASSES, because ANGLE derives it from command-buffer timestamps that
- *     include queue and scheduling gaps and each pass is its own submission.
- *     Measured: switching the whole post chain off moved the GPU timer by
- *     −34.8 ms (median pair) and the presented interval by only −3.3 ms, a
- *     factor of 13. Any per-pass breakdown built on the timer query is fiction.
- *   - At DPR 2 this build runs at 30-48 ms and rAF is NOT vsync-locked there
- *     (the intervals are 34.0/40.2/42.8/48, which are not multiples of 16.7), so
- *     the presented interval is a genuine continuous measure of frame cost.
+ *     gl.finish()-bracketed render span by 0.00 ms. Independently confirmed, and
+ *     worse than that: enabling `--sync-gpu` roughly DOUBLES the presented
+ *     interval, so it does not merely fail as a proxy, it perturbs the thing it
+ *     is measuring. Do not use it.
+ *   - EXT_disjoint_timer_query_webgl2 over-attributes cost in proportion to
+ *     SUBMISSION COUNT, because ANGLE derives it from command-buffer timestamps
+ *     that include queue and scheduling gaps and each pass is its own submission.
+ *     Measured as a ratio against the presented interval: 2.75x with the post
+ *     chain on, 1.94x with it off. The absolute deltas the timer reports across a
+ *     change in pass count are not reproducible and must not be quoted.
+ *   - At DPR 2 this build runs at 30-48 ms and rAF is NOT vsync-locked there:
+ *     only 31% of frames land near a multiple of 16.7 ms and the distribution is
+ *     smooth across 33.4, so the interval is a genuine continuous measure.
  *     At DPR 1 it pins to 16.70 and can only ever report a FLOOR — so a DPR 1
  *     run of this tool measures nothing unless an arm falls off 60 fps. Run it
  *     at --dpr 2.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS INSTRUMENT CANNOT DO
+ * ---------------------------------------------------------------------------
+ * The gutted fragment program does not reference most of the varyings the vertex
+ * program writes, so the GLSL linker is free to dead-strip whatever fed them.
+ * "Material -> basic" therefore removes an unknown amount of VERTEX work along
+ * with the fragment work, and the split between the two is not recoverable from
+ * these numbers alone. To separate them, sweep resolution with the subsystem
+ * gutted: fragment cost scales with pixels and vertex cost does not. Done for the
+ * terrain, 2.2-3.0 of the frame's 3.5-4.3 ms/Mpx is genuinely fragment work.
+ *
+ * For the same reason this tool cannot answer a question about TESSELLATION
+ * (e.g. whether terrain.js' LEVEL_RES of 512 on the outer three clipmap rings is
+ * worth its 1.28 M triangles). Ring tessellation is vertex and bandwidth cost,
+ * which is exactly what the gut preserves by design and what the linker may then
+ * strip. That needs a geometry A/B — two builds with different LEVEL_RES — not a
+ * material swap.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -163,29 +183,41 @@ const KIT_SRC = `(function () {
   const P = d.postfx.params;
   const A = {
     // --- scene shading cost (coverage-preserving material swaps) -------------
-    snow:   { desc: 'terrain snow/rock shader -> MeshBasicMaterial (same coverage)', on: () => swapGroup(groups.snow), off: unswapAll },
-    // Split the terrain by clipmap ring. LEVEL_RES ramps to 512 for levels 6-8,
-    // which is 1.28 M of the scene's 2.63 M triangles and was justified in
-    // terrain.js with "measured cost at 1600x900 was nil (60.3 fps against
-    // 60.0)" — an fps number, at DPR 1, where the frame is vsync-locked and a
-    // real cost cannot show up at all. This says what those rings cost where it
-    // matters.
-    snownear: { desc: 'terrain LOD 0-5 (near+mid rings) -> basic',
-      meshes: () => groups.snow.filter((o) => !/lod[678]/.test(o.name || '')),
-      on: () => swapGroup(A.snownear.meshes()), off: unswapAll },
-    snowfar:  { desc: 'terrain LOD 6-8 (the 512-res skyline rings) -> basic',
-      meshes: () => groups.snow.filter((o) => /lod[678]/.test(o.name || '')),
-      on: () => swapGroup(A.snowfar.meshes()), off: unswapAll },
-    trees:  { desc: 'conifer cards + clusters -> basic (same map + alphaTest)',      on: () => swapGroup(groups.trees), off: unswapAll },
-    rocks:  { desc: 'scatter rocks/talus -> basic',                                  on: () => swapGroup(groups.rocks), off: unswapAll },
-    skier:  { desc: 'skier + riders -> basic',                                       on: () => swapGroup(groups.skier), off: unswapAll },
-    sky:    { desc: 'sky dome shader -> basic',                                      on: () => swapGroup(groups.sky),   off: unswapAll },
-    tracks: { desc: 'carve trench ribbon -> basic (it runs the FULL snow shader)',    on: () => swapGroup(groups.tracks), off: unswapAll },
-    spray:  { desc: 'snow spray particles -> basic',                                  on: () => swapGroup(groups.spray), off: unswapAll },
-    lift:   { desc: 'chairlift, cable and towers -> basic',                           on: () => swapGroup(groups.lift), off: unswapAll },
-    markers:{ desc: 'piste markers, gates, fences -> basic',                          on: () => swapGroup(groups.markers), off: unswapAll },
-    other:  { desc: 'everything else in the scene -> basic',                          on: () => swapGroup(groups.other), off: unswapAll },
+    // Every group entry declares meshes() so the shared-material guard can check
+    // it. Without that the guard only covered the entries that happened to define
+    // one, and e.g. "rocks -1.2 ms" could silently have been about rocks AND
+    // markers if they shared a material.
+    snow:   { desc: 'terrain snow/rock shader -> MeshBasicMaterial (same coverage)',
+      meshes: () => groups.snow, on: () => swapGroup(groups.snow), off: unswapAll },
+    trees:  { desc: 'conifer cards + clusters -> basic (same map + alphaTest)',
+      meshes: () => groups.trees, on: () => swapGroup(groups.trees), off: unswapAll },
+    rocks:  { desc: 'scatter rocks/talus -> basic',
+      meshes: () => groups.rocks, on: () => swapGroup(groups.rocks), off: unswapAll },
+    skier:  { desc: 'skier + riders -> basic',
+      meshes: () => groups.skier, on: () => swapGroup(groups.skier), off: unswapAll },
+    sky:    { desc: 'sky dome shader -> basic',
+      meshes: () => groups.sky, on: () => swapGroup(groups.sky), off: unswapAll },
+    tracks: { desc: 'carve trench ribbon -> basic (it runs the FULL snow shader)',
+      meshes: () => groups.tracks, on: () => swapGroup(groups.tracks), off: unswapAll },
+    spray:  { desc: 'snow spray particles -> basic',
+      meshes: () => groups.spray, on: () => swapGroup(groups.spray), off: unswapAll },
+    lift:   { desc: 'chairlift, cable and towers -> basic',
+      meshes: () => groups.lift, on: () => swapGroup(groups.lift), off: unswapAll },
+    markers:{ desc: 'piste markers, gates, fences -> basic',
+      meshes: () => groups.markers, on: () => swapGroup(groups.markers), off: unswapAll },
+    other:  { desc: 'everything else in the scene -> basic',
+      meshes: () => groups.other, on: () => swapGroup(groups.other), off: unswapAll },
+    // COMPLEMENT ARMS. "terrain is X" and "everything except terrain is Y" are
+    // different questions and both are needed: an arm that bottoms out on the
+    // vsync floor only gives a lower bound, and the complement is what turns two
+    // lower bounds into a ratio. Reviewing this tool, the complement is what
+    // established that terrain is >=76% of scene shading cost rather than
+    // "over half".
+    noterrain: { desc: 'EVERYTHING EXCEPT terrain -> basic (complement of snow)',
+      meshes: () => Object.entries(groups).filter(([k]) => k !== 'snow').flatMap(([, v]) => v),
+      on: () => swapGroup(A.noterrain.meshes()), off: unswapAll },
     allscene: { desc: 'EVERY scene material -> basic (scene shading floor)',
+      meshes: () => Object.values(groups).flat(),
       on: () => { for (const k of Object.keys(groups)) swapGroup(groups[k]); },
       off: unswapAll },
 
@@ -307,7 +339,9 @@ const opts = {
 };
 
 const server = await startServer({ prod: opts.prod, port: 5321 });
-const { browser, page, errors } = await launch(opts);
+// The whole-scene arms relink ~120 programs in one call; the default timeout is
+// not enough for that on a cold program cache.
+const { browser, page, errors } = await launch({ ...opts, protocolTimeout: 1800000 });
 let code = 0;
 const out = [];
 
@@ -330,7 +364,18 @@ try {
   console.log(`ablated mesh counts: ${JSON.stringify(counts)}`);
   if (opts.dpr < 2) {
     console.log('WARNING: at dpr 1 the presented interval pins to 16.70 ms (vsync). This run can only');
-    console.log('         report a FLOOR — an ablation that saves 5 ms will read as saving 0.');
+    console.log('         report a FLOOR — an ablation that saves 5 ms will read as saving 0. Use --dpr 2.');
+  }
+  // Shared materials across GROUPS make the group split itself meaningless, not
+  // just the subset entries. Say so up front rather than at the point of use.
+  const shared = await page.evaluate(() => window.__abl.sharedWarnings());
+  const crossGroup = shared.filter((s) => s.groups.length > 1);
+  if (crossGroup.length) {
+    console.log(`\nNOTE: ${crossGroup.length} material instance(s) are shared ACROSS groups. Any entry naming`);
+    console.log('      one of these groups also ablates the others, so those rows are not separable:');
+    for (const s of crossGroup.slice(0, 6)) {
+      console.log(`        [${s.groups.join(' + ')}]  ${s.meshes.slice(0, 4).join(', ')}${s.meshes.length > 4 ? ', …' : ''}`);
+    }
   }
   console.log(`\nprimary metric: presented frame interval. delta = ablated − baseline (negative ⇒ the`);
   console.log(`ablated subsystem was costing that much). ${opts.cycles} ABBA cycles per entry.\n`);
@@ -346,6 +391,18 @@ try {
   for (const name of want) {
     const desc = await page.evaluate((k) => window.__abl.desc(k), name);
     process.stdout.write(`── ${name}: ${desc}\n`);
+
+    // PRE-WARM. Toggling an arm links a fresh program per material, and on a cold
+    // cache the whole-scene arms link ~120 of them — several seconds of stall that
+    // would otherwise land inside a measurement window (or blow the CDP timeout).
+    // Link them all once here, outside every window; the ABBA toggles below are
+    // then program-cache hits.
+    await page.evaluate(async (k) => {
+      window.__abl.on(k);
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      window.__abl.allOff();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    }, name);
 
     // SELF-CHECK. A "no measurable difference" verdict is worthless if the
     // ablation never took effect — a typo'd param path or a material that was
@@ -416,32 +473,47 @@ try {
     // entries in the first run — `snow` and `allscene` both bottomed out at
     // 16.70 and their "−15.7 / −27.3 ms" were floors, not costs.
     row.clamped = s.ablMin < VSYNC_FLOOR;
-    console.log(`     => interval p50  base min ${f(s.baseMin)}  ablated min ${f(s.ablMin)}  |  min-of-N Δ ${f(s.minDelta)} ms`
-      + `  median pair Δ ${f(s.medianDelta)} ms  |  cheaper in ${s.cheaperInPairs}/${s.pairs} pairs`);
+    row.consistent = s.cheaperInPairs === s.pairs;
+    row.noEffect = s.cheaperInPairs !== 0 && s.cheaperInPairs !== s.pairs;
+    // MEDIAN PAIRED DELTA IS THE HEADLINE, not min-of-N. Both arms of a pair are
+    // adjacent in time, so a paired delta is drift-immune; min-of-N takes the
+    // minimum of each arm across the WHOLE session, and those two minima can be
+    // minutes apart. Reviewed against a complement arm, min-of-N inflated the
+    // small entries by ~2.7x on a session that drifted from 31 to 60 ms.
+    console.log(`     => interval p50  MEDIAN PAIR Δ ${f(s.medianDelta)} ms  |  cheaper in ${s.cheaperInPairs}/${s.pairs} pairs`);
     console.log(`        per-pair Δ: ${s.deltas.map((x) => f(x)).join(' ')}`);
+    console.log(`        (min-of-N Δ ${f(s.minDelta)} ms from base min ${f(s.baseMin)} / abl min ${f(s.ablMin)}`
+      + ' — NOT drift-immune, for reference only)');
     const p99 = row.stats['interval.p99'];
-    console.log(`        p99 min-of-N Δ ${f(p99.minDelta)} ms   over33/s ${f(row.stats['over33/s'].baseMin, 1)} -> ${f(row.stats['over33/s'].ablMin, 1)}`);
-    if (row.clamped) {
-      console.log(`        ^ the ablated arm hit the ${VSYNC_FLOOR} ms VSYNC FLOOR. This Δ is a LOWER BOUND on the`);
-      console.log('          cost, not the cost: the frame had spare budget the presented interval cannot show.');
-      console.log('          To resolve it, raise the load (--dpr 2 is already on) or ablate something smaller.');
-    }
-    if (s.cheaperInPairs !== 0 && s.cheaperInPairs !== s.pairs) {
-      console.log('        ^ sign NOT consistent across pairs — treat as no measurable difference.');
+    console.log(`        p99 median pair Δ ${f(p99.medianDelta)} ms   over33/s ${f(row.stats['over33/s'].baseMin, 1)} -> ${f(row.stats['over33/s'].ablMin, 1)}`);
+    if (row.noEffect) {
+      // Report exactly one conclusion. An inconsistent sign means "no measurable
+      // difference" and that is the end of it — printing a LOWER BOUND alongside
+      // it told the reader the opposite thing at the same time.
+      console.log('        ^ sign NOT consistent across pairs — no measurable difference. Ignore the numbers.');
+    } else if (row.clamped) {
+      console.log(`        ^ the ablated arm reached the ${VSYNC_FLOOR} ms VSYNC FLOOR, so this Δ is a LOWER BOUND`);
+      console.log('          on the cost: the frame had spare budget the presented interval cannot show. Run the');
+      console.log('          COMPLEMENT arm (`noterrain` for `snow`) to turn two lower bounds into a ratio,');
+      console.log(`          or raise the load beyond --dpr ${opts.dpr}.`);
     }
     console.log('');
     out.push(row);
   }
 
   // --- ranked summary --------------------------------------------------------
-  const ranked = [...out].sort((a, b) => a.stats['interval.p50'].minDelta - b.stats['interval.p50'].minDelta);
-  console.log('════ ranked by min-of-N saving on interval p50 (most expensive subsystem first) ════');
+  const ranked = [...out].sort((a, b) => a.stats['interval.p50'].medianDelta - b.stats['interval.p50'].medianDelta);
+  console.log('════ ranked by MEDIAN PAIRED saving on interval p50 (most expensive subsystem first) ════');
   for (const r of ranked) {
     const s = r.stats['interval.p50'];
-    const consistent = s.cheaperInPairs === s.pairs ? ' ' : (s.cheaperInPairs === 0 ? ' (no effect)' : ' (INCONSISTENT)');
-    console.log(`  ${r.name.padEnd(12)} ${r.clamped ? '>=' : '  '}${f(s.minDelta)} ms  (median pair ${f(s.medianDelta)})  ${s.cheaperInPairs}/${s.pairs}${consistent}`
-      + `${r.clamped ? '  [LOWER BOUND — hit vsync floor]' : ''}`);
+    // Exactly one verdict per row.
+    const verdict = r.noEffect ? 'no measurable difference (sign inconsistent)'
+      : r.clamped ? 'LOWER BOUND — ablated arm hit the vsync floor'
+      : `${s.cheaperInPairs}/${s.pairs} pairs`;
+    console.log(`  ${r.name.padEnd(12)} ${r.clamped && !r.noEffect ? '>=' : '  '}${f(s.medianDelta)} ms   ${verdict}`);
   }
+  console.log('\nDeltas are median PAIRED differences (drift-immune). Rows marked LOWER BOUND are');
+  console.log('censored by vsync — pair them with their complement arm before quoting a level.');
 
   if (opts.json) {
     const p = path.resolve(ROOT, opts.json);

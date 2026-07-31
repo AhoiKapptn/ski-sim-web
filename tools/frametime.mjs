@@ -145,10 +145,16 @@ export async function startServer({ prod = false, port = 5301 } = {}) {
 }
 
 // ---- browser ----------------------------------------------------------------
-export async function launch({ w = 1600, h = 900, dpr = 1 } = {}) {
+/**
+ * `protocolTimeout` needs raising for callers that toggle MANY materials in one
+ * evaluate: `needsUpdate = true` on ~120 materials is a synchronous shader-link
+ * storm inside a single CDP call, and tools/gpu-breakdown.mjs' whole-scene arms
+ * hit the default.
+ */
+export async function launch({ w = 1600, h = 900, dpr = 1, protocolTimeout = 600000 } = {}) {
   const browser = await puppeteer.launch({
     headless: true,
-    protocolTimeout: 600000,
+    protocolTimeout,
     args: [
       '--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist',
       '--enable-unsafe-swiftshader', '--no-sandbox', '--force-color-profile=srgb',

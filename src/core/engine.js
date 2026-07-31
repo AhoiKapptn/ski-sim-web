@@ -187,6 +187,14 @@ export function createEngine(container, opts = {}) {
   const MIN_MPX = 2.5;         // below this there is nothing to win (rule 4)
   const HOLD_MS = 900;         // no more than one step per this (rule 3)
   const WINDOW = 45;           // frames of evidence per decision
+  // Boot frames are not gameplay frames: `main.js` links programs at frames 30,
+  // 120, 300 and 600, and the clipmap and scatter pools are still streaming in.
+  // Reacting to them means reacting to shader-link stalls. It also keeps the
+  // controller out of the way of `shoot.mjs`, which boots, waits ~1.2 s and then
+  // pauses the sim — without this grace period it had already stepped to 0.9 by
+  // then and `--dpr 2` screenshots came out at 4.67 Mpx instead of 5.76.
+  const START_GRACE_MS = 4000;
+  let firstFrameAt = 0;
 
   // `?rscale=` / `opts.resolutionScale` is an explicit instruction about the
   // resolution. The header documents it as pinning, so it pins: the controller
@@ -223,6 +231,28 @@ export function createEngine(container, opts = {}) {
   let freezeDepth = 0;
   let upVotes = 0;             // consecutive windows agreeing that we may go up
   let lastDecision = null;     // diagnostics: why the last window did or did not move
+
+  // --- "a tool is driving this page" ----------------------------------------
+  // `window.__setAuto(false)` pauses the simulation, and every capture tool in
+  // tools/ does exactly that before it starts stepping and screenshotting. A
+  // paused sim is not a gameplay frame, so the controller has no business acting
+  // on its frame time — and acting is actively harmful: a step reallocates ~12
+  // postfx render targets, and doing that while `Page.captureScreenshot` is in
+  // flight makes `shoot.mjs --dpr 2` time out and fail. (Found by running it.)
+  //
+  // `main.js` installs `__setAuto` after `createEngine` returns, so the hook is
+  // installed lazily on the first rAF tick and is one boolean test thereafter.
+  // This keeps shoot.mjs and flyby.mjs correct without either of them — files
+  // this module does not own — having to know the controller exists.
+  let simPaused = false;
+  let setAutoHooked = false;
+  function hookSetAuto() {
+    if (setAutoHooked || typeof window === 'undefined') return;
+    if (typeof window.__setAuto !== 'function') return;
+    const orig = window.__setAuto;
+    window.__setAuto = (v) => { simPaused = !v; return orig(v); };
+    setAutoHooked = true;
+  }
   const _v2 = new THREE.Vector2();
 
   // Observed cost per ladder step, for the up-step prediction below.
@@ -286,7 +316,10 @@ export function createEngine(container, opts = {}) {
     const prev = lastFrame;
     lastFrame = now;
     if (!prev) return;
-    if (!adaptive || freezeDepth > 0) return;
+    hookSetAuto();
+    if (!firstFrameAt) firstFrameAt = now;
+    if (now - firstFrameAt < START_GRACE_MS) return;
+    if (!adaptive || freezeDepth > 0 || simPaused) return;
     // Rule 1: never move while the frame-time harness is recording...
     if (typeof window !== 'undefined' && window.__harness?.perf?.recording) return;
     // ...and never move while something has pinned the backbuffer with
@@ -530,6 +563,10 @@ export function createEngine(container, opts = {}) {
         adaptiveForced: forceAdaptive,
         rscalePinned,
         frozen: freezeDepth > 0,
+        simPaused,
+        _nSamples: nSamples,
+        _graceMs: firstFrameAt ? Math.round(performance.now() - firstFrameAt) : -1,
+        _explicitPixelRatio: explicitPixelRatio,
         // Derived, never stored — see `nearestStep`.
         adaptiveStep: nearestStep(resolutionScale),
         adaptiveSteps: STEPS,
