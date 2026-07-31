@@ -46,8 +46,41 @@ const MU_LAT_EDGE = 3.20;   // grip per sin(phi): ~2.3 g at 30 deg, ~3.5 g laid 
 const MU_SNOW = 0.045;      // kinetic snow friction, running flat
 const DRAG_UP = 0.0042;     // 1/m, upright (terminal ~20 m/s on a 12 deg pitch, 28 on 20)
 const DRAG_TUCK = 0.0020;   // 1/m, tucked  (terminal ~29 m/s on a 12 deg pitch, 40 on 20)
-const EDGE_W = 13.0;        // rad/s, edge-angle spring (weight transfer ~0.25 s)
-const EDGE_RATE_MAX = 9.0;  // rad/s
+// ---- edge dynamics ---------------------------------------------------------
+// The edge angle is not a slider the input writes; it is where the rider's mass
+// is, and mass takes time to move. Two nested limits model that:
+//
+//   EDGE_W        a critically damped spring that TRACKS the commanded edge. Set
+//                 high (18 rad/s) on purpose — it is not the thing that slows the
+//                 turn down, it just must not lag or ring. Making the spring slow
+//                 instead produced a t^2 onset: the first 100 ms were dead and
+//                 then it slammed, which is the worst of both.
+//   EDGE_RATE_*   the real limit — how fast the edge angle itself can change.
+//                 Tipping the ski from flat is quick; laying it further over once
+//                 you are already inclined at 2 g means moving the whole body
+//                 across the skis against that load, and it gets progressively
+//                 harder. So the ceiling FADES with edge angle:
+//
+//                     rate_max(phi) = EDGE_RATE_SET * (1 - FADE * (|phi|/PHI_MAX)^P)
+//
+//                 2.30 rad/s flat (132 deg/s) down to 0.87 rad/s at full lock.
+//                 That single line is what turns "tap = instant 60 deg" into an
+//                 arc that keeps tightening for the better part of a second:
+//                 ~8 deg at 100 ms, 30 deg at 300 ms, 90% at 0.61 s, lock at 0.79 s.
+//                 The ceiling is untouched — full lock is still full lock.
+//
+//                 Releasing is the reverse move and gravity helps, so it gets its
+//                 own, higher limit. It stays well short of the old 7.5 /s snap so
+//                 that letting go of a turn no longer trips the rebound pop.
+//
+// Note it is a function of |phi| ONLY, never of load: load differs between a left
+// and a right turn on any traverse, and the input->edge chain has to be exactly
+// mirror-symmetric.
+const EDGE_W = 18.0;          // rad/s, edge-angle tracking spring
+const EDGE_RATE_SET = 2.30;   // rad/s, edge-roll ceiling from flat
+const EDGE_SET_FADE = 0.62;   // ...falling to (1-FADE) of that at full lock
+const EDGE_SET_P = 1.3;       // ...with this shape
+const EDGE_RATE_REL = 4.20;   // rad/s, releasing an edge (standing up is easy)
 const AIR_YAW = 2.0;        // rad/s, in-air rotation authority
 const LEG_TRAVEL = 0.45;    // m of leg extension before the skis really leave the snow
 const AIR_REPORT = 0.07;    // s of real flight before `airborne` is published
@@ -259,14 +292,42 @@ export class SkiPhysics {
     const loadPrev = Math.abs(this.aLat) / G;
     const phiTarget = steer * PHI_MAX * (1 - 0.45 * brake);
     const acc = EDGE_W * EDGE_W * (phiTarget - this.phi) - 2 * EDGE_W * this.phiRate;
-    this.phiRate = clamp(this.phiRate + acc * dt, -EDGE_RATE_MAX, EDGE_RATE_MAX);
+    let phiRate = this.phiRate + acc * dt;
+    // Rolling further ONTO the edge (rate and angle the same sign) is the move
+    // that gets progressively harder; coming back off it, or crossing over to the
+    // other edge, is not.
+    const aNorm = Math.abs(this.phi) / PHI_MAX;
+    const rateCap = phiRate * this.phi >= 0
+      ? EDGE_RATE_SET * (1 - EDGE_SET_FADE * Math.pow(aNorm, EDGE_SET_P))
+      : EDGE_RATE_REL;
+    this.phiRate = clamp(phiRate, -rateCap, rateCap);
     this.phi = clamp(this.phi + this.phiRate * dt, -PHI_MAX, PHI_MAX);
     const absPhi = Math.abs(this.phi);
     const dPhi = (absPhi - phiPrev) / dt;
 
-    // --- jump pre-load: squat while held, release the spring on let-go --------
-    // Coyote time + a short release buffer: skimming a roller for 40 ms must
-    // never eat the player's pop.
+    // --- the pop: an UNWEIGHT that modulates a takeoff, never a jump ----------
+    // You cannot jump your way into the air on skis. What a rider actually does
+    // is extend at the lip, and what that buys is proportional to what the
+    // terrain was already giving them. So the pop is scaled by how much the snow
+    // is doing the launching at the moment it fires:
+    //
+    //   lipNow   the ground has already started falling away — the legs are
+    //            extending into the suspension travel. This is the lip.
+    //   rampNow  the contact surface is still moving UP (vSurf > 0), i.e. the
+    //            rider is on the face of a kicker or the back of a roller. On the
+    //            open piste vSurf is negative (the hill descends), so this is
+    //            zero and cannot be farmed on flat ground.
+    //   coyote   already off the lip by a frame or two — full credit.
+    //
+    // On flat ground the whole authority is POP_FLAT: 1.30 m/s, an 8 cm hop that
+    // reads as an unweight. Off a lip it adds up to 4.5 m/s and roughly doubles a
+    // kicker's hang time, which is the skill the button is there to reward.
+    //
+    // History: this used to be `pending = 3.2 + 4.3 * preload` — a 7.5 m/s launch
+    // out of nothing — and it was bound to W as well as Space, so *letting go of
+    // the forward key* threw the rider 3.7 m into the air. Never again.
+    const POP_FLAT = 1.30;      // m/s, standing on the flat: an unweight
+    const POP_LIP = 3.20;       // m/s, extra, and only what the terrain earns you
     let popImpulse = 0;
     this.jumpBuf = Math.max(0, this.jumpBuf - dt);
     if (jump) {
@@ -274,15 +335,21 @@ export class SkiPhysics {
       this.preload = Math.min(1, this.preload + dt / 0.28);  // legs load, air or not
     } else if (this.jumpHeld) {
       this.jumpHeld = false;
-      this.pending = 3.2 + 4.3 * this.preload;              // charged pop
-      this.jumpBuf = 0.80;   // fires on the next contact, so a float never eats it
+      this.pending = 0.30 + 0.70 * this.preload;            // charge, 0.30..1
+      this.jumpBuf = 0.45;   // fires on the next contact, so a float never eats it
       this.preload = 0;
     } else {
       this.preload = Math.max(0, this.preload - dt * 3);
     }
     if (this.pending > 0) {
       if (this.grounded || this.airT < 0.12) {              // coyote time
-        popImpulse = this.pending; this.pending = 0; this.jumpBuf = 0;
+        // Evaluated when it FIRES, not when the key was released, so the buffer
+        // lets a slightly early release still catch the lip.
+        const lipNow = clamp(this.gap / (LEG_TRAVEL * 0.5), 0, 1);
+        const rampNow = clamp(this.vSurf / 2.5, 0, 1);
+        const lip = this.grounded ? clamp(Math.max(lipNow, 0.7 * rampNow), 0, 1) : 1;
+        popImpulse = this.pending * (POP_FLAT + POP_LIP * lip);
+        this.pending = 0; this.jumpBuf = 0;
       } else if (this.jumpBuf === 0) {
         this.pending = 0;                                   // buffer expired
       }
@@ -290,13 +357,17 @@ export class SkiPhysics {
 
     // --- rebound: unloading a loaded turn throws you up ------------------------
     this.reboundCd = Math.max(0, this.reboundCd - dt);
-    // Real cross-over unweights; it does not launch you every turn. Firing this
-    // on any 1 g turn put the rider airborne for ~30% of a linked-carve run and
-    // taxed him a touchdown each time, so it wants a genuinely loaded edge.
+    // Real, but it is the *rarest* way to get air, not the default one. The
+    // thresholds are set from measurement: through 40 s of linked carving the
+    // release rate now peaks around -3.0 rad/s and the load at release around
+    // 1.9 g, so requiring BOTH a snapped release and a genuinely over-2 g edge
+    // keeps this out of ordinary turns entirely. Capped at 0.85 m/s — 3 cm and
+    // 0.15 s — because a cross-over unweights the skis, it does not launch them.
+    // (Measured before: 12.6% of a 2 s-period linked run was spent airborne.)
     if (this.grounded && !this.jumpHeld && this.reboundCd === 0 &&
-        dPhi < -2.6 && loadPrev > 1.45 && brake < 0.5) {
-      popImpulse += Math.min(1.1, (loadPrev - 1.35) * 1.1);
-      this.reboundCd = 0.45;
+        dPhi < -3.0 && loadPrev > 2.05 && brake < 0.5) {
+      popImpulse += Math.min(0.85, (loadPrev - 1.95) * 1.1);
+      this.reboundCd = 0.70;
     }
 
     // --- ground sample --------------------------------------------------------
