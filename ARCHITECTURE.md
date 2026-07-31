@@ -58,6 +58,7 @@ Dispatch on `typeof third === 'number'`.
 
 | `world/snow-material.js` | `createSnowMaterial(opts)` | the snow shader: sparkle, sheen, subsurface, wind ripples |
 | `world/scatter.js` | `createScatter(scene, terrain)` | instanced trees, rocks, lift towers, gates, fences |
+| `world/branding.js` | `createBranding(scene, terrain, scatter)` | slope-side sponsor boards, banners and a feather flag at the piste edge. Reads placement off scatter's public seam; **the only two binary assets in the repo** (`public/brand/*.png`, a scoped exception documented in the file header). Also returns `ready` (and sets `window.__brandingReady`), which resolves once those PNGs are composited into the atlas; the panels render procedurally drawn stand-ins until then, so no frame and no capture is ever blank |
 | `player/skier.js` | `createSkier(scene)` | skier mesh/rig + procedural animation from `state` |
 | `player/physics.js` | `class SkiPhysics` | carving dynamics, edges, air, landings |
 | `player/controls.js` | `createControls()` | keyboard/gamepad → `state.input` |
