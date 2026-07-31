@@ -278,6 +278,14 @@ export class SkiPhysics {
 
   // ---------------------------------------------------------------------------
   update(dt, state) {
+    // The resort mode machine (game/resort.js) SUSPENDS the sim while the player
+    // is on a lift or inside a hut: it owns pos/vel/heading/groundNormal for the
+    // duration and integrating here as well would be two authorities fighting
+    // over the same vector. main.js already skips this call — this guard is the
+    // belt to that braces, because a second caller (a capture tool, a future
+    // replay) that did not know the rule would otherwise drive the rider off the
+    // chair and into the snow.
+    if (state.mode && state.mode !== 'ski') return;
     if (!(dt > 0)) { this._publish(state, 0); return; }
     dt = Math.min(dt, 0.1);
     const steps = Math.min(6, Math.max(1, Math.ceil(dt / SUBSTEP)));

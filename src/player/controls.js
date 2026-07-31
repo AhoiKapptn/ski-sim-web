@@ -9,6 +9,14 @@
  *   W / ↑ / S / ↓ / Shift or RT  tuck    (0..1 analogue — get low, go faster)
  *   Ctrl / X or LT               brake   (0..1, hockey stop)
  *   Space or A-button            pop     (hold to pre-load, release to unweight)
+ *   E or Y-button                action  (board a lift, step into the hut, get off)
+ *   1 / 2                        pick    (order at the bar)
+ *
+ * `action` and `pick` exist for the resort mode machine (`game/resort.js`) and
+ * are the ONLY keys that mean different things in different modes — everything
+ * above always means the same thing. `action` is published both as a level and
+ * as an edge (`actionPressed`), because the mode machine wants the edge and
+ * because a level that is read twice in one frame would double-fire.
  *
  * There is no "forward" in skiing — gravity is the throttle — so both the
  * "forward" key (W/↑) and the "get low" key (S/↓/Shift) drive the same tuck
@@ -87,6 +95,7 @@ export function createControls() {
 
   let steer = 0, tuck = 0, brake = 0;
   let jumpPrev = false;
+  let actPrev = false;
 
   const k = (...codes) => codes.some((c) => keys[c]);
 
@@ -105,6 +114,7 @@ export function createControls() {
       tuck: clamp(Math.max(btn(7), btn(1) /* B */), 0, 1),          // RT
       brake: clamp(Math.max(btn(6), btn(2) /* X */), 0, 1),         // LT
       jump: btn(0) > 0.5,                                           // A
+      action: btn(3) > 0.5,                                         // Y
     };
   }
 
@@ -119,6 +129,10 @@ export function createControls() {
         i.jump = !!ov.jump;
         i.jumpPressed = i.jump && !jumpPrev;
         jumpPrev = i.jump;
+        i.action = !!ov.action;
+        i.actionPressed = i.action && !actPrev;
+        actPrev = i.action;
+        i.pick = ov.pick | 0;
         steer = i.steer; tuck = i.crouch; brake = i.brake;
         return;
       }
@@ -162,6 +176,18 @@ export function createControls() {
       i.jump = jump;
       i.jumpPressed = jump && !jumpPrev;
       jumpPrev = jump;
+
+      // --- resort interaction -----------------------------------------------
+      // Digital only, and deliberately not folded into any of the channels
+      // above: `action` never means anything while the player is skiing except
+      // "use the thing in front of me", so it can never change how the skiing
+      // feels. `pick` is the bar order and is a level, not an edge — the mode
+      // machine debounces it against what is already in front of you.
+      const act = k('KeyE') || !!(g && g.action);
+      i.action = act;
+      i.actionPressed = act && !actPrev;
+      actPrev = act;
+      i.pick = k('Digit1', 'Numpad1') ? 1 : k('Digit2', 'Numpad2') ? 2 : 0;
     },
   };
 }
