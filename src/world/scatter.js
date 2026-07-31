@@ -5258,6 +5258,10 @@ export function createScatter(scene, terrain) {
           new THREE.Vector3(bx + tl, gy + 1.7, bz + tl * 0.6), 0.035, col);
       }
     }
+    // Floor level, for consumers that need to stand something on this hut's
+    // deck. It is the four-corner maximum plus 0.3 and NOT terrain.height at
+    // the centre — see the comment at the top of this function.
+    return gy;
   }
 
   /**
@@ -5369,7 +5373,7 @@ export function createScatter(scene, terrain) {
     const gb = new GB();
     for (const b of BUILDINGS) {
       const gy = terrain.height(b.x, b.z);
-      hutAt(gb, b.x, b.z, gy, b.yaw, b);
+      b.floorY = hutAt(gb, b.x, b.z, gy, b.yaw, b);
     }
     for (const g of GROOMERS) groomerAt(gb, g.x, g.z, terrain.height(g.x, g.z), g.yaw);
     // people outside the huts, in twos and threes
@@ -6226,6 +6230,26 @@ export function createScatter(scene, terrain) {
     // Nothing in the sim reads either.
     uniforms,
     riders,
+
+    // --- placement seam, for gameplay modules ------------------------------
+    // Consumers that have to put the PLAYER somewhere the world already has
+    // geometry (ride the lift, walk into the restaurant, hang a banner off the
+    // piste edge) must read the placement from here rather than re-deriving it.
+    // Two copies of `corridorX0` or of the cable catenary is exactly the
+    // ambiguous seam that has caused every integration failure in this repo.
+    //
+    //   buildings[]  { x, z, yaw, w, d, h, roofH, deck?, floorY }
+    //                w/d are HALF extents across/along the ridge; floorY is the
+    //                four-corner maximum, i.e. the deck level (see hutAt).
+    //   lift.towers[] { x, z, g, h, top, topY, yaw, perpX, perpZ, armL, armR }
+    //   lift.cables[] { pts, cum, total, dir }
+    //                pts run from tower 0 (z = LIFT_Z0, the VALLEY end) to
+    //                tower nT (z = LIFT_Z1, the TOP), so arc length increases
+    //                uphill and `dir: +1` is the uphill-travelling side.
+    //                These are the same samples the chairs already ride; `cum`
+    //                is the arc-length table.
+    buildings: BUILDINGS,
+    lift,
 
     update(dt, state) {
       time += dt || 0;
