@@ -10,7 +10,8 @@ pnpm dev            # http://127.0.0.1:5199
 ```
 
 Controls: **A/D** or **←/→** steer · **W/↑**, **S/↓** or **Shift** tuck ·
-**Ctrl/X** brake · **Space** pop. Gamepad supported.
+**Ctrl/X** brake · **Space** pop · **E** use the thing in front of you.
+Gamepad supported.
 
 There is no "forward" key — gravity is the throttle, so the key that should make
 you faster tucks. **Space is a pop, not a jump**: on flat ground its whole
@@ -18,6 +19,34 @@ authority is a ~9 cm unweight. Air is earned from terrain. Ski the park —
 `terrain.jumps` places a roller, a hip, a step-down and three kickers down the
 corridor — and time the pop at the lip to extend it (kicker1: 2.1 s of air
 becomes 2.83 s if you hit it right).
+
+## The resort loop
+
+Skiing down is not the whole day. Stop next to something and a prompt appears;
+**E** uses it.
+
+| | |
+|---|---|
+| **The chairlift** | 4 km of real cable with 39 lattice towers. Board at the valley station or the mid-station, ride the line at its true 4.6 m/s with the towers going over your head and the down-side chairs passing, and unload at the summit. **A/D** look around — the view back down the valley is half of what a lift ride is for — **S** looks down at your own ski tips over the footrest, and **hold X** to skip the rest of the ride. |
+| **The T-bar** | A 680 m drag lift up the lower pitch, 30 m off the piste centreline. You stay on your skis and on the snow with a steel bar under you at 3.4 m/s, which is a different thing from sitting on a chair rather than a second copy of it. Same **hold X** to skip. |
+| **The Bergrestaurant** | Ski up to the mid-mountain restaurant and go in. Timber, a stove, a hanging lamp, the massif through the window, and a coffee (**1**) or a beer (**2**) on the table in front of you. The drink resets your warmth, logs the run you just finished on the card, and costs you a bit of the afternoon — the sun really does move. **E** puts you back on the snow. |
+
+Warmth drains while you are out in it (about eleven minutes of skiing to empty)
+and a hot drink refills it. It is a reason to go inside, not a fail state:
+nothing breaks at zero.
+
+While you are on a lift or indoors the mode machine in `src/game/resort.js`
+suspends the physics and owns the rider — see `state.mode` in ARCHITECTURE.md.
+
+To drop straight into any of it, `pnpm dev` and add a query:
+
+```
+?resort=hut&drink=beer            sitting in the restaurant with a beer
+?resort=lift&at=mid&progress=0.4  on the chair, 40% of the way up from the mid-station
+?resort=drag&progress=0.45        on the T-bar
+?resort=tbar                      standing at the T-bar with the prompt up
+?resort=chair-mid                 ...or at the mid-station
+```
 
 ## What's in it
 
@@ -31,6 +60,7 @@ becomes 2.83 s if you hit it right).
 | Character | Lofted parametric garments with procedural fabric, rucksack, boot hardware, mirrored goggles. Procedural animation — angulation, absorption, pole plants, airborne phases |
 | FX | GPU spray with soft-particle depth fade, persistent carve trenches driven by normals/AO rather than dark decals |
 | World | Instanced conifer forests with treeline gradient, chairlift, other skiers, lodges, snow guns, piste furniture |
+| Resort loop | Rideable chairlift and T-bar, an enterable mid-mountain restaurant with a coffee and a beer, one mode machine driving physics, camera, HUD and audio |
 | Audio | Fully procedural WebAudio — carve, wind, impacts, convolution reverb from a generated impulse response |
 
 ## Tools

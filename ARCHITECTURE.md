@@ -35,7 +35,51 @@ subsystem each frame. Read what you need; only the owner writes each field.
 | `crouch` | 0..1 | physics | tuck amount |
 | `gForce` | number | physics | lateral load, drives spray volume + cam shake |
 | `airTime`,`distance`,`time` | number | physics | run stats for HUD |
-| `input` | object | controls | `{steer,crouch,jump,brake}` |
+| `input` | object | controls | `{steer,crouch,jump,brake,action,actionPressed,pick}` |
+| `mode` | string | resort | `'ski' \| 'lift' \| 'drag' \| 'hut'` — see below |
+| `modeT` | number | resort | seconds since the mode was entered |
+| `prompt` | object\|null | resort | contact prompt `{key,text,sub,ready}` |
+| `ride` | object\|null | resort | `{kind,name,s,total,progress,speed,hint,canUnload}` |
+| `hut` | object\|null | resort | `{name,choices,drink,served,run,hint}` |
+| `warmth` | 0..1 | resort | drains while skiing, refilled by a hot drink |
+| `run` | object | resort | live maxima `{top,bestAir}` for the current run |
+| `runs` | array | resort | one entry per drink taken, with the run it closed |
+| `veil` | 0..1 | resort | screen dip through a door or a skipped ride |
+| `glow` | 0..1 | resort | warm flash on the first sip |
+
+### `state.mode` — the one authority on "is the player skiing?"
+
+Riding the chair, riding the T-bar and sitting in the hut are the same statement,
+and every subsystem has to agree about it in the same frame. `game/resort.js`
+writes `mode`; nothing else may. `main.js` reads it and branches ONCE:
+
+| mode | physics | chaseCam | camera driven by | skier rig | tracks/spray |
+|---|---|---|---|---|---|
+| `ski` | yes | yes | `chaseCam` | visible | yes |
+| `drag` | **no** | yes | `chaseCam` | visible | yes — a T-bar lane really is tracked up |
+| `lift` | **no** | no | `resort.updateCamera()` | hidden | no |
+| `hut` | **no** | no | `resort.updateCamera()` | hidden | no |
+
+Physics is *suspended*, never fought: while a ride runs, `resort` owns `pos`,
+`vel`, `speed`, `heading` and `groundNormal`, and `physics.update()` is not
+called at all (`SkiPhysics.update` also returns early on a non-`ski` mode, as a
+guard against a second caller). Handing control back is a `physics.reset()`,
+which is the same path `harness.setPlayer()` uses.
+
+`tracks` is skipped in `lift`/`hut` because it draws a ribbon between last
+frame's contact point and this one's, and a chair twenty metres up would paint a
+carve trench along the whole piste.
+
+Forcing a mode from the harness (this is how the feature gets screenshot):
+
+```js
+harness.debug.resort.enter('lift', { at: 'mid', progress: 0.35 })
+harness.debug.resort.enter('drag', { progress: 0.45 })
+harness.debug.resort.enter('hut',  { drink: 'beer' })
+harness.debug.resort.enter('ski')
+harness.debug.resort.goto('chair-mid' | 'chair-bottom' | 'tbar' | 'hut')  // park next to it
+harness.debug.resort.info()                                              // ride + placement state
+```
 
 ## Modules
 
@@ -58,6 +102,8 @@ Dispatch on `typeof third === 'number'`.
 
 | `world/snow-material.js` | `createSnowMaterial(opts)` | the snow shader: sparkle, sheen, subsurface, wind ripples |
 | `world/scatter.js` | `createScatter(scene, terrain)` | instanced trees, rocks, lift towers, gates, fences |
+| `world/draglift.js` | `createDragLift(scene, terrain, {towers})` | the T-bar: pylons, rope, circulating bars, stations. Places itself off `scatter.lift.towers[]` so it never re-derives the corridor |
+| `game/resort.js` | `createResort({...})` | the mode machine: boarding zones, the chair and T-bar rides, the hut interior, and every camera that is not `chaseCam` |
 | `player/skier.js` | `createSkier(scene)` | skier mesh/rig + procedural animation from `state` |
 | `player/physics.js` | `class SkiPhysics` | carving dynamics, edges, air, landings |
 | `player/controls.js` | `createControls()` | keyboard/gamepad → `state.input` |
@@ -67,6 +113,22 @@ Dispatch on `typeof third === 'number'`.
 | `fx/postfx.js` | `createPostFX(renderer, scene, camera)` | bloom, DOF, motion blur, grade, grain, vignette |
 | `audio/audio.js` | `createAudio()` | procedural WebAudio: carve, wind, impacts. No audio files |
 | `ui/hud.js` | `createHUD()` | speed, air time, run stats. Diegetic, restrained |
+
+### The placement seam
+
+Anything that has to put the PLAYER where the world already has geometry reads
+the placement from `scatter`, never from a second copy of the maths:
+
+- `scatter.lift.towers[]` — `{x,z,g,h,top,topY,yaw,perpX,perpZ,armL,armR}`
+- `scatter.lift.cables[]` — `{pts,cum,total,dir}`, arc length increasing uphill,
+  `dir:+1` the uphill side. These are the samples the chairs ride.
+- `scatter.buildings[]` — `{x,z,yaw,w,d,h,roofH,deck?,floorY}`, `w`/`d` HALF
+  extents across/along the ridge, `floorY` the deck level.
+
+`resort.js` rides `cables[1]` and builds its interior inside `buildings[0]`;
+`draglift.js` interpolates `towers[]` for its own line. A second copy of
+`corridorX0()` or of the cable catenary is the ambiguous seam that has broken
+every integration in this repo — see CLAUDE.md.
 
 Every module returns an object with `update(dt, state)`. `postfx` also exposes
 `render(dt)` and `setSize(w,h)`; if post-processing is active, `main.js` calls
