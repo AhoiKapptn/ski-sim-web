@@ -122,6 +122,8 @@ export class SkiPhysics {
     this.preload = 0;        // jump pre-load charge 0..1
     this.jumpHeld = false;
     this.reboundCd = 0;
+    this.nPop = 0;         // diagnostics: how often each air source actually fires
+    this.nRebound = 0;
     this.compression = 0;    // suspension compression 0..1 (landings + turn load)
     this.landImpact = 0;
     this.lastAirTime = 0;
@@ -212,7 +214,7 @@ export class SkiPhysics {
     this.phi = 0; this.phiRate = 0; this.grounded = true;
     this.aLat = 0; this.aLatS = 0; this.aLong = 0; this.omega = 0; this.slip = 0; this.slipAngle = 0;
     this.turnRadius = Infinity; this.skidding = false; this.gripPenalty = 0;
-    this.preload = 0; this.jumpHeld = false; this.reboundCd = 0;
+    this.preload = 0; this.jumpHeld = false; this.reboundCd = 0; this.nPop = 0; this.nRebound = 0;
     this.compression = 0; this.landImpact = 0; this.lastAirTime = 0; this.gSpike = 0;
     this.roughness = 0; this.incline = 0; this.airT = 0; this.jumpBuf = 0; this.pending = 0;
     this.vSurf = state.vel.y; this.gap = 0; this.squash = 0;
@@ -349,6 +351,7 @@ export class SkiPhysics {
         const rampNow = clamp(this.vSurf / 2.5, 0, 1);
         const lip = this.grounded ? clamp(Math.max(lipNow, 0.7 * rampNow), 0, 1) : 1;
         popImpulse = this.pending * (POP_FLAT + POP_LIP * lip);
+        this.nPop++;
         this.pending = 0; this.jumpBuf = 0;
       } else if (this.jumpBuf === 0) {
         this.pending = 0;                                   // buffer expired
@@ -368,6 +371,7 @@ export class SkiPhysics {
         dPhi < -3.0 && loadPrev > 2.05 && brake < 0.5) {
       popImpulse += Math.min(0.85, (loadPrev - 1.95) * 1.1);
       this.reboundCd = 0.70;
+      this.nRebound++;
     }
 
     // --- ground sample --------------------------------------------------------
@@ -682,6 +686,8 @@ export class SkiPhysics {
 
     m.aLong = this.aLong;
     m.grip = this.gripPenalty;
+    m.nPop = this.nPop;
+    m.nRebound = this.nRebound;
   }
 
   /** Never let a NaN escape into the rest of the engine. */
