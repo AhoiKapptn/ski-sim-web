@@ -494,11 +494,12 @@ function drawAkFallback(g, x, y, w, h, ink) {
  * documented 73.1/12.6 reproduced. Numerators are crops verified to contain only
  * board (CLAUDE.md trap 4):
  *
- *   board z 664, 27.7 m   24x8 at (853,474)   L* 42.6   Y 0.130   ratio 0.271
- *   board z 664 in hero   24x8 at (736,494)   L* 41.8   Y 0.127   ratio 0.265
- *   board z 128, 28.2 m   28x8 at (600,479)   L* 49.6   Y 0.183   ratio 0.381
+ *   board z 664, 27.7 m   24x8 at (853,474)   L* 42.6-43.1   ratio 0.271-0.278
+ *   board z 664 in hero   24x8 at (736,493)   L* 41.8-42.6   ratio 0.265-0.283
+ *   board z 128, 28.2 m   28x8 at (600,479)   L* 49.6-50.0   ratio 0.381-0.386
  *
- * 0.27-0.38, inside the 0.25-0.45 band, against 0.027 before — 10x. For scale,
+ * (two runs each; the spread is the settle and the TAA history, not the build.)
+ * 0.27-0.39, inside the 0.25-0.45 band, against 0.027 before — 10x. For scale,
  * the scene's own shaded anchors are the hut wall at L* 31 and the near conifers
  * at L* 25, so the board is now a light object in shade and no longer darker
  * than the darkest thing on the hillside.
