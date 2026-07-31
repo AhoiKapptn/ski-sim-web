@@ -102,8 +102,10 @@
  *  * A capture must never quietly contain the fallback letterforms. The mesh is
  *    therefore HIDDEN until `ready` resolves; see the note at `scene.add`.
  *
- * Everything is merged into one geometry with one material: 1 draw call, ~230
- * triangles, no per-frame work beyond copying three uniforms.
+ * Everything is merged into one geometry with one material: 188 triangles, and
+ * MEASURED against a --nobrand run of the same framing, +3 draw calls and +1000
+ * triangles per frame — the multiple is the shadow cascades, which the colour
+ * pass alone does not show. No per-frame work beyond copying three uniforms.
  */
 import * as THREE from 'three';
 
@@ -632,7 +634,11 @@ function panel(gb, o, u, v, w, h, reg, regBack, col, sag, nu = 4) {
   return N;
 }
 
-/** A 3 cm lip of settled snow along a panel's top edge. */
+/**
+ * A lip of settled snow along a panel's top edge: 3 cm on the banner's top hem,
+ * and on the board it caps the ridge, where `depth` has to stay inside the A's
+ * own base half-spread or the cap overhangs the print.
+ */
 function snowLip(gb, o, u, v, w, h, depth, col) {
   const y = o.y + v.y * h, ox = o.x + v.x * h, oz = o.z + v.z * h;
   const nx = u.y * v.z - u.z * v.y, nz = u.x * v.y - u.y * v.x;
