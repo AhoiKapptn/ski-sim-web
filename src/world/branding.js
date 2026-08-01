@@ -83,6 +83,12 @@
  *    with an empty lower hemisphere) and still runs off scatter's OWN uniform
  *    objects when they are exposed, so a board is lit by the identical radiance
  *    as the hut behind it.
+ *      THE ONE DELIBERATE EXCEPTION is the BTM ink, and only the ink: the owner
+ *    traded realism for brand accuracy there, knowingly, and BTM_INK_LIFT is the
+ *    whole of that trade. It gives the yellow a second helping of the same
+ *    ambient so it reads as #F0EC00 instead of olive. Nothing else in the module
+ *    is lit above physics, and 0 puts the ink back exactly. Read that constant
+ *    before assuming any panel here is honestly lit.
  *  * Thin geometry below one pixel of width shimmers. The banner posts carry
  *    `aRad` and the same screen-space width floor as scatter's props.
  *  * Fine high-contrast print at a few px/period beats against the pixel grid
@@ -515,34 +521,122 @@ const AK_INK = '#1c1f24';    // fallback letterforms only; the PNG carries its o
 // ------------------------------------------------------------------ BTM ink --
 /**
  * THE ONE PLACE the BTM ink is treated. Every decision about how that yellow
- * lands on the panel is in this function and nowhere else, deliberately.
+ * lands on the panel is in this function and the one shader term it owns, and
+ * nowhere else, deliberately.
  *
- * PENDING DECISION, do not pre-empt it: the artwork's #F0EC00 arrives on screen
- * at about L* 61, rgb(145,151,70) — olive-grey, not yellow. That is physically
- * correct for a shaded panel under a blue sky fill and it is being put to the
- * owner as a question, because "the brand yellow does not read as yellow" may
- * matter more than the realism does. If the answer comes back yes, this is the
- * lever: raise BTM_INK_LIFT. It overprints the ink with itself in 'lighter', so
- * only pixels the artwork actually covers move and the white PVC field is
- * untouched — no mask to maintain, no second region.
+ * DECIDED, by the owner, knowingly: the brand yellow has to READ as yellow.
+ * Shipped, #F0EC00 arrived on screen as olive — see the numbers below. That was
+ * physically correct (no printed face in this module ever sees the sun, so the
+ * ink is lit by snowfield bounce and a blue sky fill and nothing else) and it was
+ * still the wrong object on screen. BTM_INK_LIFT is the whole of the trade: it
+ * buys brand accuracy with realism, it is the only knob, and 0 restores the
+ * physical answer exactly.
  *
- * Its ceiling is the 8-bit map: #F0EC00 is already at 240/236 in R/G, so a lift
- * much past ~0.06 only saturates and starts eating the ink's shape. If the
- * decision needs more than that, the real instrument is an emissiveMap keyed off
- * this image's alpha — and this is still the function to build it in, because it
- * is the only code in the module that knows where the ink is.
+ * WHY IT IS NOT THE OVERPRINT THE PREVIOUS BUILD LEFT HERE. That version drew
+ * the ink over itself in 'lighter', which raises ALBEDO and is therefore capped
+ * by the 8-bit map. Measured on the shipped atlas, not reasoned about: the ink
+ * lands at rgb(238,238,16), i.e. 93% of full scale already, so the entire
+ * remaining headroom is +7% linear — about +2 L* — and it is spent before the
+ * ink has moved a quarter of the way. The route was measured to its ceiling and
+ * removed rather than left as a second, useless knob. Albedo cannot make a
+ * surface brighter than the light falling on it, and that is the actual problem:
+ * the panel is in shade, and a dark yellow is what "olive" means.
+ *
+ * SO THE LIFT IS LIGHT, NOT PAINT. The shader adds a second helping of the same
+ * bounce+sky ambient, times the ink's own albedo, times BTM_INK_LIFT — as if the
+ * print were far more reflective than any real ink. Two consequences worth
+ * knowing:
+ *   * it is PROPORTIONAL TO THE SCENE LIGHT, unlike an emissiveMap. An emissive
+ *     term is a constant that would still be glowing if the time of day ever
+ *     moved off sky.js' pinned tod = 0.302. This one goes out with the light.
+ *   * it is tinted by the ink's own diffuse colour, so it can only make the ink
+ *     more of what it already is. It cannot invent a hue and it cannot touch the
+ *     white PVC field, which is the constraint that mattered most: a glowing
+ *     white banner would be a worse failure than an olive logo.
+ *
+ * WHERE THE MASK COMES FROM — and this is the part to check before adding any
+ * new artwork. There is no second texture, no second draw call and no alpha
+ * channel, because the module's one-atlas promise in the header is worth more
+ * than the convenience: the ink mask is the sampled texel's OWN CHROMA,
+ * `min(r,g) - b` in linear, which works because the BTM yellow is the only
+ * chromatic thing in the entire atlas. That expression is exactly LINEAR in ink
+ * coverage over the banner (0.030 + 0.820c), so the mask IS the artwork's
+ * antialiased, mip-filtered coverage, for free — nothing to keep in register, no
+ * cut-out fringe, and a banner at 200 m whose print has mipped to pale off-white
+ * gets a proportionally small lift instead of a hard-edged one. (With the
+ * threshold below it is coverage with a small toe: 1.148c - 0.098, so the
+ * faintest tenth of coverage gets nothing. That is the right way for the error to
+ * fall — it under-lifts edges and far mips, never over-lifts them.)
+ *
+ * The threshold is 0.10 and the margins under it are MEASURED over every pixel of
+ * the shipped atlas, not reasoned about, because reasoning about them got the
+ * worst case wrong by 4x on the first pass:
+ *
+ *   ink core                 0.600 .. 0.915     <- what has to be caught
+ *   R_AK   (the light board) worst  0.0019      55x margin
+ *   R_BACK (banner reverse)  worst  0.0431      2.3x  <- the binding one
+ *   R_BOARDB / R_SNOW / R_PAINT     negative
+ *
+ * R_BACK is the constraint and it is not obvious: its base #dfe1de is already
+ * faintly warm, and weather()'s bottom wash (rgba(96,88,74,0.16)) plus the grit
+ * spatter push its darkest row to 0.043. The first threshold tried was 0.05,
+ * which cleared it by 16% — close enough that a slightly dirtier banner reverse
+ * would have started glowing on its BACK face, where no one would look for it.
+ *   -> Any new artwork or weathering that puts warm colour in this atlas must be
+ *      re-run against this. Nothing today gets near. Check it, do not assume it.
+ *
+ * WHAT IT MEASURES. 1600x900 DPR 1, crop (652,404) 284x100 on
+ * `banner-z-104-face` — 4.7 m head-on, and the crop was cut back from the tool's
+ * own projected rect until it contained panel and nothing else, because that rect
+ * includes the posts and clips the orange B-net behind them (CLAUDE.md trap 4).
+ * "Ink" is the chroma mask ERODED 1 px, so no measured pixel is an antialiased
+ * blend with the field; "field" is the neutral high-luma pixels in the same crop.
+ * Every row below is one arm of ONE `--inklift` sweep — one page, one camera, one
+ * settle, only the uniform moving:
+ *
+ *   LIFT   ink rgb              L*     white PVC field       ink/field Y
+ *   0.00   (138.4,145.5,29.1)   58.0   (146.2,151.8,154.9)   0.82   olive; ink DARKER than its own panel
+ *   0.60   (171.5,178.5,36.2)   70.1   (146.3,151.8,155.0)
+ *   1.00   (188.8,195.5,40.5)   76.2   (146.3,151.8,155.0)
+ *   1.40   (202.3,208.1,43.3)   80.7   (146.2,151.8,155.0)   1.87   SHIPPED
+ *   1.80   (213.1,218.5,45.1)   84.4   (146.2,151.8,155.0)
+ *   2.20   (221.6,226.2,46.8)   87.1   (146.2,151.7,155.0)          starts to read as emitting
+ *   3.00   (234.8,237.6,49.3)   91.1   (146.3,151.8,155.0)          #F0EC00's own L*: it glows
+ *
+ * The field moves by 0.2 of a code over a 33 L* swing in the ink, which is the
+ * constraint holding and is the single most important line in this table.
+ *
+ * WHY 1.40. Hue is on-brand well before brightness is: at 1.40 the ink sits at
+ * HSV hue 62 deg against #F0EC00's 59 deg, and saturation is pinned at 0.79 by
+ * the weathering wash and the sky fill no matter how far the lift goes. So the
+ * lever is only VALUE, and value is what separates "olive" from "yellow": 0.60
+ * reads as old gold, 1.00 as a slightly dark yellow, 1.40 as the brand yellow,
+ * and past ~2.2 the panel reads as backlit. 1.40 was also the point at which the
+ * mark became legible at the 31 m pass-by framing rather than only at 4.7 m —
+ * that was not the goal, but it is the strongest argument for this value.
+ *
+ * WHAT IT COSTS, stated plainly because it is a real lie and not a small one: at
+ * 1.40 the ink returns 1.87x the luminance of the white PVC it is printed on,
+ * where physics says 0.82x. There is no ink on any banner anywhere that does
+ * that. It is invisible as a lie because the eye has no reference for how bright
+ * a shaded panel should be, and it is confined to the ~5000 px of one logo.
+ *
+ * VERIFIED after the change, because a brighter card on a flat quad is exactly
+ * the shape of the "white ice shards" bug (CLAUDE.md's wrong-diagnosis table):
+ * the camera was orbited to 0/20/40/60/70/77 deg off the panel normal at five
+ * sun elevations (tod 0.22/0.302/0.40/0.50/0.62), against a lift-0 control in the
+ * same sweep. The white field matched the control to 0.3 L* at all 30 pairs, and
+ * the ink is flat with angle (81.0/80.9/80.6/81.0/81.6/81.0 L* at tod 0.302).
+ * No grazing term appeared; the specular kill below is untouched and still does
+ * the work.
  */
-const BTM_INK_LIFT = 0.0;
+const BTM_INK_LIFT = 1.40;
 function paintBtmInk(g, img, bb, dx, dy, dw, dh) {
   if (!img) { drawBtmFallback(g, dx, dy, dw, dh); return; }
+  // Straight source-over. The ink is painted at its true #F0EC00 and the bias
+  // lives entirely in the light, above — nothing here is doctored, so the atlas
+  // dump is still the artwork.
   g.drawImage(img, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
-  if (BTM_INK_LIFT > 0) {
-    g.save();
-    g.globalCompositeOperation = 'lighter';
-    g.globalAlpha = BTM_INK_LIFT;
-    g.drawImage(img, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
-    g.restore();
-  }
 }
 
 // ===========================================================================
@@ -780,6 +874,10 @@ export function createBranding(scene, terrain, scatter) {
     uSkyFill: scatter.uniforms.uSkyFill,
     uMinR: { value: 6.0e-4 },
   };
+  // The brand-yellow bias, live so it can be swept in one session rather than
+  // across rebuilds (CLAUDE.md trap 1's lesson, applied to a colour A/B: compare
+  // arms inside one page or the settle and the TAA history move under you).
+  uniforms.uInkLift = { value: BTM_INK_LIFT };
 
   const mat = new THREE.MeshStandardMaterial({
     map: tex, vertexColors: true, roughness: 0.86, metalness: 0.0,
@@ -789,6 +887,7 @@ export function createBranding(scene, terrain, scatter) {
     shader.uniforms.uBounce = uniforms.uBounce;
     shader.uniforms.uSkyFill = uniforms.uSkyFill;
     shader.uniforms.uMinR = uniforms.uMinR;
+    shader.uniforms.uInkLift = uniforms.uInkLift;
     // screen-space width floor for the posts and the flag pole; aRad is 0 on
     // every panel vertex, and it MULTIPLIES the expansion, so panels are untouched
     shader.vertexShader = shader.vertexShader
@@ -809,6 +908,7 @@ export function createBranding(scene, terrain, scatter) {
         #include <common>
         uniform vec3 uBounce;
         uniform vec3 uSkyFill;
+        uniform float uInkLift;
       `)
       // Snowfield bounce + dome fill. Without it the shaded face of a dark
       // board integrates to nothing and reads as a hole cut in the snow.
@@ -819,7 +919,16 @@ export function createBranding(scene, terrain, scatter) {
           float dwn = clamp( 0.5 - 0.5 * wUp, 0.0, 1.0 );
           vec3 amb = uBounce * ( 0.78 * ( 0.30 + 0.70 * dwn ) )
                    + uSkyFill * ( 0.24 * ( 0.28 + 0.72 * ( 1.0 - dwn ) ) );
-          reflectedLight.indirectDiffuse += amb * material.diffuseColor;
+          // The BTM brand-yellow bias. See BTM_INK_LIFT: the mask is the texel's
+          // own chroma, which is the ink's antialiased coverage because the BTM
+          // yellow is the only chromatic thing in the atlas (ink 0.82 linear,
+          // every other region <= 0.03 or negative). White field -> 0, so the
+          // PVC cannot move; the term is extra AMBIENT, not emission, so it dies
+          // with the light instead of glowing in the dark.
+          float ink = clamp( ( min( material.diffuseColor.r, material.diffuseColor.g )
+                             - material.diffuseColor.b - 0.10 ) * 1.40, 0.0, 1.0 );
+          reflectedLight.indirectDiffuse += amb * material.diffuseColor
+                                          * ( 1.0 + uInkLift * ink );
         }
       `)
       // F0 = 0.04 on a flat card reflecting the sky dome is the "white ice

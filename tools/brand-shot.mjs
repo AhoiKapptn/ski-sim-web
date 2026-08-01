@@ -2,6 +2,7 @@
  * Capture harness for src/world/branding.js.
  *
  *   node tools/brand-shot.mjs --out shots/brand [--dpr 2] [--only hero,b0,b1]
+ *                                              [--inklift 0,1.4,2.2]
  *
  * branding.js is not wired into main.js (the branding agent does not own that
  * file), so this tool installs it the same way main.js will: it dynamically
@@ -50,6 +51,14 @@ const FALLBACK = flag('fallback');
 // radiance estimate. Both are otherwise dead code, and dead code that has never
 // run is not a fallback.
 const NOSEAM = flag('noseam');
+// --inklift 0,0.8,1.4  sweeps branding.js' BTM_INK_LIFT across the `-face`
+// framings and writes one PNG per value as `<shot>@lift<v>.png`. It exists
+// because that constant is a COLOUR judgement, and a colour judgement compared
+// across separate runs is comparing settle states and TAA histories as much as
+// builds — the same reason CLAUDE.md trap 1 insists a perf A/B is interleaved
+// inside one session. Here every arm is one page, one camera, one settle, with
+// only the uniform moving. Each arm re-settles the history before its shutter.
+const INKLIFT = (arg('inklift', '') || '').split(',').filter((s) => s !== '').map(Number);
 
 // Canonical framings, byte-identical to shoot.mjs, plus one per placed object
 // (added at runtime from the module's own item list).
@@ -111,6 +120,8 @@ try {
       const b = m.createBranding(h.debug.scene, h.debug.terrain, noseam ? null : h.debug.scatter);
       h.debug.branding = b;              // as main.js will expose it
       window.__brand = b;
+      // the module's own shipped BTM_INK_LIFT, so --inklift can put it back
+      window.__brandInkLift0 = b.debug.uniforms.uInkLift.value;
       // The module must NOT be renderable before its artwork is composited, or a
       // capture can silently contain the fallback letterforms. Asserted here so
       // the guarantee is enforced by the tool and not just by the comment.
@@ -219,11 +230,26 @@ try {
     });
 
     let stats;
-    if (s.free) {
-      // park the camera 4.5 m off the printed face and present, repeatedly, so
-      // the TAA history is built at THIS camera and not at the chase cam's
+    // park the camera 4.5 m off the printed face and present, repeatedly, so
+    // the TAA history is built at THIS camera and not at the chase cam's. A
+    // chase-cam framing has nothing to re-park, so it just re-presents — but it
+    // must still re-present, because the TAA history holds the PREVIOUS arm of
+    // an --inklift sweep for several frames.
+    const settleAndPresent = async () => {
+      if (!s.free) {
+        // stats() and NOT step(): step() skis, and 8 frames a sweep arm walked
+        // the camera 12 m down the hill and took the subject off screen — the
+        // same trap the framing comment above records, met a second time.
+        let st;
+        for (let i = 0; i < 8; i++) {
+          st = await page.evaluate(() => window.__harness.stats());
+          await new Promise((r) => setTimeout(r, 24));
+        }
+        return st;
+      }
+      let st;
       for (let i = 0; i < 16; i++) {
-        stats = await page.evaluate((it) => {
+        st = await page.evaluate((it) => {
           const cam = window.__harness.debug.camera;
           const cy = it.y - it.h * 0.45;
           const camX = it.x + it.nx * 4.5, camZ = it.z + it.nz * 4.5;
@@ -244,8 +270,23 @@ try {
         }, s.free);
         await new Promise((r) => setTimeout(r, 24));
       }
-    } else {
-      stats = await page.evaluate(() => window.__harness.stats());
+      return st;
+    };
+    stats = s.free ? await settleAndPresent() : await page.evaluate(() => window.__harness.stats());
+    // one PNG per BTM_INK_LIFT value, all from this one camera and this one
+    // page — see --inklift at the top for why the sweep is not N runs
+    if (INKLIFT.length && !NOBRAND) {
+      for (const v of INKLIFT) {
+        await page.evaluate((val) => {
+          window.__brand.debug.uniforms.uInkLift.value = val;
+        }, v);
+        await settleAndPresent();
+        await page.screenshot({ path: path.join(OUT, `${name}@lift${v}.png`) });
+      }
+      await page.evaluate(() => {
+        window.__brand.debug.uniforms.uInkLift.value = window.__brandInkLift0;
+      });
+      stats = await settleAndPresent();
     }
     // projected screen rect of every placed object, in CSS pixels
     const rects = NOBRAND ? [] : await page.evaluate(() => {
