@@ -11,7 +11,13 @@ Third-person ski simulator in Three.js. Target: AAA-grade visuals at 60 fps, 160
    `node tools/shoot.mjs --out shots/<yourname>` must exit 0.
 3. **No new runtime dependencies** without asking. `three` only. Everything —
    textures, normal maps, meshes, audio — is generated procedurally in code.
-   There are no binary art assets in this project and none may be downloaded.
+   The rule still stands and nothing may be downloaded to solve a problem. The
+   **one** exception, granted explicitly by the owner for these files alone, is
+   `public/brand/*.png`: two real sponsor logos that `world/branding.js` loads.
+   A brand mark is the one thing in this project that cannot be reproduced
+   procedurally without being wrong, which is why it is the only exception —
+   it is not a precedent for anything else, and any second request goes back
+   to the owner.
 4. **60 fps budget at 1600×900** on Apple M5 Pro. Check with `--perf`.
 5. Prefer `three/addons/...` (ships with the `three` package) over hand-rolling
    post-processing passes, noise, or loaders.

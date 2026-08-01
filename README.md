@@ -1,8 +1,9 @@
 # Alpine — a third-person ski simulator in Three.js
 
-Everything you see is generated in code. There are no binary art assets in this
-repository: no models, no textures, no audio files. `three` is the only runtime
-dependency. It runs in a browser at 1600×900.
+Everything you see is generated in code — no models, no textures, no audio
+files — with exactly one exception: the two sponsor logos under `public/brand/`,
+which are real brand marks and are the only binary assets in the repository.
+`three` is the only runtime dependency. It runs in a browser at 1600×900.
 
 ```bash
 pnpm install
@@ -63,6 +64,7 @@ To drop straight into any of it, `pnpm dev` and add a query:
 | FX | GPU spray with soft-particle depth fade, persistent carve trenches driven by normals/AO rather than dark decals |
 | World | Instanced conifer forests with treeline gradient, chairlift, other skiers, lodges, snow guns, piste furniture |
 | Resort loop | Rideable chairlift and T-bar, an enterable mid-mountain restaurant with a coffee and a beer, one mode machine driving physics, camera, HUD and audio |
+| Branding | Four sponsor elements at the piste edge — two banners on the B-net, two A-frame boards — as one merged geometry on one atlas, so the whole set is a single draw call and 0.058% of the frame |
 | Audio | Fully procedural WebAudio — carve, wind, impacts, convolution reverb from a generated impulse response |
 
 ## Tools
