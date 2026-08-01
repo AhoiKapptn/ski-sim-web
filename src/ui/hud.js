@@ -6,7 +6,20 @@
  * frame is always clear for the capture harness.
  *
  *   bottom-left   speed (hero) + speed ladder + edge/carve needle + air badge
- *   bottom-right  run timer, distance, top speed
+ *   bottom-right  run timer, distance, top speed, warmth
+ *
+ * ### The resort layer
+ *
+ * `state.mode` (see game/resort.js) decides which instruments exist. Riding a
+ * lift or sitting in the hut, the speedometer is meaningless and the run timer
+ * is not the subject, so both fade down and their place is taken by the thing
+ * that IS the subject: a contact prompt, a ride progress line, or the bar card.
+ * Nothing is created or destroyed per frame — every element is built once and
+ * driven by CSS custom properties, exactly like the speed block.
+ *
+ *   `--ui`     1 while skiing, 0 while riding or indoors (fades the instruments)
+ *   `--veil`   the dip through a doorway or a skipped ride
+ *   `--glow`   the warm flash off the first sip
  *
  * Scaling is tuned against the measured envelope of the current physics
  * (tools/ux-trace.mjs): rest 0, cruise ~30, carving 45-65, straight schuss
@@ -43,6 +56,7 @@ const CSS = `
   font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1,"ss01" 1;
   --ink:255,255,255;--accent:168,222,255;--hot:255,201,132;
   --live:0;--heat:0;--edge:0;--carve:0;--land:0;
+  --ui:1;--veil:0;--glow:0;--prompt:0;--ride:0;--card:0;--warm:1;--warmvis:0;
   --halo:0 1px 0 rgba(2,9,20,.62),0 -1px 0 rgba(2,9,20,.42),
          1px 0 0 rgba(2,9,20,.5),-1px 0 0 rgba(2,9,20,.5);
   transition:none}
@@ -68,7 +82,8 @@ const CSS = `
 
 /* ---------------------------------------------------------------- speed --- */
 #alp-hud .speed{position:absolute;left:clamp(32px,4vw,84px);bottom:clamp(40px,7.6vh,88px);
-  opacity:calc(.74 + .26*var(--live));transform:translateY(calc(6px - 6px*var(--live)))}
+  opacity:calc((.74 + .26*var(--live)) * var(--ui));
+  transform:translateY(calc(6px - 6px*var(--live) + 14px*(1 - var(--ui))))}
 #alp-hud .glow{position:absolute;left:-20%;bottom:-40%;width:170%;height:210%;
   background:radial-gradient(50% 50% at 28% 58%,
     rgba(var(--accent),calc(.20*var(--heat) + .30*var(--land))) 0%, rgba(var(--accent),0) 68%);
@@ -199,7 +214,8 @@ const CSS = `
 #alp-hud .stats{position:absolute;right:clamp(32px,4vw,84px);bottom:clamp(42px,7.8vh,90px);
   display:grid;grid-template-columns:auto auto;align-items:baseline;justify-items:end;
   column-gap:clamp(11px,.95vw,19px);row-gap:clamp(10px,1.5vh,18px);
-  opacity:calc(.78 + .22*var(--live));transform:translateY(calc(5px - 5px*var(--live)))}
+  opacity:calc((.78 + .22*var(--live)) * var(--ui));
+  transform:translateY(calc(5px - 5px*var(--live) + 12px*(1 - var(--ui))))}
 #alp-hud .stats .k{font-size:clamp(9px,1.1vh,12px);font-weight:700;letter-spacing:.24em;
   text-transform:uppercase;color:rgba(var(--ink),.84);
   text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.55)}
@@ -210,6 +226,110 @@ const CSS = `
   letter-spacing:.09em;font-weight:600}
 #alp-hud .stats .hr{grid-column:1/-1;width:clamp(62px,6.4vw,110px);height:1px;
   background:rgba(var(--ink),.24);filter:drop-shadow(0 1px 2px rgba(0,8,20,.5))}
+
+/* --------------------------------------------------------------- warmth --- */
+/* A subordinate pip under the run stats, and deliberately almost always
+   invisible: it fades in as the tank empties, which is the only moment it is
+   information rather than clutter. */
+#alp-hud .warmth{position:absolute;right:clamp(32px,4vw,84px);bottom:clamp(20px,3.4vh,42px);
+  display:flex;align-items:center;gap:.7em;opacity:calc(var(--warmvis) * var(--ui))}
+#alp-hud .warmth .k{font-size:clamp(8px,1.0vh,11px);font-weight:700;letter-spacing:.24em;
+  text-transform:uppercase;color:rgba(var(--ink),.72);text-shadow:var(--halo)}
+#alp-hud .warmth .b{position:relative;width:clamp(46px,4.6vw,78px);height:2px;
+  background:rgba(var(--ink),.2);filter:drop-shadow(0 1px 2px rgba(0,8,20,.5))}
+#alp-hud .warmth .b i{position:absolute;inset:0;transform-origin:0 50%;
+  transform:scaleX(var(--warm));
+  background:linear-gradient(90deg,rgba(255,150,90,.9),rgba(var(--hot),.95))}
+
+/* --------------------------------------------------------------- prompt --- */
+/* The contact prompt. Centre-bottom, above the scrim: this is the one moment
+   the middle of the frame is allowed to carry type, because it is the frame's
+   subject — you are standing at a lift station waiting to be told what to do. */
+#alp-hud .prompt{position:absolute;left:50%;bottom:clamp(96px,15.5vh,190px);
+  transform:translate(-50%,calc(8px - 8px*var(--prompt)));
+  display:flex;align-items:center;gap:.85em;white-space:nowrap;opacity:var(--prompt)}
+#alp-hud .prompt .kb{display:inline-flex;align-items:center;justify-content:center;
+  min-width:1.9em;height:1.9em;padding:0 .45em;border:1px solid rgba(var(--ink),.62);
+  border-radius:5px;background:rgba(4,10,20,.34);
+  font-size:clamp(11px,1.5vh,16px);font-weight:700;letter-spacing:.06em;
+  color:rgba(var(--ink),.97);text-shadow:var(--halo);
+  box-shadow:0 1px 3px rgba(0,8,20,.5),inset 0 1px 0 rgba(255,255,255,.14)}
+#alp-hud .prompt .tx{font-size:clamp(14px,1.95vh,21px);font-weight:400;letter-spacing:.01em;
+  color:rgba(var(--ink),.97);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.55)}
+#alp-hud .prompt .sb{font-size:clamp(9px,1.15vh,12px);font-weight:700;letter-spacing:.22em;
+  text-transform:uppercase;color:rgba(var(--accent),.86);text-shadow:var(--halo)}
+#alp-hud .prompt.cold .sb{color:rgba(var(--hot),.94)}
+
+/* ----------------------------------------------------------------- ride --- */
+/* Top-centre, tiny: on a lift the picture is the point, so this is a caption
+   and a progress keel, nothing more. */
+#alp-hud .ride{position:absolute;left:50%;top:clamp(26px,4.4vh,54px);
+  transform:translate(-50%,calc(-6px + 6px*var(--ride)));
+  display:flex;flex-direction:column;align-items:center;gap:.55em;opacity:var(--ride)}
+#alp-hud .ride .n{font-size:clamp(9px,1.2vh,13px);font-weight:700;letter-spacing:.34em;
+  text-transform:uppercase;color:rgba(var(--ink),.9);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.5)}
+#alp-hud .ride .rail2{position:relative;width:clamp(160px,20vw,300px);height:3px}
+#alp-hud .ride .rail2 b{position:absolute;left:0;right:0;top:1px;height:1px;
+  background:rgba(var(--ink),.26)}
+#alp-hud .ride .rail2 i{position:absolute;left:0;top:0;height:3px;right:0;
+  clip-path:inset(0 calc(100% - 100%*var(--rp,0)) 0 0);
+  background:linear-gradient(90deg,rgba(var(--ink),.5),rgba(var(--accent),.95))}
+#alp-hud .ride .rail2 u{position:absolute;top:-2px;width:1.4px;height:7px;
+  transform:translateX(calc(var(--rp,0) * clamp(160px,20vw,300px)));
+  background:rgba(var(--ink),.95);box-shadow:0 0 6px rgba(var(--accent),.6)}
+
+/* The ride's controls line lives at the BOTTOM, with the contact prompts.
+   It shipped at the top of the frame at 0.62 opacity and clamp(8px,1.05vh,11px),
+   i.e. the escape hatch from a long ride was the least legible thing on screen,
+   in the one place this game never trains you to look. Everything that tells the
+   player what a key does is now in the same band. */
+#alp-hud .ridehint{position:absolute;left:50%;bottom:clamp(56px,8.8vh,108px);
+  transform:translate(-50%,calc(6px - 6px*var(--ride)));
+  font-size:clamp(10px,1.3vh,14px);font-weight:600;letter-spacing:.18em;
+  text-transform:uppercase;white-space:nowrap;opacity:calc(var(--ride) * .92);
+  color:rgba(var(--ink),.86);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.55)}
+
+/* ----------------------------------------------------------------- card --- */
+/* The bar card. Anchored bottom-left over the empty part of the interior shot
+   rather than centred, so the window and the mug stay the picture. */
+#alp-hud .card{position:absolute;left:clamp(32px,4vw,84px);bottom:clamp(40px,7.6vh,92px);
+  min-width:clamp(230px,22vw,330px);opacity:var(--card);
+  transform:translateY(calc(10px - 10px*var(--card)))}
+#alp-hud .card .hd{font-size:clamp(10px,1.3vh,14px);font-weight:700;letter-spacing:.3em;
+  text-transform:uppercase;color:rgba(var(--hot),.95);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.6)}
+#alp-hud .card .rule{margin:.7em 0 .8em;width:100%;height:1px;background:rgba(var(--ink),.22)}
+#alp-hud .card .row{display:flex;justify-content:space-between;align-items:baseline;
+  gap:1.4em;margin:.28em 0}
+#alp-hud .card .row .k{font-size:clamp(8px,1.05vh,11px);font-weight:700;letter-spacing:.22em;
+  text-transform:uppercase;color:rgba(var(--ink),.66);text-shadow:var(--halo)}
+#alp-hud .card .row .v{font-size:clamp(13px,1.7vh,19px);font-weight:400;
+  color:rgba(var(--ink),.96);text-shadow:var(--halo),0 2px 8px rgba(0,8,20,.5)}
+#alp-hud .card .row .v s{text-decoration:none;font-size:.5em;opacity:.6;margin-left:.3em;
+  letter-spacing:.09em;font-weight:600}
+#alp-hud .card .opts{margin-top:.95em;display:flex;flex-direction:column;gap:.5em}
+#alp-hud .card .opt{display:flex;align-items:center;gap:.7em}
+#alp-hud .card .opt .kb{display:inline-flex;align-items:center;justify-content:center;
+  width:1.6em;height:1.6em;border:1px solid rgba(var(--ink),.5);border-radius:4px;
+  background:rgba(4,10,20,.3);font-size:clamp(9px,1.2vh,12px);font-weight:700;
+  color:rgba(var(--ink),.95);text-shadow:var(--halo)}
+#alp-hud .card .opt .l{font-size:clamp(12px,1.55vh,17px);color:rgba(var(--ink),.95);
+  text-shadow:var(--halo),0 2px 8px rgba(0,8,20,.5)}
+#alp-hud .card .opt .n{font-size:clamp(8px,1.0vh,11px);letter-spacing:.14em;
+  text-transform:uppercase;color:rgba(var(--ink),.55);text-shadow:var(--halo)}
+#alp-hud .card .opt.on .l{color:rgba(var(--hot),.98)}
+#alp-hud .card .note{margin-top:.85em;font-size:clamp(10px,1.3vh,14px);font-style:italic;
+  color:rgba(var(--hot),.92);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.5);
+  min-height:1.3em}
+
+/* ------------------------------------------------------- veil and flash --- */
+/* A door is a cut, and a cut with nothing over it reads as a bug. Pale rather
+   than black: this is a snow game in full sun and a black dip looks like a
+   crash. */
+#alp-hud .veil{position:absolute;inset:0;background:rgb(238,244,252);
+  opacity:calc(var(--veil) * .92)}
+#alp-hud .flash{position:absolute;inset:0;opacity:var(--glow);
+  background:radial-gradient(120% 90% at 50% 100%,
+    rgba(255,176,96,.30) 0%,rgba(255,168,88,.12) 45%,rgba(255,160,80,0) 78%)}
 `;
 
 export function createHUD(opts = {}) {
@@ -243,7 +363,30 @@ export function createHUD(opts = {}) {
       <span class="hr"></span>
       <span class="k">Dist</span><span class="v" id="alp-d">0<s>m</s></span>
       <span class="k">Top</span><span class="v" id="alp-x">0<s>km/h</s></span>
-    </div>`;
+    </div>
+    <div class="warmth"><span class="k">Warmth</span><span class="b"><i></i></span></div>
+    <div class="ride">
+      <span class="n" id="alp-rn">Chairlift</span>
+      <span class="rail2"><b></b><i></i><u></u></span>
+    </div>
+    <div class="ridehint" id="alp-rh"></div>
+    <div class="prompt">
+      <span class="kb" id="alp-pk">E</span>
+      <span class="tx" id="alp-pt">Ride the chairlift</span>
+      <span class="sb" id="alp-ps"></span>
+    </div>
+    <div class="card">
+      <div class="hd" id="alp-cn">Bergrestaurant</div>
+      <div class="rule"></div>
+      <div class="row"><span class="k">Run</span><span class="v" id="alp-cr">0:00.0</span></div>
+      <div class="row"><span class="k">Dist</span><span class="v" id="alp-cd">0<s>m</s></span></div>
+      <div class="row"><span class="k">Top</span><span class="v" id="alp-cx">0<s>km/h</s></span></div>
+      <div class="row"><span class="k">Best air</span><span class="v" id="alp-ca">0.00<s>s</s></span></div>
+      <div class="opts" id="alp-co"></div>
+      <div class="note" id="alp-cm"></div>
+    </div>
+    <div class="flash"></div>
+    <div class="veil"></div>`;
   (opts.parent ?? doc.body).appendChild(root);
 
   const $ = (sel) => root.querySelector(sel);
@@ -254,12 +397,26 @@ export function createHUD(opts = {}) {
   const elD = $('#alp-d');
   const elX = $('#alp-x');
   const elBest = $('.rail u');
+  // resort layer
+  const elPrompt = $('.prompt');
+  const elPK = $('#alp-pk'), elPT = $('#alp-pt'), elPS = $('#alp-ps');
+  const elRide = $('.ride'), elRN = $('#alp-rn'), elRH = $('#alp-rh');
+  const elRail2 = $('.ride .rail2');
+  const elCard = $('.card'), elCN = $('#alp-cn'), elCO = $('#alp-co'), elCM = $('#alp-cm');
+  const elCR = $('#alp-cr'), elCD = $('#alp-cd'), elCX = $('#alp-cx'), elCA = $('#alp-ca');
 
   // ---- animated internals ---------------------------------------------------
   let dSpeed = 0, dLive = 0, dHeat = 0, dEdge = 0, dCarve = 0, dKick = 1, dLand = 0;
   let topKmh = 0, airT = 0, airHold = 0, wasAir = false, boost = 0, landFlash = 0;
   let lastNum = -1, lastT = '', lastD = '', lastX = '', lastRun = -1, airShown = false;
-  const w = { live: -1, heat: -1, edge: -9, carve: -1, p: -1, kick: -1, land: -1 };
+  let dUI = 1, dPrompt = 0, dRide = 0, dCard = 0, dWarmVis = 0;
+  let lastPromptTx = '', lastPromptK = '', lastPromptSb = '', lastRideN = '', lastRideH = '';
+  let lastOpts = '', lastNote = '', lastCard = '';
+  let lastCR = '', lastCD = '', lastCX2 = '', lastCA = '';
+  const w = {
+    live: -1, heat: -1, edge: -9, carve: -1, p: -1, kick: -1, land: -1,
+    ui: -1, veil: -1, glow: -1, prompt: -1, ride: -1, card: -1, warm: -1, warmvis: -1, rp: -1,
+  };
 
   const setVar = (k, v, eps = 0.004) => {
     if (Math.abs(v - w[k]) < eps) return;
@@ -373,6 +530,87 @@ export function createHUD(opts = {}) {
       // only show the ghost once it is meaningfully behind the live needle
       elBest.style.opacity = topKmh > 25 ? '0.6' : '0';
     }
+
+    updateResort(d, state);
+  }
+
+  /**
+   * The resort layer. Four elements, each driven by one opacity variable, and
+   * every text node diffed before it is written — the same discipline as the
+   * speed block, for the same reason: this runs every frame.
+   */
+  function updateResort(d, state) {
+    const mode = state.mode || 'ski';
+    const indoors = mode === 'lift' || mode === 'hut';
+
+    // instruments fade out when they stop meaning anything
+    dUI = smooth(dUI, indoors ? 0 : 1, d, indoors ? 0.20 : 0.34);
+    setVar('ui', dUI);
+    setVar('veil', clamp(state.veil ?? 0, 0, 1), 0.004);
+    setVar('glow', clamp(state.glow ?? 0, 0, 1) * 0.85, 0.004);
+
+    // ---- contact prompt ----------------------------------------------------
+    const pr = state.prompt || null;
+    dPrompt = smooth(dPrompt, pr ? 1 : 0, d, pr ? 0.14 : 0.20);
+    setVar('prompt', dPrompt);
+    if (pr) {
+      if (pr.key !== lastPromptK) { lastPromptK = pr.key; elPK.textContent = pr.key; }
+      if (pr.text !== lastPromptTx) { lastPromptTx = pr.text; elPT.textContent = pr.text; }
+      const sb = pr.sub || '';
+      if (sb !== lastPromptSb) { lastPromptSb = sb; elPS.textContent = sb; }
+      const cold = pr.ready === false;
+      if (elPrompt.classList.contains('cold') !== cold) elPrompt.classList.toggle('cold', cold);
+    }
+
+    // ---- ride progress -----------------------------------------------------
+    const rd = state.ride || null;
+    dRide = smooth(dRide, rd ? 1 : 0, d, 0.22);
+    setVar('ride', dRide);
+    if (rd) {
+      const nm = (rd.name || '').toUpperCase();
+      if (nm !== lastRideN) { lastRideN = nm; elRN.textContent = nm; }
+      const hint = rd.hint || '';
+      if (hint !== lastRideH) { lastRideH = hint; elRH.textContent = hint; }
+      const p = clamp(rd.progress || 0, 0, 1);
+      if (Math.abs(p - w.rp) > 0.002) { w.rp = p; elRail2.style.setProperty('--rp', p.toFixed(4)); }
+    }
+
+    // ---- bar card ----------------------------------------------------------
+    const ht = state.hut || null;
+    dCard = smooth(dCard, ht ? 1 : 0, d, ht ? 0.24 : 0.18);
+    setVar('card', dCard);
+    if (ht) {
+      if (ht.name !== lastCard) { lastCard = ht.name; elCN.textContent = ht.name; }
+      // Diffed like everything else in this file. The run these four report is
+      // frozen the moment the door shuts — `lastRun` in resort.js — so writing
+      // four innerHTML/textContent per frame was rewriting four constants sixty
+      // times a second for the whole time the player sat there, in the block
+      // whose own docstring says every text node is diffed before it is written.
+      const r = ht.run || { time: 0, distance: 0, top: 0, air: 0 };
+      const dm = r.distance || 0;
+      const cr = fmtTime(r.time || 0);
+      const cd = (dm < 1000 ? Math.round(dm) + '<s>m</s>' : (dm / 1000).toFixed(2) + '<s>km</s>');
+      const cx = Math.round((r.top || 0) * 3.6) + '<s>km/h</s>';
+      const ca = (r.air || 0).toFixed(2) + '<s>s</s>';
+      if (cr !== lastCR) { lastCR = cr; elCR.textContent = cr; }
+      if (cd !== lastCD) { lastCD = cd; elCD.innerHTML = cd; }
+      if (cx !== lastCX2) { lastCX2 = cx; elCX.innerHTML = cx; }
+      if (ca !== lastCA) { lastCA = ca; elCA.innerHTML = ca; }
+      const opts = (ht.choices || []).map((c) => `<div class="opt${ht.drink && c.label.toLowerCase() === ht.drink ? ' on' : ''}">`
+        + `<span class="kb">${c.key}</span><span class="l">${c.label}</span><span class="n">${c.note || ''}</span></div>`).join('')
+        + `<div class="opt"><span class="kb">E</span><span class="l">Back outside</span></div>`;
+      if (opts !== lastOpts) { lastOpts = opts; elCO.innerHTML = opts; }
+      const note = ht.drink
+        ? (ht.drink === 'beer' ? 'Prost. The afternoon can wait.' : 'Hot, black, and worth the stop.')
+        : (ht.hint || '');
+      if (note !== lastNote) { lastNote = note; elCM.textContent = note; }
+    }
+
+    // ---- warmth ------------------------------------------------------------
+    const wm = clamp(state.warmth ?? 1, 0, 1);
+    setVar('warm', wm, 0.004);
+    dWarmVis = smooth(dWarmVis, wm < 0.62 ? clamp((0.62 - wm) * 3.2, 0, 1) : 0, d, 0.4);
+    setVar('warmvis', dWarmVis);
   }
 
   const api = {

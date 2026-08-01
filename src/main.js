@@ -4,6 +4,8 @@ import { createState } from './core/state.js';
 import { Terrain } from './world/terrain.js';
 import { createSky } from './world/sky.js';
 import { createScatter } from './world/scatter.js';
+import { createDragLift } from './world/draglift.js';
+import { createResort } from './game/resort.js';
 import { createSkier } from './player/skier.js';
 import { SkiPhysics } from './player/physics.js';
 import { createControls } from './player/controls.js';
@@ -33,6 +35,15 @@ const postfx = createPostFX(renderer, scene, camera);
 const audio = createAudio();
 const hud = createHUD();
 
+// The second lift and the resort loop. `draglift` places itself off the CHAIR
+// line (scatter's published placement seam), so both lifts move together if the
+// corridor ever does; `resort` owns `state.mode` and every "the player is not
+// skiing right now" case — see src/game/resort.js.
+const draglift = createDragLift(scene, terrain, { towers: scatter.lift.towers });
+const resort = createResort({
+  scene, terrain, scatter, sky, camera, chaseCam, physics, skier, audio, draglift, state,
+});
+
 physics.reset(state, state.pos.x, state.pos.z, state.heading);
 
 // The engine owns the backbuffer size (it also drives the resolution-scale knob),
@@ -44,17 +55,70 @@ addEventListener('pointerdown', () => audio.start(), { once: true });
 addEventListener('keydown', () => audio.start(), { once: true });
 
 // Subsystems that need per-frame updates, in dependency order.
-const SYSTEMS = [terrain, sky, scatter, skier, spray, tracks, postfx, audio, hud];
+const SYSTEMS = [terrain, sky, scatter, draglift, skier, spray, tracks, postfx, audio, hud];
+
+/**
+ * Subsystems that make no sense while the player is on the chair or inside the
+ * hut: the rig is hidden, there are no edges on snow, and — the one that is a
+ * real bug rather than wasted work — `tracks` would stamp a carve trench up the
+ * whole piste from a chair twenty metres in the air, because it only knows how
+ * to draw a ribbon between last frame's contact point and this one's.
+ *
+ * The T-bar deliberately is NOT in this case: a drag lift really does track its
+ * own lane up the hill, and the rider is on his skis the whole way.
+ */
+const SUSPENDED = new Set([skier, spray, tracks]);
+const rideSuspends = () => state.mode === 'lift' || state.mode === 'hut';
+
+/**
+ * The one subsystem that has to see the RIDE's clock rather than the wall clock.
+ *
+ * A chairlift is honest at 4.6 m/s and unwatchable at 4 km, so `resort` runs the
+ * middle of a ride as a timelapse (`resort.timeScale`). The chairs coming the
+ * other way are scatter's, integrated from its own `chairPhase += dt * 4.6`, and
+ * the whole reason resort copies that 4.6 is to stay in step with them. Scaling
+ * one and not the other would put the player's chair through the down-side line
+ * at eight times the closing speed — so scatter gets the same clock.
+ *
+ * Nothing else does. The clouds, the wind, the audio and the HUD's smoothing all
+ * want real seconds, and none of them are in shot next to a moving reference.
+ */
+const dtFor = (sys, dt) => (sys === scatter ? dt * resort.timeScale : dt);
 
 // Same list, named, for per-subsystem frame-time attribution. `update()` walks
 // SYSTEMS on the hot path and STEPS only while `perf` is recording, so the
 // instrumented order is identical to the live one by construction.
 const STEPS = [
-  ['controls', controls], ['physics', physics], ['chaseCam', chaseCam],
-  ['terrain', terrain], ['sky', sky], ['scatter', scatter], ['skier', skier],
-  ['spray', spray], ['tracks', tracks], ['postfx', postfx], ['audio', audio], ['hud', hud],
+  ['controls', controls], ['resort', resort], ['physics', physics], ['chaseCam', chaseCam],
+  ['terrain', terrain], ['sky', sky], ['scatter', scatter], ['draglift', draglift],
+  ['skier', skier], ['spray', spray], ['tracks', tracks], ['postfx', postfx],
+  ['audio', audio], ['hud', hud],
 ];
 const STEP_NAMES = STEPS.map((s) => s[0]);
+
+/**
+ * The mode branch. `resort.update()` runs before physics because it is the thing
+ * that decides whether physics runs at all this frame, and after controls
+ * because boarding a lift is an input. Exactly three subsystems change
+ * behaviour with the mode, and all three are here rather than testing
+ * `state.mode` inside themselves:
+ *
+ *   physics    integrates only while skiing (resort owns the rider otherwise)
+ *   chaseCam   frames the rider while skiing or on the T-bar; on the chair and
+ *              in the hut the camera IS the feature and resort drives it
+ *   SUSPENDED  see above
+ */
+function stepPlayer(dt) {
+  resort.update(dt, state);
+  const skiing = state.mode === 'ski';
+  if (skiing) physics.update(dt, state);
+  if (skiing || state.mode === 'drag') {
+    chaseCam.update(dt, state);
+    resort.postCamera(dt, state);      // eases out of a ride into the run
+  } else {
+    resort.updateCamera(dt, state);
+  }
+}
 
 function update(dt) {
   // `perf.inFrame` and not `perf.recording`: a `harness.step()` from a capture
@@ -64,9 +128,12 @@ function update(dt) {
   // Capture tools (tools/flyby.mjs) drive a scripted run by pinning the input
   // after the live sampler has written it.
   if (harness.__scripted) Object.assign(state.input, harness.__scripted);
-  physics.update(dt, state);
-  chaseCam.update(dt, state);
-  for (const s of SYSTEMS) s.update?.(dt, state);
+  stepPlayer(dt);
+  const skip = rideSuspends();
+  for (const s of SYSTEMS) {
+    if (skip && SUSPENDED.has(s)) continue;
+    s.update?.(dtFor(s, dt), state);
+  }
 }
 
 /**
@@ -81,13 +148,18 @@ function updateInstrumented(dt) {
   controls.update(dt, state);
   if (harness.__scripted) Object.assign(state.input, harness.__scripted);
   let t1 = performance.now(); perf.step(0, t1 - t0); t0 = t1;
-  physics.update(dt, state);
+  resort.update(dt, state);
   t1 = performance.now(); perf.step(1, t1 - t0); t0 = t1;
-  chaseCam.update(dt, state);
+  const skiing = state.mode === 'ski';
+  if (skiing) physics.update(dt, state);
   t1 = performance.now(); perf.step(2, t1 - t0); t0 = t1;
+  if (skiing || state.mode === 'drag') { chaseCam.update(dt, state); resort.postCamera(dt, state); }
+  else resort.updateCamera(dt, state);
+  t1 = performance.now(); perf.step(3, t1 - t0); t0 = t1;
+  const skip = rideSuspends();
   for (let i = 0; i < SYSTEMS.length; i++) {
-    SYSTEMS[i].update?.(dt, state);
-    t1 = performance.now(); perf.step(3 + i, t1 - t0); t0 = t1;
+    if (!(skip && SUSPENDED.has(SYSTEMS[i]))) SYSTEMS[i].update?.(dtFor(SYSTEMS[i], dt), state);
+    t1 = performance.now(); perf.step(4 + i, t1 - t0); t0 = t1;
   }
 }
 
@@ -528,8 +600,18 @@ const harness = {
   // Live subsystem handles, so diagnostics can measure the scene instead of
   // guessing from pixels (e.g. compare the rig's ski base against terrain
   // height to prove a grounding bug).
-  debug: { terrain, sky, scatter, skier, physics, spray, tracks, postfx, chaseCam, camera, scene, renderer },
+  debug: {
+    terrain, sky, scatter, skier, physics, spray, tracks, postfx, chaseCam, camera, scene, renderer,
+    // The resort loop. `resort.enter('lift' | 'drag' | 'hut' | 'ski')` forces a
+    // mode so the feature can be screenshot; `resort.goto('chair-mid')` parks the
+    // player next to an interaction so the contact prompt can be. `resort.info()`
+    // dumps the ride state and the placement it read out of scatter.
+    resort, draglift,
+  },
   setPlayer(x, z, heading = Math.PI) {
+    // A teleport ends whatever the player was doing: capture tools expect
+    // setPlayer to leave them on the snow, whichever mode the session was in.
+    resort.enter('ski', { x, z, heading });
     physics.reset(state, x, z, heading);
     controls.update(0, state);
     chaseCam.update(1, state); // snap, don't spring, on teleport
@@ -597,6 +679,39 @@ function warmShaders(label = 'boot') {
 warmShaders.log = [];
 const WARM_AT = new Set([30, 120, 300, 600]);
 
+// --- ?resort= : start the session in a resort mode ---------------------------
+/**
+ * `?resort=lift|drag|hut|chair-mid|chair-bottom|tbar` puts the player straight
+ * into a mode (or next to the interaction that starts it) a few frames after
+ * boot, so a reviewer can SEE the feature with `pnpm dev` and a URL instead of
+ * having to write a puppeteer script:
+ *
+ *   ?resort=hut&drink=beer          sitting in the restaurant with a beer
+ *   ?resort=hut&drink=beer&beat=1   ...and play the look across at the counter
+ *   ?resort=lift&at=mid&progress=.4 on the chair, 40% up from the mid-station
+ *   ?resort=lift&to=summit          the full line rather than the mid-station leg
+ *   ?resort=drag&progress=.45       on the T-bar
+ *   ?resort=tbar                    standing at the T-bar with the prompt up
+ *
+ * Deliberately applied a few frames in, not at boot: the terrain and scatter
+ * around the destination have to stream in first, and the chair-clearance test
+ * needs scatter's chairs to exist.
+ */
+function applyStartMode() {
+  let q;
+  try { q = new URLSearchParams(location.search); } catch { return; }
+  const which = q.get('resort');
+  if (!which) return;
+  const o = {};
+  if (q.has('at')) o.at = q.get('at');
+  if (q.has('to')) o.to = q.get('to');
+  if (q.has('progress')) o.progress = +q.get('progress');
+  if (q.has('drink')) o.drink = q.get('drink');
+  if (q.has('beat')) o.beat = true;
+  if (which === 'lift' || which === 'drag' || which === 'hut' || which === 'ski') resort.enter(which, o);
+  else resort.goto(which);
+}
+
 // --- loop --------------------------------------------------------------------
 let prev = performance.now();
 function loop() {
@@ -618,6 +733,7 @@ function loop() {
     renderFrame(dt);
   }
   harness.frames++;
+  if (harness.frames === 12) applyStartMode();
   // Further passes as the graph fills in: LOD rings, pooled meshes and anything
   // the first seconds of streaming adds. Everything already linked is a cache
   // hit, so the later passes are cheap unless there is genuinely something new —

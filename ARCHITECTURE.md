@@ -35,7 +35,81 @@ subsystem each frame. Read what you need; only the owner writes each field.
 | `crouch` | 0..1 | physics | tuck amount |
 | `gForce` | number | physics | lateral load, drives spray volume + cam shake |
 | `airTime`,`distance`,`time` | number | physics | run stats for HUD |
-| `input` | object | controls | `{steer,crouch,jump,brake}` |
+| `input` | object | controls | `{steer,crouch,jump,brake,action,actionPressed,pick}` |
+| `mode` | string | resort | `'ski' \| 'lift' \| 'drag' \| 'hut'` — see below |
+| `modeT` | number | resort | seconds since the mode was entered |
+| `prompt` | object\|null | resort | contact prompt `{key,text,sub,ready}` |
+| `ride` | object\|null | resort | `{kind,name,s,total,progress,speed,lapse,hint,option}` |
+| `hut` | object\|null | resort | `{name,choices,drink,served,run,hint}` |
+| `warmth` | 0..1 | resort | drains while skiing, refilled by a hot drink |
+| `run` | object | resort | live maxima `{top,bestAir}` for the current run |
+| `runs` | array | resort | one entry per drink taken, with the run it closed |
+| `veil` | 0..1 | resort | screen dip through a door or a skipped ride |
+| `glow` | 0..1 | resort | warm flash on the first sip |
+
+### `state.mode` — the one authority on "is the player skiing?"
+
+Riding the chair, riding the T-bar and sitting in the hut are the same statement,
+and every subsystem has to agree about it in the same frame. `game/resort.js`
+writes `mode`; nothing else may. `main.js` reads it and branches ONCE:
+
+| mode | physics | chaseCam | camera driven by | skier rig | tracks/spray |
+|---|---|---|---|---|---|
+| `ski` | yes | yes | `chaseCam` | visible | yes |
+| `drag` | **no** | yes | `chaseCam` | visible | yes — a T-bar lane really is tracked up |
+| `lift` | **no** | no | `resort.updateCamera()` | hidden | no |
+| `hut` | **no** | no | `resort.updateCamera()` | hidden | no |
+
+Physics is *suspended*, never fought: while a ride runs, `resort` owns `pos`,
+`vel`, `speed`, `heading` and `groundNormal`, and `physics.update()` is not
+called at all (`SkiPhysics.update` also returns early on a non-`ski` mode, as a
+guard against a second caller). Handing control back is a `physics.reset()`,
+which is the same path `harness.setPlayer()` uses.
+
+`tracks` is skipped in `lift`/`hut` because it draws a ribbon between last
+frame's contact point and this one's, and a chair twenty metres up would paint a
+carve trench along the whole piste.
+
+### The ride clock
+
+Two rules, both of which have bitten:
+
+- **The ride integrates the RAW dt, not the clamped one.** `resort.update` clamps
+  dt to 0.1 for its eases and springs, but `scatter.update` clamps nothing and
+  advances the other chairs at `dt * 4.6`. Clamping before advancing `rideS`
+  desynchronised the two for any caller stepping in coarse slices: measured,
+  `harness.step(0.25)` × 40 moved the player 18.35 m while scatter moved 46 m.
+  Not reachable live — `main.js` clamps to 0.05 first — but reachable from every
+  tool in `tools/`. It is now 46.00 m against 46 m.
+- **The chairlift runs the middle of a ride as a timelapse**, up to 8×, real time
+  for the first 92 m and the last 78 m of the leg. `resort.timeScale` publishes
+  the factor and `main.js` multiplies **scatter's** dt by it — and nothing
+  else's. That is not decoration: the entire reason `CHAIR_SPEED` copies
+  scatter's 4.6 is to stay in phase with the chairs coming the other way, and
+  compressing one clock and not the other would throw it away. Measured drift at
+  full lapse: 0.07 m over 800 m.
+
+The chairlift's default destination is the **mid-station**, which is where the
+restaurant is; staying on for the summit is offered as a prompt on the approach.
+A full-line ride is 152 s against the 867 s it would be at literal line speed.
+
+Forcing a mode from the harness (this is how the feature gets screenshot):
+
+```js
+harness.debug.resort.enter('lift', { at: 'mid', progress: 0.35 })
+harness.debug.resort.enter('lift', { to: 'summit' })       // the full line, not the mid leg
+harness.debug.resort.enter('lift', { instant: false })     // keep the boarding move
+harness.debug.resort.enter('drag', { progress: 0.45 })
+harness.debug.resort.enter('hut',  { drink: 'beer' })
+harness.debug.resort.enter('hut',  { drink: 'beer', beat: true })  // play the trip to the bar
+harness.debug.resort.enter('ski')
+harness.debug.resort.goto('chair-mid' | 'chair-bottom' | 'tbar' | 'hut')  // park next to it
+harness.debug.resort.info()                                              // ride + placement state
+
+`enter()` and `goto()` publish `state.mode` themselves, so a tool may read it in
+the same tick. Both hand the player back STATIONARY: `physics.reset` is a
+deliberate flying start and stepping off a lift is not one.
+```
 
 ## Modules
 
@@ -58,6 +132,8 @@ Dispatch on `typeof third === 'number'`.
 
 | `world/snow-material.js` | `createSnowMaterial(opts)` | the snow shader: sparkle, sheen, subsurface, wind ripples |
 | `world/scatter.js` | `createScatter(scene, terrain)` | instanced trees, rocks, lift towers, gates, fences |
+| `world/draglift.js` | `createDragLift(scene, terrain, {towers})` | the T-bar: pylons, rope, circulating bars, stations. Places itself off `scatter.lift.towers[]` so it never re-derives the corridor |
+| `game/resort.js` | `createResort({...})` | the mode machine: boarding zones, the chair and T-bar rides, the hut interior, and every camera that is not `chaseCam` |
 | `player/skier.js` | `createSkier(scene)` | skier mesh/rig + procedural animation from `state` |
 | `player/physics.js` | `class SkiPhysics` | carving dynamics, edges, air, landings |
 | `player/controls.js` | `createControls()` | keyboard/gamepad → `state.input` |
@@ -68,6 +144,22 @@ Dispatch on `typeof third === 'number'`.
 | `audio/audio.js` | `createAudio()` | procedural WebAudio: carve, wind, impacts. No audio files |
 | `ui/hud.js` | `createHUD()` | speed, air time, run stats. Diegetic, restrained |
 
+### The placement seam
+
+Anything that has to put the PLAYER where the world already has geometry reads
+the placement from `scatter`, never from a second copy of the maths:
+
+- `scatter.lift.towers[]` — `{x,z,g,h,top,topY,yaw,perpX,perpZ,armL,armR}`
+- `scatter.lift.cables[]` — `{pts,cum,total,dir}`, arc length increasing uphill,
+  `dir:+1` the uphill side. These are the samples the chairs ride.
+- `scatter.buildings[]` — `{x,z,yaw,w,d,h,roofH,deck?,floorY}`, `w`/`d` HALF
+  extents across/along the ridge, `floorY` the deck level.
+
+`resort.js` rides `cables[1]` and builds its interior inside `buildings[0]`;
+`draglift.js` interpolates `towers[]` for its own line. A second copy of
+`corridorX0()` or of the cable catenary is the ambiguous seam that has broken
+every integration in this repo — see CLAUDE.md.
+
 Every module returns an object with `update(dt, state)`. `postfx` also exposes
 `render(dt)` and `setSize(w,h)`; if post-processing is active, `main.js` calls
 `postfx.render()` instead of `renderer.render()`.
@@ -76,6 +168,9 @@ Every module returns an object with `update(dt, state)`. `postfx` also exposes
 
 ```bash
 node tools/shoot.mjs --out shots/mine            # 5 canonical framings
+node tools/resort-shots.mjs shots/mine-resort    # 24 framings of the resort loop
+node tools/resort-flow.mjs                       # the mode machine, driven through state.input only
+node tools/probe.mjs "return h.debug.resort.info()"   # any measurement, headless
 node tools/shoot.mjs --out shots/mine --only hero --w 1920 --h 1080
 node tools/shoot.mjs --out shots/mine --perf     # fps
 ```

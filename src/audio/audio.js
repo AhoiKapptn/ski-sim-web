@@ -41,6 +41,12 @@ const smooth = (cur, tgt, dt, tau) => cur + (tgt - cur) * (1 - Math.exp(-dt / (t
 const TOP_SPEED = 25.5;
 /** Below this the skier is standing still: the wind must be silent, not quiet. */
 const WIND_FLOOR = 0.06;   // as a fraction of TOP_SPEED (~5.5 km/h)
+/**
+ * m/s of apparent wind while riding a chair. A chair moves at 4.6 m/s and hangs
+ * 8-26 m off the deck where there is a real breeze, so this is a little above
+ * the line speed and is the only thing you hear up there besides the sheaves.
+ */
+const LIFT_BREEZE = 6.2;
 const MASTER = 0.95;
 
 // ------------------------------------------------------------ noise banks ---
@@ -191,9 +197,13 @@ export function createAudio(opts = {}) {
     pan: 0, carveFreq: 1800, skidFreq: 1100, powderFreq: 500,
     windFreq: 1800, windMidFreq: 560, windLoG: 0.9, windMidG: 0.3, windHiG: 0.05,
     grain: 0, buffet: 0, sendAmt: 0.12,
+    // 1 while the skis are on snow, 0 on a chair or indoors. Smoothed, because
+    // boarding a lift must fade the bed out rather than cut it.
+    contact: 1,
   };
   let lastEdgeSign = 0;
   let sinceChirp = 10, sinceStop = 10, sincePole = 10;
+  let sinceCrackle = 0, nextCrackle = 0.2;
   let wasAir = false, airVy = 0, airDur = 0;
   let prevSpeed = 0, decelS = 0;
 
@@ -529,20 +539,93 @@ export function createAudio(opts = {}) {
     tone(t, { f0: 150, f1: 55, dur: 0.22, gain: 0.18 * a });
   }
 
+  /** Metallic clack of a sheave train going over, and the drive's low thrum. */
+  function mech(kind = 'sheave') {
+    if (!N || !running) return;
+    const t = ctx.currentTime + 0.01;
+    if (kind === 'sheave') {
+      burst(t, { type: 'bandpass', f0: 2100, f1: 900, q: 5.5, dur: 0.10, atk: 0.002, gain: 0.055, pan: 0.12, send: 0.30 });
+      burst(t + 0.012, { type: 'bandpass', f0: 380, f1: 220, q: 1.6, dur: 0.16, atk: 0.004, gain: 0.05, pan: -0.06, send: 0.18 });
+      tone(t, { f0: 78, f1: 46, dur: 0.14, gain: 0.05 });
+    } else {
+      // stepping off: a lump of steel taking the weight off, then skis on snow
+      tone(t, { f0: 120, f1: 52, dur: 0.22, gain: 0.10 });
+      burst(t + 0.02, { type: 'lowpass', f0: 900, f1: 260, q: 0.9, dur: 0.30, atk: 0.01, gain: 0.10, send: 0.2 });
+    }
+  }
+
+  /** A cup set down on a table, or a glass. The whole sound of a hut stop. */
+  function sip(kind = 'coffee') {
+    if (!N || !running) return;
+    const t = ctx.currentTime + 0.01;
+    if (kind === 'beer') {
+      // glass on timber, then the fizz
+      burst(t, { type: 'bandpass', f0: 2600, f1: 1500, q: 6.0, dur: 0.13, atk: 0.002, gain: 0.075, send: 0.3 });
+      tone(t + 0.005, { type: 'triangle', f0: 640, f1: 520, dur: 0.22, gain: 0.045 });
+      burst(t + 0.05, { type: 'highpass', f0: 5200, q: 0.8, dur: 1.5, atk: 0.20, gain: 0.020, send: 0.2 });
+    } else {
+      // ceramic on a saucer, twice, and the hiss of a steam wand
+      burst(t, { type: 'bandpass', f0: 3300, f1: 2100, q: 7.0, dur: 0.09, atk: 0.002, gain: 0.06, send: 0.28 });
+      burst(t + 0.085, { type: 'bandpass', f0: 2900, f1: 1900, q: 6.0, dur: 0.07, atk: 0.002, gain: 0.035, send: 0.24 });
+      burst(t + 0.22, { type: 'bandpass', f0: 4200, q: 0.9, dur: 0.55, atk: 0.06, gain: 0.028, send: 0.3 });
+    }
+  }
+
+  /** One pop of a log on the fire. Scheduled from update while indoors. */
+  function crackle() {
+    if (!N || !running) return;
+    const t = ctx.currentTime + 0.01;
+    const a = 0.3 + Math.random() * 0.7;
+    burst(t, {
+      type: 'bandpass', f0: 700 + Math.random() * 1800, f1: 400, q: 2.2 + Math.random() * 3,
+      dur: 0.03 + Math.random() * 0.06, atk: 0.002, gain: 0.012 + 0.030 * a,
+      pan: -0.45 + Math.random() * 0.12, send: 0.34,
+    });
+    if (a > 0.75) tone(t, { f0: 150 + Math.random() * 60, f1: 70, dur: 0.10, gain: 0.02 });
+  }
+
   // ------------------------------------------------------------- update ----
   function update(dt, state) {
     if (!state) return;
     const d = clamp(dt || 0, 0, 0.1);
 
-    const speed = state.speed ?? 0;
-    const edge = clamp(state.edge ?? 0, -1, 1);
+    // ---- resort modes ------------------------------------------------------
+    // A rider on a chair is not shearing snow at 4.6 m/s and a rider in a hut is
+    // not outside at all, so the bed and the wind are driven from an EFFECTIVE
+    // state rather than the literal one. Without this, boarding the lift left a
+    // full carve bed running under a rider hanging in mid-air — the single most
+    // obvious way an audio mix can contradict what is on screen.
+    //
+    //   ski    literal
+    //   drag   literal (he really is sliding, at walking pace)
+    //   lift   no contact at all; wind is the exposed breeze of sitting 20 m up
+    //   hut    no contact, no wind, and a fire (see crackle())
+    const mode = state.mode || 'ski';
+    const onLift = mode === 'lift';
+    const indoors = mode === 'hut';
+    const skiing = mode === 'ski';
+
+    const speed = indoors ? 0 : (state.speed ?? 0);
+    const edge = skiing ? clamp(state.edge ?? 0, -1, 1) : 0;
     const absEdge = Math.abs(edge);
-    const airborne = state.airborne ? 1 : 0;
-    const brake = clamp(state.input?.brake ?? 0, 0, 1);
-    const carving = state.carving ? 1 : 0;
-    const vy = state.vel?.y ?? 0;
+    const airborne = skiing && state.airborne ? 1 : 0;
+    const brake = skiing ? clamp(state.input?.brake ?? 0, 0, 1) : 0;
+    const carving = skiing && state.carving ? 1 : 0;
+    const vy = skiing ? (state.vel?.y ?? 0) : 0;
+    // What the wind hears, which is not what the skis hear.
+    const windSpeed = indoors ? 0.9 : (onLift ? LIFT_BREEZE : speed);
+    s.contact = smooth(s.contact, (skiing || mode === 'drag') ? 1 : 0, d, 0.22);
 
     sinceChirp += d; sinceStop += d; sincePole += d;
+
+    if (indoors) {
+      sinceCrackle += d;
+      if (sinceCrackle > nextCrackle) {
+        sinceCrackle = 0;
+        nextCrackle = 0.10 + Math.random() * 0.55;
+        crackle();
+      }
+    }
 
     // ---- event detection (runs even before the context exists) ------------
     const events = [];
@@ -596,7 +679,9 @@ export function createAudio(opts = {}) {
     s.absEdge = smooth(s.absEdge, absEdge, d, 0.08);
     s.crouch = smooth(s.crouch, clamp(state.crouch ?? 0, 0, 1), d, 0.25);
 
-    const g = 1 - s.air;                 // grounded blend, smoothed
+    // grounded blend, smoothed — and gated on whether the skis are on snow at
+    // all, which is the mode machine's business rather than the physics'
+    const g = (1 - s.air) * s.contact;
     const firm = s.carve;                // carving on firm snow
 
     // ---- ski-on-snow: a true 3-way crossfade -------------------------------
@@ -646,7 +731,7 @@ export function createAudio(opts = {}) {
     // from the snow bed dropping out, not from more wind. The floor
     // subtraction is what buys real silence: sp^1.5 alone still leaves audible
     // wind while stationary, which is the tell of a demo.
-    const spW = clamp((sp - WIND_FLOOR) / (1 - WIND_FLOOR), 0, 1.3);
+    const spW = clamp((clamp(windSpeed / TOP_SPEED, 0, 1.25) - WIND_FLOOR) / (1 - WIND_FLOOR), 0, 1.3);
     const tWind = Math.pow(spW, 2.0) * 0.38 * (1 + 0.12 * s.air);
     s.gWind = smooth(s.gWind, tWind, d, 0.13);
     // Brightness rides speed independently of level: the low band's share falls
@@ -731,6 +816,11 @@ export function createAudio(opts = {}) {
   const api = {
     start,
     update,
+    // Called by game/resort.js: the lift's sheaves and the bar. One-shots only —
+    // nothing here holds a node open, so a mode that forgets to stop them cannot
+    // leave a sound running.
+    mech,
+    sip,
     get context() { return ctx; },
     get nodes() { return N; },
     setVolume(v) { if (N) N.out.gain.value = clamp(v, 0, 1.5); },
