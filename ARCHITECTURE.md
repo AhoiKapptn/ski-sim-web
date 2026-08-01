@@ -134,6 +134,7 @@ Dispatch on `typeof third === 'number'`.
 | `world/scatter.js` | `createScatter(scene, terrain)` | instanced trees, rocks, lift towers, gates, fences |
 | `world/draglift.js` | `createDragLift(scene, terrain, {towers})` | the T-bar: pylons, rope, circulating bars, stations. Places itself off `scatter.lift.towers[]` so it never re-derives the corridor |
 | `game/resort.js` | `createResort({...})` | the mode machine: boarding zones, the chair and T-bar rides, the hut interior, and every camera that is not `chaseCam` |
+| `world/branding.js` | `createBranding(scene, terrain, scatter)` | slope-side sponsor banners and boards at the piste edge — two BTM, two AhoiKapptn!, one merged geometry and one atlas, so the whole set is one draw call. Reads placement off scatter's public seam rather than re-deriving the corridor. Ships **the only binary assets in the repo** (`public/brand/*.png`), a scoped exception documented in the file header. Returns `ready`, which resolves once those PNGs are composited into the atlas; the group stays `visible = false` until then, so a capture taken too early contains *nothing* rather than silently containing the procedural fallback |
 | `player/skier.js` | `createSkier(scene)` | skier mesh/rig + procedural animation from `state` |
 | `player/physics.js` | `class SkiPhysics` | carving dynamics, edges, air, landings |
 | `player/controls.js` | `createControls()` | keyboard/gamepad → `state.input` |

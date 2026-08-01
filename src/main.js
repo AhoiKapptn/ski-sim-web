@@ -4,6 +4,7 @@ import { createState } from './core/state.js';
 import { Terrain } from './world/terrain.js';
 import { createSky } from './world/sky.js';
 import { createScatter } from './world/scatter.js';
+import { createBranding } from './world/branding.js';
 import { createDragLift } from './world/draglift.js';
 import { createResort } from './game/resort.js';
 import { createSkier } from './player/skier.js';
@@ -25,6 +26,7 @@ scene.add(terrain.mesh ?? terrain.group);
 
 const sky = createSky(scene, renderer);
 const scatter = createScatter(scene, terrain);
+const branding = createBranding(scene, terrain, scatter);
 const skier = createSkier(scene);
 const physics = new SkiPhysics(terrain);
 const controls = createControls();
@@ -55,7 +57,7 @@ addEventListener('pointerdown', () => audio.start(), { once: true });
 addEventListener('keydown', () => audio.start(), { once: true });
 
 // Subsystems that need per-frame updates, in dependency order.
-const SYSTEMS = [terrain, sky, scatter, draglift, skier, spray, tracks, postfx, audio, hud];
+const SYSTEMS = [terrain, sky, scatter, draglift, branding, skier, spray, tracks, postfx, audio, hud];
 
 /**
  * Subsystems that make no sense while the player is on the chair or inside the
@@ -91,7 +93,7 @@ const dtFor = (sys, dt) => (sys === scatter ? dt * resort.timeScale : dt);
 const STEPS = [
   ['controls', controls], ['resort', resort], ['physics', physics], ['chaseCam', chaseCam],
   ['terrain', terrain], ['sky', sky], ['scatter', scatter], ['draglift', draglift],
-  ['skier', skier], ['spray', spray], ['tracks', tracks], ['postfx', postfx],
+  ['branding', branding], ['skier', skier], ['spray', spray], ['tracks', tracks], ['postfx', postfx],
   ['audio', audio], ['hud', hud],
 ];
 const STEP_NAMES = STEPS.map((s) => s[0]);
@@ -607,6 +609,9 @@ const harness = {
     // player next to an interaction so the contact prompt can be. `resort.info()`
     // dumps the ride state and the placement it read out of scatter.
     resort, draglift,
+    // Slope-side sponsor branding. `branding.ready` resolves when its two brand
+    // PNGs are in the atlas; until then its group is hidden (see below).
+    branding,
   },
   setPlayer(x, z, heading = Math.PI) {
     // A teleport ends whatever the player was doing: capture tools expect
@@ -744,5 +749,13 @@ function loop() {
 warmShaders('boot');
 loop();
 
-harness.ready = true;
-document.getElementById('boot').classList.add('gone');
+// `branding` composites its two brand PNGs asynchronously and keeps its group
+// hidden until they are in its atlas, so a capture taken before that contains no
+// branding at all. Every capture tool gates on `harness.ready`, so flipping it
+// synchronously would have quietly produced a whole review's worth of shots with
+// the sponsor boards missing — which is why the module hides rather than falls
+// back: absent is loud, wrong artwork is silent. ~200 ms, and it cannot reject.
+branding.ready.then(() => {
+  harness.ready = true;
+  document.getElementById('boot').classList.add('gone');
+});
