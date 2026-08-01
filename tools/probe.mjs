@@ -18,7 +18,7 @@ await server.listen();
 const q = process.env.PQ ? '?' + process.env.PQ : '';
 const url = `http://127.0.0.1:${server.httpServer.address().port}/${q}`;
 const browser = await puppeteer.launch({
-  headless: true, protocolTimeout: 180000,
+  headless: true, protocolTimeout: 900000,
   args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist',
     '--enable-unsafe-swiftshader', '--no-sandbox', '--force-color-profile=srgb'],
 });

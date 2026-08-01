@@ -1,7 +1,7 @@
 /**
  * Screenshot the resort loop: the two lifts, the hut, and the contact prompts.
  *
- *   node shots/probe/resort-shots.mjs shots/resort
+ *   node tools/resort-shots.mjs shots/resort
  *
  * Each shot forces a mode through `window.__harness.debug.resort` and then steps
  * the sim, exactly the way tools/shoot.mjs settles a framing.

@@ -733,17 +733,20 @@ function buildInterior(b) {
    */
   const steamP = [], steamN = [], steamC = [];
   {
-    const N = 9;
-    const H = 0.235;
+    const N = 11;
+    const H = 0.185;
     for (let strand = 0; strand < 2; strand++) {
       const ph = strand * 2.1, zoff = (strand - 0.5) * 0.012;
       let prev = null;
       for (let i = 0; i <= N; i++) {
         const t = i / N;
         const y = t * H;
-        // a slow curl, widening and leaning as it rises
-        const x = Math.sin(t * 2.5 + ph) * 0.016 * t + (strand - 0.5) * 0.010;
-        const w = lerp(0.011, 0.040, Math.pow(t, 0.7));
+        // Two frequencies of curl, both scaled by height so the base stays over
+        // the cup. One frequency at a tenth of this amplitude was the first cut
+        // and it read as a straight vertical smear rather than as a wisp.
+        const x = (Math.sin(t * 3.1 + ph) * 0.042 + Math.sin(t * 7.4 + ph * 1.7) * 0.013)
+          * Math.pow(t, 1.25) + (strand - 0.5) * 0.010;
+        const w = lerp(0.011, 0.046, Math.pow(t, 0.7));
         // opaque in the middle of the plume, nothing at the surface or the top
         const a = 0.85 * Math.sin(Math.pow(t, 0.62) * Math.PI) * (strand ? 0.7 : 1.0);
         const cur = { x, y, w, a };
