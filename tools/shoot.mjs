@@ -144,11 +144,34 @@ try {
   }
 
   if (PERF) {
-    await page.evaluate(() => { window.__harness.frames = 0; window.__setAuto?.(true); });
+    // The capture loop above runs with the sim PAUSED, which is what holds the
+    // adaptive resolution controller still. This window un-pauses to count
+    // presented frames, so without an explicit freeze the controller is live
+    // INSIDE the measurement: it measured "38.3 fps @ 3200x1800" while actually
+    // finishing at 2560x1440, having stepped twice mid-window. Take the freeze
+    // (optional — older builds have no controller to freeze).
+    await page.evaluate(() => {
+      window.__harness.gfx?.freeze?.();
+      window.__harness.frames = 0;
+      window.__setAuto?.(true);
+    });
     await new Promise((r) => setTimeout(r, 4000));
     const frames = await page.evaluate(() => window.__harness.frames);
-    report.perf = { fps: +(frames / 4).toFixed(1), dpr: DPR, drawingBuffer: report.drawingBuffer };
-    console.log(`⏱  ${report.perf.fps} fps @ ${report.drawingBuffer.join('x')} (dpr ${DPR}) — `
+    // Re-read the backbuffer AFTER the window rather than reusing the boot-time
+    // value: if it ever moves, the number must be wrong loudly rather than
+    // recorded as a resolution the frames were never rendered at.
+    const bufAfter = await page.evaluate(() => {
+      const c = window.__harness.debug.renderer.domElement;
+      return [c.width, c.height];
+    });
+    await page.evaluate(() => window.__harness.gfx?.unfreeze?.());
+    if (bufAfter[0] !== report.drawingBuffer[0] || bufAfter[1] !== report.drawingBuffer[1]) {
+      errors.push(`--perf: backbuffer moved during the window, ${report.drawingBuffer.join('x')} → `
+        + `${bufAfter.join('x')}. The fps figure spans two resolutions and means nothing.`);
+      exitCode = 1;
+    }
+    report.perf = { fps: +(frames / 4).toFixed(1), dpr: DPR, drawingBuffer: bufAfter };
+    console.log(`⏱  ${report.perf.fps} fps @ ${bufAfter.join('x')} (dpr ${DPR}) — `
       + 'vsync-quantised, player nearly stationary. See README "Measuring frame cost".');
   }
 } catch (e) {
