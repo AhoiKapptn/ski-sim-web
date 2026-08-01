@@ -145,10 +145,16 @@ export async function startServer({ prod = false, port = 5301 } = {}) {
 }
 
 // ---- browser ----------------------------------------------------------------
-export async function launch({ w = 1600, h = 900, dpr = 1 } = {}) {
+/**
+ * `protocolTimeout` needs raising for callers that toggle MANY materials in one
+ * evaluate: `needsUpdate = true` on ~120 materials is a synchronous shader-link
+ * storm inside a single CDP call, and tools/gpu-breakdown.mjs' whole-scene arms
+ * hit the default.
+ */
+export async function launch({ w = 1600, h = 900, dpr = 1, protocolTimeout = 600000 } = {}) {
   const browser = await puppeteer.launch({
     headless: true,
-    protocolTimeout: 600000,
+    protocolTimeout,
     args: [
       '--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist',
       '--enable-unsafe-swiftshader', '--no-sandbox', '--force-color-profile=srgb',
@@ -169,9 +175,22 @@ export async function launch({ w = 1600, h = 900, dpr = 1 } = {}) {
   return { browser, page, errors };
 }
 
-export async function boot(page, url) {
+/**
+ * `freezeAdaptive` (default true) holds `gfx.freeze()` for the whole session.
+ *
+ * engine.js' resolution controller is ON by default above 2.5 Mpx, and it is
+ * driven by the presented frame interval — which is the same quantity every tool
+ * here measures. Left running it would move the backbuffer between the two arms
+ * of an A/B, so both arms would be measuring the controller instead of the
+ * change. `perf.recording` freezes it too, but a window's SETTLE period runs
+ * before `perf.start()`, so the freeze has to cover the session, not the window.
+ * `tools/adaptive-test.mjs` is the one caller that passes `false`, because the
+ * controller is what it is testing.
+ */
+export async function boot(page, url, { freezeAdaptive = true } = {}) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
   await page.waitForFunction('window.__harness && window.__harness.ready === true', { timeout: 120000 });
+  if (freezeAdaptive) await page.evaluate(() => window.__harness.gfx.freeze?.());
   await new Promise((r) => setTimeout(r, 1500));
   return page.evaluate(() => {
     const h = window.__harness;
