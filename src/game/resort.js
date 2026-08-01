@@ -1234,8 +1234,19 @@ export function createResort(opts) {
     return true;
   }
 
-  /** Hand control back to the physics, facing down the hill. */
-  function backToSki(state, x, z, heading) {
+  /**
+   * Hand control back to the physics, facing down the hill.
+   *
+   * `snapCam` cuts to the chase view instead of easing out of wherever the last
+   * camera was. The hut exit needs it: the interior lens stands INSIDE the
+   * building, and easing out of it over T_OFF put the chase boom at room-local
+   * (4.17, 3.01) — inside the footprint, between the floor and the ridge —
+   * while the veil, which is only T_DOOR long, had already cleared. Measured,
+   * the first second outside was the back of the exterior shell with its own
+   * shutter boxes floating in it. A door is a cut and the veil is what covers
+   * it; a lift unload is a move and keeps its blend.
+   */
+  function backToSki(state, x, z, heading, snapCam = false) {
     mode = 'ski'; phase = 'ride'; modeT = 0; phaseT = 0;
     setSkierVisible(true);
     state.ride = null;
@@ -1258,8 +1269,7 @@ export function createResort(opts) {
     state.vel.set(0, 0, 0);
     state.speed = 0;
     runTop = 0; runAir = 0;
-    grabCamera();
-    blend = 1; blendDur = T_OFF;
+    if (snapCam) { camFrom = null; blend = 0; } else { grabCamera(); blend = 1; blendDur = T_OFF; }
     publishMode(state);
   }
 
@@ -1574,7 +1584,7 @@ export function createResort(opts) {
         const { cx: hcx, cz: hcz } = hutFrame;
         const zx = hutDoor.x + hcx * 6, zz = hutDoor.z + hcz * 6;
         state.hut = null;
-        backToSki(state, zx, zz, Math.PI);
+        backToSki(state, zx, zz, Math.PI, true);
         return;
       }
     }

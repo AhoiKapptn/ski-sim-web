@@ -50,7 +50,10 @@ const SHOTS = [
   // the counter you ordered from: `beat: true` plays the look across, and 1.1 s
   // in is the hold on the bar
   ['hut-bar', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20); h.debug.resort.enter('hut', { drink: 'coffee', beat: true }); h.step(1/60, 60);", 0],
-  ['hut-exit', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20); window.__inputOverride = { action: true }; h.step(1/60, 2); window.__inputOverride = null; h.step(1/60, 60);", 0],
+  // stepping back outside: the door is a veiled cut, so the first frame the veil
+  // clears has to already be the chase view and not the inside of the shell
+  ['hut-exit-a', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20); window.__inputOverride = { action: true }; h.step(1/60, 2); window.__inputOverride = null; h.step(1/60, 18);", 0],
+  ['hut-exit-b', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20); window.__inputOverride = { action: true }; h.step(1/60, 2); window.__inputOverride = null; h.step(1/60, 60);", 0],
   ['hut-prompt', "h.debug.resort.enter('ski'); window.__inputOverride = { brake: 1 }; h.debug.resort.goto('hut');", 26],
   ['chair-prompt', "h.debug.resort.enter('ski'); window.__inputOverride = { brake: 1 }; h.debug.resort.goto('chair-mid');", 26],
 ];
