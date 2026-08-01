@@ -7,10 +7,15 @@ is the human-facing overview.
 ## The project in one paragraph
 
 Third-person ski simulator in Three.js r185. **`three` is the only dependency and
-there are no binary art assets** — every mesh, texture, shader and sound is
+almost nothing is a binary asset** — every mesh, texture, shader and sound is
 generated in code. That constraint is deliberate; do not add a dependency or
 download an asset to solve a problem. Anything under `three/addons/` is fair game.
 Runs at 1600×900, ~60 fps.
+
+The **one** exception, granted by the owner for those files alone, is
+`public/brand/*.png`: two real sponsor logos loaded by `world/branding.js`. A
+brand mark is the one thing here that cannot be reproduced procedurally without
+being wrong. It is not a precedent — a second request goes back to the owner.
 
 ## Verify visually or you are guessing
 
@@ -56,16 +61,58 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
    it had done nothing. Verify a rock crop contains rock. Also beware difference
    masks: white cards differed from the snow behind them by ~6 levels and dropped
    out of their own measurement.
+
+   **And check your crop box against the image's actual dimensions.** A crop
+   rectangle tuned on a 1600×900 shot, applied unchanged to a 3200×1800 DPR-2
+   PNG, lands on completely different ground. This produced a "−15% snow
+   micro-contrast" regression that was really −0.3% to −5.4%, and in the same
+   session a "23 L\* difference" between two resolutions that was camera framing
+   drift, not a rendering difference. Two guards: assert the PNG's width before
+   measuring, and capture every arm with `shoot.mjs`' deterministic settle
+   (`setAuto(false)` then a fixed count of `harness.step()`) — letting the sim
+   run free between arms moves the camera.
 5. **You have never measured the resolution the game is played at.** `engine.js`
    uses `min(devicePixelRatio, 2)`; headless Chrome reports DPR **1** and
    `shoot.mjs` pinned `deviceScaleFactor: 1`, so every measurement in this
    project's history rendered 1600×900 = **1.44 Mpx**. A Retina machine renders
    3200×1800 = **5.76 Mpx — 4× the fragment work** — and every postfx target is
    sized from `getDrawingBufferSize()`, so the whole post chain scales with it.
-   Measured: **~5.1 ms per megapixel** plus a ~18.5 ms resolution-independent
-   floor. Use `shoot.mjs --dpr 2` / `perf-ab.mjs --dpr 2`; `report.json` now
-   records `dpr` and the real `drawingBuffer`. Never compare shots across
-   densities.
+   Measured on the canonical carve path: DPR 1 is p50 16.70 / p99 17.90 with 3 of
+   839 frames over 20 ms; DPR 2 is p50 34.00 / p99 42.80 with **404 of 405** over
+   20 ms and 65% over 33 ms.
+
+   Cost model: **~3–5 ms per megapixel on a ~8–12 ms fixed floor, valid only over
+   1.4–5.8 Mpx.** The slope originally recorded here (5.1 ms/Mpx) reproduces — an
+   independent ascending sweep gives 5.21. **The 18.5 ms floor does not**: an
+   18.5 ms floor puts DPR 1 at 25.8 ms, under 40 fps, and DPR 1 measures a clean
+   16.70 ms vsync lock. **Do not extrapolate the fit**: at 9.0 Mpx the real cost
+   is 77.5 ms where every linear fit predicts 40–54.
+
+   Use `shoot.mjs --dpr 2` / `perf-ab.mjs --dpr 2`; `report.json` records `dpr`
+   and the real `drawingBuffer`. Never compare shots across densities.
+
+   Two consequences for measurement:
+   - At DPR 2 the presented interval is **not** vsync-censored: the distribution
+     is smooth across 28–44 ms. At DPR 1 it pins to 16.70 and can only ever
+     report a floor.
+
+     **But do not make that argument from the 16.7 residual.** The begin-frame
+     tick in headless Chrome is **8.33 ms, not 16.7** — every clean interval
+     observed (16.7 / 25.0 / 33.3 / 41.7 / 50.0 / 58.3 / 66.7) is an integer
+     multiple of it, and 13 of the 15 distinct values in one controller log were
+     exact multiples. So "this value is not a multiple of 16.7" is **not** by
+     itself evidence of a free-running frame; check against 8.33. The DPR-2
+     conclusion stands on the SHAPE of the distribution, not on the residual.
+
+     This is not pedantry: reasoning from a 16.7 ms tick produced a silent
+     one-way ratchet in `engine.js`' resolution controller, twice. **Any
+     threshold that a vsync-locked frame must satisfy, derived from a quantity
+     that can slide underneath it, is the same bug** — and the presented interval
+     is ALWAYS quantised, so it is an upper bound on an unknown cost and nothing
+     can be inferred by scaling it.
+   - `engine.js`' resolution controller is ON by default above 2.5 Mpx. Any tool
+     that measures frame time must hold `gfx.freeze()` for the session or it will
+     measure the controller. `tools/frametime.mjs` boot() does this.
 6. **`renderer.info.render.calls` reads `1` unless you force `autoReset = false`.**
    three resets `info` at the top of *every* `renderer.render()`, and the post
    chain makes a dozen per frame, so the naive read reports the last fullscreen
@@ -78,6 +125,19 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
    real GPU busy time. Narrowing the query to bracket only the render span does
    not fix it. It is a sensitive *relative* metric: read ratios between the two
    arms of one A/B, never levels.
+
+   Its inflation tracks **submission count**, not load: measured as a ratio
+   against the presented interval it reads 2.75× with the post chain on and 1.94×
+   with it off, so it systematically over-charges any change that alters the
+   number of passes. Never quote a timer delta across such a change.
+
+   **And `gl.finish()` is not an escape hatch: it does not drain the GPU on
+   Chrome's command-buffer path.** Known-answer test: quadrupling the pixel count
+   moved the presented interval +18.35 ms in 6/6 pairs and moved the
+   `gl.finish()`-bracketed render span by **0.00 ms**. Worse, enabling
+   `--sync-gpu` roughly **doubles** the presented interval, so it perturbs what it
+   measures. The `--sync-gpu` fallback advertised in `perf-ab.mjs`' header is not
+   usable on this machine; the presented interval at DPR 2 is.
 
 `--perf` is a **stationary player at DPR 1**. It is structurally blind to
 motion-dependent cost and to fragment cost. Use `tools/frametime.mjs` (what is
@@ -113,6 +173,7 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 | Conifers as bare poles with floating cards | Foliage generation | LOD1 band starts at 34 m but carried only ~9% of LOD0's foliage |
 | Trees flicker | LOD churn, ring rebuild, mip/alpha-test coverage, billboard flipping — all four eliminated by measurement | **The TAA resolve.** Freeze the sim completely (no wind, no dither, no camera) and accumulate per-pixel temporal SD over the crowns: **6.95 codes shipped, 0.013 with TAA off.** The render was exactly static; the resolve was not. Raising feedback alone fixes a third of it, because the variance box that clips the history is itself built from the jittered current frame |
 | Park kickers read as bumps and launch you late | Two separate defects | **One defect.** The takeoff ramp peaked at **+7.7°** where a park kicker is 25–35°. Too shallow to read as built *and* too shallow to unload the skis — the rider separated 5.3 m past the lip. Raising the ramp fixed both |
+| "The performance is lagging a bit" | CPU cost, the post chain, draw calls, shadow maps, or the 527-call scene being too complex | **Fragment cost at DPR 2, and almost all of it one shader.** CPU is 0.4 ms update + 1.1 ms submit out of a 34 ms frame. Ablating every scene material returns the interval to the 16.70 ms vsync lock; the terrain snow shader alone is **well over half** of scene shading cost — **≥14.4 ms (censored by the vsync floor) against 3.6–8.3 ms for the entire rest of the scene**, measured with complement arms, 2/2 pairs. No post pass, no shadow pass and no CPU subsystem is measurable against it. The lever is pixels, not passes |
 
 ## Interface hazards
 
@@ -140,6 +201,28 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 - **`renderer.info` is reset at the top of every `renderer.render()`.** The post
   chain calls that a dozen times a frame, so per-frame counters need
   `autoReset = false` — see trap 6.
+- **Shared material instances defeat subset ablation.** `terrain.js` creates one
+  snow material (`terrain.js:1302`) and assigns that same instance to all nine
+  clipmap LOD meshes (`terrain.js:2651`); `scatter.js` shares one instance across
+  the chairlift, the chairs, the piste markers and the snow guns. An ablation
+  naming any subset silently ablates every other holder, and the two arms then
+  agree beautifully and mean nothing. A frame-changed self-check cannot catch it —
+  the frame really does change, just not as labelled. `tools/gpu-breakdown.mjs`
+  enumerates shared instances at startup and refuses subset entries.
+- **A trivial fragment program lets the linker dead-strip the vertex program.**
+  "Swap the material for a cheap one" measures fragment *and* an unknown amount of
+  vertex cost, because the varyings the vertex shader wrote are now unreferenced.
+  It therefore cannot **in principle** answer a tessellation question. So
+  `LEVEL_RES = 512` on the outer three clipmap rings (1.28 M of 2.63 M triangles,
+  originally justified with a DPR-1 fps number, which traps 1 and 5 both
+  invalidate) is **unanswerable by material ablation** and needs a geometry A/B:
+  two builds with different `LEVEL_RES`. Separate fragment from vertex cost by
+  sweeping resolution with the subsystem gutted — fragment cost scales with
+  pixels, vertex cost does not.
+- **`engine.js`' adaptive resolution controller must be frozen during any
+  measurement.** `gfx.freeze()`/`unfreeze()` bracket a window; `perf.recording`
+  freezes it too, but a tool's *settle* window runs before `perf.start()`, and a
+  pinned `gfx.setPixelRatio()` was once silently discarded by a step.
 - Instrumentation hook: `window.__harness?.perf?.mark(label, n)` is a no-op unless
   recording. Tag ring wraps, chunk re-emits and trench commits with it; then
   `report().marks` contrasts the frame-time tail on marked frames against unmarked
@@ -151,15 +234,30 @@ Four blind reviews against real Steep screenshots and alpine photography scored
 74 → 80 → 84 → 85/100. It is **not** AAA and was identified in every pair. These
 are the measured wins; check them after any change to the snow or lighting:
 
-| Metric | Value | Reference |
-|---|---|---|
-| Near-piste sunlit snow L\*/sd | 73.1 / 12.6 | photo 74.8/10.5, Steep 58.3/29.6 |
-| Treeline luminance ÷ adjacent snow | 0.36 | target band 0.25–0.45 |
-| Distant conifer band RGB | (43,58,68) | real Megève (40,55,72) |
-| Cast-shadow snow B−R | +21 to +26 | real photos +24 to +26 |
-| Shadowed rock B/R | ≥ 1.58 | trades against a blue cast — see below |
-| Sky bluest-decile B/R | 2.63–3.50 | photos 2.07–3.68, Steep 2.17 |
-| Carve edge ÷ inclination | 1.23, angulation 25–33° | reviewed as better than either game reference |
+**Measure these on `shoot.mjs`' canonical framings at DPR 1 (1600×900) with its
+deterministic settle.** The crop rectangles were unrecorded for most of this
+project's life, which made the table unfalsifiable — nobody could reproduce a row
+to check it, and two separate agents wasted a session measuring arbitrary crops
+that read 77–87 L\* against a documented 73.1. Scale a crop by the PNG width
+before applying it to a `--dpr 2` capture (trap 4).
+
+| Metric | Value | Shot / crop (`crop=W:H:X:Y`) | Reference |
+|---|---|---|---|
+| Near-piste sunlit snow L\*/sd | 73.1 / **10.6** | `hero`, `crop=300:120:400:600` | photo 74.8/10.5, Steep 58.3/29.6 |
+| Treeline luminance ÷ adjacent snow | 0.36 | `trees` — **unrecorded** | target band 0.25–0.45 |
+| Distant conifer band RGB | (43,58,68) | `trees` — **unrecorded** | real Megève (40,55,72) |
+| Cast-shadow snow B−R | +21 to +26 | `hero` — **unrecorded** | real photos +24 to +26 |
+| Shadowed rock B/R | ≥ 1.58 | `ridge` — **unrecorded** | trades against a blue cast — see below |
+| Sky bluest-decile B/R | 2.63–3.50 | `hero`, bluest decile by B/R — **unrecorded** | photos 2.07–3.68, Steep 2.17 |
+| Carve edge ÷ inclination | 1.23, angulation 25–33° | `closeup` — **unrecorded** | reviewed as better than either game reference |
+
+The near-piste sd is restated from the original **12.6 to 10.6** (DPR 1; it reads
+11.7 at DPR 2). The rectangle is right — two agents independently measured 73.6
+and 74.1 L\* on it against the documented 73.1 — but the build has gained
+buildings, a T-bar and sponsor boards since the baseline, and an sd recorded
+against different content is a phantom regression waiting for the next agent.
+**If you fill in one of the unrecorded rows, restate its value from the same
+measurement rather than assuming the old number still describes this build.**
 
 Also protected: no ring/annulus artifacts and no chromatic fireflies on snow
 (verify at 8× nearest-neighbour); grooming corduroy stays fine parallel ridging at
