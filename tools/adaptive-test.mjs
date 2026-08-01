@@ -16,10 +16,16 @@
  *  2 force-dpr1      ?adaptive=force at DPR 1 MUST step — proves case 1 is inert
  *                    because of the guard and not because nothing was happening.
  *  3 step-down       At DPR 2 it must leave native and reach its floor.
- *  4 step-up         From the floor, with the budget made easy to meet
- *                    (setTargetFps(30)), it must climb BACK. The old up-test
- *                    demanded 13.33 ms at 60 fps — below the vsync period — so it
- *                    was a one-way ratchet.
+ *  4 step-up-at-30   From the floor, with the budget made easy to meet
+ *                    (setTargetFps(30)), it must climb BACK.
+ *  4b step-up-at-60  THE ONE THAT MATTERS. At the SHIPPED target of 60, settle at
+ *                    the floor and then remove the LOAD (gut every material) —
+ *                    the resolution must climb back. Case 4 passed for two
+ *                    successive builds in which the shipped configuration was
+ *                    still a one-way ratchet, because 30 fps puts the budget
+ *                    ABOVE the refresh period and hides thresholds that are below
+ *                    it. Both failed up-tests (`b*0.80` and then `b*0.95`) were
+ *                    unsatisfiable at 60 and satisfiable at 30.
  *  5 freeze-record   It must not move while perf.recording, nor while frozen.
  *  6 rscale-pin      ?rscale=0.6 must pin (adaptive off). And with adaptive
  *                    forced on as well, a step DOWN from 0.6 must not go UP:
@@ -39,12 +45,20 @@
 import {
   startServer, launch, boot, installPath, sleep, makeArgs,
 } from './frametime.mjs';
+import { KIT_SRC } from './ablation-kit.mjs';
 
-const { num, flag } = makeArgs();
+const { num, flag, arg } = makeArgs();
+// `--only step-up-at-60,step-down` runs a subset. Cases are independent sessions,
+// so a subset is as valid as the whole suite — and on a loaded machine the whole
+// suite is SLOWER than the sum of its parts, because leftover Chrome processes
+// and thermal state carry across cases. Re-run a failure alone before believing it.
+const ONLY = (arg('only', null) || '').split(',').map((x) => x.trim()).filter(Boolean);
+const want = (n) => !ONLY.length || ONLY.includes(n);
 const HOLD = num('hold', 11000);        // long enough for several HOLD_MS windows
 const results = [];
 
 function check(name, pass, detail) {
+  if (!want(name)) return;
   results.push({ name, pass, detail });
   console.log(`  ${pass ? 'PASS' : 'FAIL'}  ${name.padEnd(16)} ${detail}`);
 }
@@ -98,6 +112,13 @@ try {
     const beforeUp = (await s.info()).resolutionScale;
     await sleep(HOLD + 12000);
     const up = await s.info();
+    // PRECONDITION. This case relaxes the BUDGET instead of removing the load, so
+    // it only means anything if the machine can actually meet 30 fps at the floor.
+    // Under accumulated suite load it sometimes cannot (observed p70 50-66 ms
+    // where the unloaded baseline is 34), and then the controller is correctly
+    // refusing to climb into a budget it cannot hold. That is the machine, not a
+    // ratchet — and it is exactly why `step-up-at-60`, which removes the load
+    // instead, is the case that gates this behaviour.
     // The criterion is "did an UP step ever happen", not "is the net scale
     // higher". This branch was DEAD — unsatisfiable at any target above ~48 fps —
     // so its existence is the thing under test. Net scale is not a fair test on a
@@ -105,8 +126,69 @@ try {
     // background load moved p70 from 33 to 75 ms mid-window, which is the
     // controller behaving correctly.
     const rose = up.adaptiveLog.some((e) => e.to > e.from);
-    check('step-up', rose,
-      `target 30fps from scale ${beforeUp}: up-step seen=${rose}, now ${up.resolutionScale}, log ${JSON.stringify(up.adaptiveLog.slice(-4))}`);
+    const lastP70 = up.lastDecision ? up.lastDecision.p70 : Infinity;
+    if (!rose && lastP70 > 34.0) {
+      check('step-up-at-30', false,
+        `PRECONDITION FAILED — frame is ${lastP70} ms p70, so this machine cannot hold even `
+        + '30 fps at the floor. Refusing to climb is correct. Re-run alone; step-up-at-60 is '
+        + 'the case that actually gates the up-path.');
+    } else {
+      check('step-up-at-30', rose,
+        `target 30fps from scale ${beforeUp}: up-step seen=${rose}, now ${up.resolutionScale}, log ${JSON.stringify(up.adaptiveLog.slice(-4))}`);
+    }
+    await s.close();
+  }
+
+  // --- 4b: THE ONE THAT MATTERS — up-step at the SHIPPED target -------------
+  // Relaxing the budget to 30 fps is not the shipped configuration, and a suite
+  // that only tests that passes while the product ships a one-way ratchet. Leave
+  // the budget at 60 and take the LOAD away instead: settle at the floor, then
+  // gut every material so the frame is trivially cheap, and require the
+  // resolution to climb all the way back to native.
+  {
+    const s = await session(2, '?adaptive=1');
+    await sleep(HOLD);
+    const settled = await s.info();
+    await s.page.evaluate((src) => { eval(src)(); window.__abl.on('allscene'); }, KIT_SRC);
+    await sleep(8000);   // let ~120 program relinks finish
+
+    // PRECONDITION, asserted rather than assumed. The whole point of this case is
+    // "the load is gone, so the resolution must come back" — if the machine is so
+    // loaded that even a fully gutted scene cannot hold vsync, the premise is
+    // false and a failure here would be about the machine, not the controller.
+    // Measured independently of the controller, straight off rAF.
+    const gutted = await s.page.evaluate(() => new Promise((res) => {
+      const d = []; let last = 0, n = 0;
+      const f = (t) => {
+        if (last) d.push(t - last);
+        last = t;
+        if (++n < 150) requestAnimationFrame(f);
+        else { d.sort((a, b) => a - b); res(d[Math.floor(d.length * 0.7)]); }
+      };
+      requestAnimationFrame(f);
+    }));
+    if (gutted > 19) {
+      check('step-up-at-60', false,
+        `PRECONDITION FAILED — gutted frame is still ${gutted.toFixed(1)} ms p70, so this machine `
+        + 'cannot hold vsync with no shading work at all. That is machine load, not the controller. '
+        + 'Re-run alone on a quiet machine.');
+    } else {
+      // Climbing the whole ladder is slow by design: every index carries an 8 s
+      // backoff from the down-step that left it, and each rung needs two agreeing
+      // windows. 0.7 -> 1.0 is three rungs. Poll rather than sleep a fixed time so
+      // a pass does not depend on timing luck, and so the failure message can show
+      // WHY it stopped.
+      let back = await s.info();
+      const deadline = Date.now() + 90000;
+      while (Date.now() < deadline && back.resolutionScale < 1) {
+        await sleep(2000);
+        back = await s.info();
+      }
+      check('step-up-at-60', back.resolutionScale === 1,
+        `gutted frame ${gutted.toFixed(1)} ms p70; scale ${settled.resolutionScale} -> ${back.resolutionScale} `
+        + `(${back.megapixels} Mpx), log ${JSON.stringify(back.adaptiveLog.slice(-4))}`
+        + (back.resolutionScale < 1 ? `, stuck at ${JSON.stringify(back.lastDecision)}` : ''));
+    }
     await s.close();
   }
 

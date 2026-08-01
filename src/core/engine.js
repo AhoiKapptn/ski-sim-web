@@ -99,15 +99,30 @@ import * as THREE from 'three';
  *      that ENABLING the feature must not bypass this guard — `?adaptive=1` used
  *      to set the bypass flag as a side effect, so "verified inert at DPR 1" was
  *      vacuous. `?adaptive=force` is the bypass; it exists for testing.
- *   5. It must be able to come back UP. The first cut could not: the up-test
- *      asked for the interval to be 20% UNDER budget, i.e. 13.33 ms at 60 fps,
- *      which is below the vsync period and therefore unsatisfiable while frames
- *      are presenting. That made it a one-way ratchet for any target above
- *      ~48 fps — and combined with trap 1 (this build spontaneously locks to
- *      exactly 30.0 fps, which is never a regression) one spurious mode lock
- *      would have destroyed the resolution permanently. The test is now "is the
- *      frame meeting vsync, and does the measured cost/Mpx say it would still
- *      meet it one step up".
+ *   5. It must be able to come back UP. This took THREE attempts, and the first
+ *      two failed the same way — a threshold below the refresh period, which a
+ *      presented interval can never go under:
+ *        - `p30 < b * 0.80` = 13.33 ms at 60 fps. Unsatisfiable.
+ *        - then `predictMs(...) < b * 0.95` = 15.83 ms. Also unsatisfiable, and
+ *          worse, this was written directly underneath a comment correctly
+ *          diagnosing the first one.
+ *      A third, independent blocker sat behind them: cost observations were never
+ *      aged out, and the reading stored for a ladder index is by construction the
+ *      over-budget value that caused the step down in the first place — measured
+ *      frozen at 25.3 ms for 24 s while the real frame was 16.7 ms.
+ *      All three are fixed, and the up-test is now:
+ *        meeting (p70 <= b*1.02)  AND  affordable  AND  not in backoff,
+ *      confirmed over two consecutive windows, where `affordable` treats a
+ *      vsync-pinned frame as UNKNOWABLE and probes upward rather than inventing
+ *      a prediction from a censored number.
+ *
+ *      This matters far beyond tidiness. Trap 1 says this build spontaneously
+ *      locks to exactly 30.0 fps and that such a reading is never a regression;
+ *      the controller cannot tell that from a genuine 33 ms frame (p70 33.4 /
+ *      p30 32.6 is exactly 2x16.7) and WILL step down on it. Reversibility, not
+ *      detection, is what makes that survivable — so while the up-path was
+ *      broken, one spurious mode lock cost the player 51% of their pixels for the
+ *      rest of the session with no way back short of a reload.
  *
  * Defaults: aa off, scale 1, adaptive ON above MIN_MPX (2.5 Mpx) with a 0.7
  * floor. Independent review measured the quality cost at that floor as −0.3% to
@@ -120,7 +135,12 @@ import * as THREE from 'three';
  *
  *     ?aa=1            multisampled default framebuffer (debug ablations)
  *     ?rscale=0.75     render at 75% linear resolution, and PIN it (adaptive off
- *                      unless ?adaptive= is also given explicitly)
+ *                      unless ?adaptive= is also given explicitly). NOTE: if you
+ *                      DO ask for both, "pin" means only the starting point —
+ *                      `nearestStep` puts the scale on the ladder and the
+ *                      controller may then climb ABOVE the value you gave, up to
+ *                      1.0, once the frame has headroom. Use `?adaptive=0` (the
+ *                      default with ?rscale) for a scale that cannot move.
  *     ?maxdpr=1        clamp device pixel ratio (what headless Chrome sees)
  *     ?adaptive=0      never move the resolution scale
  *     ?adaptive=1      enable (still inert below MIN_MPX)
@@ -255,9 +275,23 @@ export function createEngine(container, opts = {}) {
   }
   const _v2 = new THREE.Vector2();
 
-  // Observed cost per ladder step, for the up-step prediction below.
+  // Observed cost per ladder step, for the up-step prediction below. Timestamped
+  // and aged out: a reading taken under load must not outlive the load.
   const obsMs = new Float32Array(STEPS.length).fill(-1);
   const obsMpx = new Float32Array(STEPS.length).fill(-1);
+  const obsAt = new Float64Array(STEPS.length);
+  const OBS_TTL_MS = 4000;
+  // Backoff per ladder index, set when we step DOWN out of it. Without this the
+  // "probe upward when censored" path below hunts: 0.7 reads 16.7 (censored) ->
+  // step up to 0.8 -> 20 ms -> step down to 0.7 -> repeat every few seconds, and
+  // the image visibly breathes. A step down is evidence that that index was too
+  // expensive a moment ago; respect it for a while, then let it be retried.
+  const upBlockUntil = new Float64Array(STEPS.length);
+  const UP_BACKOFF_MS = 8000;
+  // Refresh period, estimated as the shortest interval seen this session. Used
+  // to recognise a frame that is pinned to vsync and therefore carries no
+  // information about how much headroom it has.
+  let vsyncMs = Infinity;
   // Own log of steps taken. `perf.mark()` cannot be used here: it is a no-op
   // unless `perf.recording`, and the controller returns early whenever perf IS
   // recording, so that call could never once have fired.
@@ -279,20 +313,37 @@ export function createEngine(container, opts = {}) {
   const mpxAt = (i) => mpxNow() * (STEPS[i] * STEPS[i]) / Math.max(resolutionScale * resolutionScale, 1e-6);
 
   /**
-   * Predicted frame cost at `i`, in ms.
+   * Predicted frame cost at `i`, in ms, or `null` when the inputs are censored
+   * and no honest prediction exists.
    *
-   * Prefers a two-point fit through whatever steps have actually been observed
-   * this session — the frame is `fixed + slope * Mpx` and both terms are real
-   * (measured on this build: roughly 8-12 ms fixed and 3-5 ms/Mpx over
-   * 1.4-5.8 Mpx). With fewer than two observations it falls back to assuming
-   * ALL cost is fragment cost, which over-predicts and therefore only ever
-   * makes the controller more reluctant to step up.
+   * Prefers a two-point fit through steps actually observed RECENTLY — the frame
+   * is `fixed + slope * Mpx` and both terms are real (roughly 8-12 ms fixed and
+   * 3-5 ms/Mpx over 1.4-5.8 Mpx on this build).
+   *
+   * TWO THINGS THAT MADE THIS BLOCK EVERY UP-STEP AT THE SHIPPED TARGET:
+   *
+   * 1. Observations never expired. The reading stored at a ladder index is the
+   *    p70 recorded while passing THROUGH it, which is by construction a value
+   *    that was over budget — that is why it stepped down. Measured: `predictUp`
+   *    frozen at 25.3 ms for 24 s while the real frame was 16.7 ms. They now
+   *    carry a timestamp and are ignored after OBS_TTL_MS.
+   *
+   * 2. A vsync-locked `curMs` carries NO information about headroom. At 16.7 ms
+   *    on a 60 Hz display the GPU may have taken 3 ms or 16 ms; the presented
+   *    interval cannot tell you which. Scaling it by the pixel ratio — the old
+   *    fallback — therefore invents a number: 16.7 * (0.8/0.7)^2 = 21.8 ms,
+   *    which exceeds any budget at 60 fps and blocks the step forever. When the
+   *    frame is sitting on the refresh period this returns `null`, meaning
+   *    "unknowable", and the caller probes upward instead. That is what a
+   *    dynamic-resolution ladder is for, and it is safe precisely because the
+   *    down-step is reliable.
    */
-  function predictMs(i, curMs) {
-    if (obsMs[i] >= 0) return obsMs[i];
+  function predictMs(i, curMs, now) {
+    const fresh = (k) => obsMs[k] >= 0 && (now - obsAt[k]) < OBS_TTL_MS;
+    if (fresh(i)) return obsMs[i];
     let lo = -1, hi = -1;
     for (let k = 0; k < STEPS.length; k++) {
-      if (obsMs[k] < 0) continue;
+      if (!fresh(k)) continue;
       if (lo < 0 || obsMpx[k] < obsMpx[lo]) lo = k;
       if (hi < 0 || obsMpx[k] > obsMpx[hi]) hi = k;
     }
@@ -302,6 +353,8 @@ export function createEngine(container, opts = {}) {
       const fixed = obsMs[lo] - slope * obsMpx[lo];
       return Math.max(curMs, fixed + slope * target);
     }
+    // Censored: the only datum is a frame pinned to the refresh period.
+    if (curMs <= vsyncMs * 1.06) return null;
     return curMs * (target / Math.max(mpxNow(), 1e-3));
   }
 
@@ -342,21 +395,35 @@ export function createEngine(container, opts = {}) {
     // distribution regardless of which mode the compositor is holding.
     const p70 = pct(nSamples, 0.70);
     const p30 = pct(nSamples, 0.30);
+    // Shortest interval ever presented ~ the refresh period. Floored so a single
+    // freak sub-millisecond sample cannot poison it.
+    const fastest = pct(nSamples, 0.0);
+    if (fastest >= 4 && fastest < vsyncMs) vsyncMs = fastest;
 
-    // Record what this step actually costs, for predictMs().
+    // Record what this step actually costs, for predictMs(), WITH a timestamp.
     obsMs[idx] = p70;
     obsMpx[idx] = mpxNow();
+    obsAt[idx] = now;
+
+    // The up-step limit must be satisfiable BY A VSYNC-LOCKED FRAME. It was
+    // `b * 0.95` = 15.83 ms at 60 fps, which is below the 16.67 ms refresh
+    // period — the identical error to the `b * 0.80` it replaced, one level
+    // down. It matches the `meeting` test now.
+    const upLimit = b * 1.02;
+    const predUp = idx > 0 ? predictMs(idx - 1, p70, now) : null;
 
     // Every decision is recorded, not just the ones that move, so "why did it not
     // step" is answerable from `gfx.info().lastDecision` instead of by guessing.
     lastDecision = {
       t: Math.round(now), idx, scale: resolutionScale, mpx: +mpxNow().toFixed(3),
       budget: +b.toFixed(2), p70: +p70.toFixed(2), p30: +p30.toFixed(2),
+      vsyncMs: Number.isFinite(vsyncMs) ? +vsyncMs.toFixed(2) : null,
       downTest: p70 > b * 1.12 && p30 > b * 1.05,
       atFloor: idx >= maxStep(),
       meeting: p70 <= b * 1.02,
-      predictUp: idx > 0 ? +predictMs(idx - 1, p70).toFixed(2) : null,
-      predictLimit: +(b * 0.95).toFixed(2),
+      predictUp: predUp === null ? 'censored' : +predUp.toFixed(2),
+      predictLimit: +upLimit.toFixed(2),
+      upBlockedMs: idx > 0 ? Math.max(0, Math.round(upBlockUntil[idx - 1] - now)) : 0,
       upVotes,
     };
 
@@ -373,22 +440,33 @@ export function createEngine(container, opts = {}) {
     // when the lock lifts, the resolution comes back. It did not work before,
     // which is what turned a mode lock into irreversible damage.
     if (p70 > b * 1.12 && p30 > b * 1.05) {
-      if (idx < maxStep()) next = idx + 1;
+      if (idx < maxStep()) {
+        next = idx + 1;
+        // This index was too expensive a moment ago. Don't come straight back.
+        upBlockUntil[idx] = now + UP_BACKOFF_MS;
+      }
       upVotes = 0;
     } else if (idx > 0) {
-      // UP. The old test was `p30 < b * 0.80`, i.e. 13.33 ms at 60 fps — BELOW
-      // the 16.67 ms vsync period, so it was unsatisfiable whenever frames were
-      // presenting and the controller was a one-way ratchet for any target above
-      // ~48 fps. The question is not "is the frame 20% under budget", which
-      // vsync forbids; it is "is the frame MEETING vsync, and would it still
-      // meet it after paying for the extra pixels".
+      // UP. The old test asked for the interval to be 20% UNDER budget
+      // (`b * 0.80` = 13.33 ms at 60 fps), which is below the refresh period and
+      // therefore unsatisfiable while frames are presenting. The question is not
+      // "is the frame under budget", which vsync forbids; it is "is the frame
+      // MEETING vsync, and would it still meet it after paying for the pixels".
       const meeting = p70 <= b * 1.02;
+      // `predUp === null` means the frame is pinned to the refresh period, so
+      // its true cost — and therefore its headroom — is unknowable from the
+      // presented interval. Probing upward is then the only way to find out, and
+      // it is safe because the down-step is reliable and the backoff above stops
+      // it hunting. This is the branch that makes recovery from a spurious vsync
+      // half-rate lock possible at all.
+      const affordable = predUp === null || predUp <= upLimit;
+      const blocked = now < upBlockUntil[idx - 1];
       // TWO consecutive agreeing windows before going up. Stepping up is the
       // risky direction — it can immediately re-trigger a step down, and the
       // observed failure mode was 0.8 -> 0.9 -> 0.8 -> 0.7 inside 12 s when
       // background load moved p70 from 33 to 75 ms. Down-steps stay
       // single-window, because being slow is the condition that matters.
-      if (meeting && predictMs(idx - 1, p70) < b * 0.95) upVotes++;
+      if (meeting && affordable && !blocked) upVotes++;
       else upVotes = 0;
       if (upVotes >= 2) { next = idx - 1; upVotes = 0; }
     }
@@ -467,7 +545,7 @@ export function createEngine(container, opts = {}) {
       if (n === resolutionScale && explicitPixelRatio === null) return gfx.info();
       resolutionScale = n;
       explicitPixelRatio = null;
-      obsMs.fill(-1); obsMpx.fill(-1);
+      obsMs.fill(-1); obsMpx.fill(-1); obsAt.fill(0); upBlockUntil.fill(0);
       nSamples = 0; sampleAt = 0;
       applyResolution();
       return gfx.info();
@@ -524,7 +602,7 @@ export function createEngine(container, opts = {}) {
       // Only ever pull the scale back UP to the new floor; never push it down.
       if (resolutionScale < minScale - 1e-6) {
         resolutionScale = STEPS[maxStep()];
-        obsMs.fill(-1); obsMpx.fill(-1);
+        obsMs.fill(-1); obsMpx.fill(-1); obsAt.fill(0); upBlockUntil.fill(0);
         nSamples = 0; sampleAt = 0;
         applyResolution();
       }
@@ -543,7 +621,7 @@ export function createEngine(container, opts = {}) {
     resetAdaptive() {
       resolutionScale = 1;
       explicitPixelRatio = null;
-      obsMs.fill(-1); obsMpx.fill(-1);
+      obsMs.fill(-1); obsMpx.fill(-1); obsAt.fill(0); upBlockUntil.fill(0);
       nSamples = 0; sampleAt = 0;
       applyResolution();
       return gfx.info();
