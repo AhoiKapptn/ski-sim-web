@@ -110,11 +110,29 @@ import * as THREE from 'three';
  *      aged out, and the reading stored for a ladder index is by construction the
  *      over-budget value that caused the step down in the first place — measured
  *      frozen at 25.3 ms for 24 s while the real frame was 16.7 ms.
- *      All three are fixed, and the up-test is now:
+ *      A FOURTH arrived by yet another route and is the reason the fix below is
+ *      shaped the way it is. The guard that decided "this frame is vsync-pinned,
+ *      so its cost is unknowable" was itself a threshold — a session-monotone
+ *      minimum interval — and it could slide underneath the value it had to be
+ *      above. Observed drifting 16.7 -> 15.1 ms inside a minute, in roughly 2 of
+ *      5 sessions, after which the guard could never fire and the ratchet was
+ *      back, silently, for the rest of the session.
+ *
+ *      That is the same defect three times over, so the fix is to delete the
+ *      CLASS rather than move the number: there is no fallback prediction and
+ *      therefore no threshold guarding one. THE PRESENTED INTERVAL IS ALWAYS
+ *      QUANTISED — the headless begin-frame tick is 8.33 ms and every clean
+ *      interval observed is an integer multiple of it (16.7, 25.0, 33.3, 41.7,
+ *      50.0, 58.3, 66.7) — so it is an upper bound on an unknown cost, always,
+ *      and nothing can be inferred by scaling it. `predictMs` returns a number
+ *      only when it has a fresh measurement of the target rung or a two-point
+ *      fit through fresh measurements; otherwise it says "unknown".
+ *
+ *      All four are fixed, and the up-test is now:
  *        meeting (p70 <= b*1.02)  AND  affordable  AND  not in backoff,
- *      confirmed over two consecutive windows, where `affordable` treats a
- *      vsync-pinned frame as UNKNOWABLE and probes upward rather than inventing
- *      a prediction from a censored number.
+ *      confirmed over two consecutive windows, where `affordable` is true when
+ *      the cost is unknown — i.e. it PROBES, and lets the reliable down-step
+ *      undo a bad guess, rather than inventing a prediction.
  *
  *      This matters far beyond tidiness. Trap 1 says this build spontaneously
  *      locks to exactly 30.0 fps and that such a reading is never a regression;
@@ -123,6 +141,18 @@ import * as THREE from 'three';
  *      detection, is what makes that survivable — so while the up-path was
  *      broken, one spurious mode lock cost the player 51% of their pixels for the
  *      rest of the session with no way back short of a reload.
+ *
+ * KNOWN, ACCEPTED BEHAVIOUR: it takes occasional FALSE DOWN-STEPS on compositor
+ * flutter. Measured on a scene with every material gutted — literally no shading
+ * work at all — it still stepped 1 -> 0.9 on p70 33.3 / p30 25, and 1 -> 0.9 ->
+ * 0.8 on p70 25 / p30 20.8, recovering 9 s and 16 s later. This is trap 1: those
+ * are 4-tick and 3-tick intervals handed out by the compositor, not frame cost,
+ * and the presented interval carries nothing that distinguishes them from real
+ * load. It is self-correcting because the up-path works, which is the whole
+ * argument for the up-path — but a player can see a resolution change that has
+ * no relation to what is on screen. Fixing it properly needs a cost signal that
+ * is not the presented interval, and this build does not have one (the GPU timer
+ * is inflated by submission count; gl.finish() does not drain — see trap 7).
  *
  * Defaults: aa off, scale 1, adaptive ON above MIN_MPX (2.5 Mpx) with a 0.7
  * floor. Independent review measured the quality cost at that floor as −0.3% to
@@ -288,10 +318,6 @@ export function createEngine(container, opts = {}) {
   // expensive a moment ago; respect it for a while, then let it be retried.
   const upBlockUntil = new Float64Array(STEPS.length);
   const UP_BACKOFF_MS = 8000;
-  // Refresh period, estimated as the shortest interval seen this session. Used
-  // to recognise a frame that is pinned to vsync and therefore carries no
-  // information about how much headroom it has.
-  let vsyncMs = Infinity;
   // Own log of steps taken. `perf.mark()` cannot be used here: it is a no-op
   // unless `perf.recording`, and the controller returns early whenever perf IS
   // recording, so that call could never once have fired.
@@ -353,9 +379,29 @@ export function createEngine(container, opts = {}) {
       const fixed = obsMs[lo] - slope * obsMpx[lo];
       return Math.max(curMs, fixed + slope * target);
     }
-    // Censored: the only datum is a frame pinned to the refresh period.
-    if (curMs <= vsyncMs * 1.06) return null;
-    return curMs * (target / Math.max(mpxNow(), 1e-3));
+    // NO FALLBACK. There used to be one — `curMs * (target / mpxNow())`, i.e.
+    // "assume the frame is entirely fragment-bound" — guarded by a test for
+    // whether `curMs` was sitting on the refresh period. Both the fallback and
+    // its guard were wrong, and the guard was the same defect as `b*0.80` and
+    // `b*0.95` arriving by a third route: a threshold that a vsync-locked frame
+    // has to satisfy, derived from a running minimum that could slide underneath
+    // it. Measured drifting 16.7 -> 15.1 inside a minute, and below ~15.7 the
+    // guard could never fire again and the controller became a one-way ratchet
+    // for the rest of the session, silently.
+    //
+    // The fallback is unsound in the first place, which is why the guard existed
+    // and why deleting both is the real fix. THE PRESENTED INTERVAL IS ALWAYS
+    // QUANTISED: in headless Chrome the begin-frame tick is 8.33 ms and every
+    // clean interval observed is an integer multiple of it (16.7, 25.0, 33.3,
+    // 41.7, 50.0, 58.3, 66.7). A frame is never presented at its true cost, only
+    // at the next tick boundary at or after it — so `curMs` is an upper bound on
+    // an unknown value, and scaling an upper bound by a pixel ratio invents a
+    // number. There is no threshold that makes that sound.
+    //
+    // So: with no fresh measurement of the target rung and no two-point fit, the
+    // honest answer is "unknown", and the caller probes. That is a decision the
+    // ladder can undo; a fabricated prediction is not.
+    return null;
   }
 
   /**
@@ -395,11 +441,6 @@ export function createEngine(container, opts = {}) {
     // distribution regardless of which mode the compositor is holding.
     const p70 = pct(nSamples, 0.70);
     const p30 = pct(nSamples, 0.30);
-    // Shortest interval ever presented ~ the refresh period. Floored so a single
-    // freak sub-millisecond sample cannot poison it.
-    const fastest = pct(nSamples, 0.0);
-    if (fastest >= 4 && fastest < vsyncMs) vsyncMs = fastest;
-
     // Record what this step actually costs, for predictMs(), WITH a timestamp.
     obsMs[idx] = p70;
     obsMpx[idx] = mpxNow();
@@ -417,7 +458,9 @@ export function createEngine(container, opts = {}) {
     lastDecision = {
       t: Math.round(now), idx, scale: resolutionScale, mpx: +mpxNow().toFixed(3),
       budget: +b.toFixed(2), p70: +p70.toFixed(2), p30: +p30.toFixed(2),
-      vsyncMs: Number.isFinite(vsyncMs) ? +vsyncMs.toFixed(2) : null,
+      // Reported so the tick structure is visible in a log: every clean value
+      // here is an integer multiple of the ~8.33 ms begin-frame tick.
+      tickMultiple: +(p70 / 8.3333).toFixed(2),
       downTest: p70 > b * 1.12 && p30 > b * 1.05,
       atFloor: idx >= maxStep(),
       meeting: p70 <= b * 1.02,
@@ -453,12 +496,24 @@ export function createEngine(container, opts = {}) {
       // "is the frame under budget", which vsync forbids; it is "is the frame
       // MEETING vsync, and would it still meet it after paying for the pixels".
       const meeting = p70 <= b * 1.02;
-      // `predUp === null` means the frame is pinned to the refresh period, so
-      // its true cost — and therefore its headroom — is unknowable from the
-      // presented interval. Probing upward is then the only way to find out, and
-      // it is safe because the down-step is reliable and the backoff above stops
-      // it hunting. This is the branch that makes recovery from a spurious vsync
-      // half-rate lock possible at all.
+      // ┌─────────────────────────────────────────────────────────────────────┐
+      // │ `predUp === null ||` IS THE LOAD-BEARING CLAUSE AT 60 Hz. DO NOT     │
+      // │ REMOVE IT. Every up-step at the shipped 60 fps target goes through   │
+      // │ it and never evaluates `upLimit` at all, because a frame that is     │
+      // │ `meeting` at 60 fps is by definition pinned to the tick and so has   │
+      // │ no prediction. `upLimit` only bites below ~59 fps.                   │
+      // │                                                                      │
+      // │ Consequence for anyone refactoring: reverting `upLimit` from b*1.02  │
+      // │ back to b*0.95 leaves the whole regression suite GREEN while         │
+      // │ restoring the ratchet for every target under 59 fps. Verified by     │
+      // │ mutation. The case that catches THIS clause is `step-up-at-60`;      │
+      // │ mutating it to `predUp !== null && predUp <= upLimit` turns that     │
+      // │ case red with the original round-2 signature.                        │
+      // └─────────────────────────────────────────────────────────────────────┘
+      // null means "no recent measurement of that rung and no fit", i.e. the
+      // cost there is genuinely unknown — see predictMs. Probing is the only way
+      // to find out, and it is safe because the down-step is reliable and the
+      // backoff stops it hunting.
       const affordable = predUp === null || predUp <= upLimit;
       const blocked = now < upBlockUntil[idx - 1];
       // TWO consecutive agreeing windows before going up. Stepping up is the

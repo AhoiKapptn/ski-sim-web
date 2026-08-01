@@ -18,6 +18,12 @@
  *  3 step-down       At DPR 2 it must leave native and reach its floor.
  *  4 step-up-at-30   From the floor, with the budget made easy to meet
  *                    (setTargetFps(30)), it must climb BACK.
+ *  4c recover-after-churn
+ *                    Recovery must survive an ERRATIC interval history. The
+ *                    censored test was once derived from a session-monotone
+ *                    minimum interval, which one short rAF tick lowered forever —
+ *                    after which the ratchet was back, silently. Churns the frame
+ *                    time (gut/un-gut x3) before demanding full recovery.
  *  4b step-up-at-60  THE ONE THAT MATTERS. At the SHIPPED target of 60, settle at
  *                    the floor and then remove the LOAD (gut every material) —
  *                    the resolution must climb back. Case 4 passed for two
@@ -127,7 +133,16 @@ try {
     // controller behaving correctly.
     const rose = up.adaptiveLog.some((e) => e.to > e.from);
     const lastP70 = up.lastDecision ? up.lastDecision.p70 : Infinity;
-    if (!rose && lastP70 > 34.0) {
+    // Two DIFFERENT preconditions, and conflating them reports the wrong cause.
+    // If the controller never sampled at all the page was rAF-throttled — with
+    // `lastDecision === null` the p70 test sees Infinity and would blame the
+    // machine for being slow when in fact it was never scheduled.
+    if (!rose && up._nSamples === 0) {
+      check('step-up-at-30', false,
+        'PRECONDITION FAILED — the controller never accumulated a window '
+        + '(_nSamples 0), so the page was rAF-throttled, not slow. Another headless '
+        + 'Chrome was almost certainly competing. Re-run with --only.');
+    } else if (!rose && lastP70 > 34.0) {
       check('step-up-at-30', false,
         `PRECONDITION FAILED — frame is ${lastP70} ms p70, so this machine cannot hold even `
         + '30 fps at the floor. Refusing to climb is correct. Re-run alone; step-up-at-60 is '
@@ -187,6 +202,59 @@ try {
       check('step-up-at-60', back.resolutionScale === 1,
         `gutted frame ${gutted.toFixed(1)} ms p70; scale ${settled.resolutionScale} -> ${back.resolutionScale} `
         + `(${back.megapixels} Mpx), log ${JSON.stringify(back.adaptiveLog.slice(-4))}`
+        + (back.resolutionScale < 1 ? `, stuck at ${JSON.stringify(back.lastDecision)}` : ''));
+    }
+    await s.close();
+  }
+
+  // --- 4c: erratic frame-time history must not poison recovery --------------
+  // REGRESSION for the fourth incarnation of the ratchet. The censored test used
+  // to be "is p70 near the session-minimum interval", and that minimum was a
+  // monotone accumulator: one short rAF interval lowered it forever, and once it
+  // sat below the real tick the test could never fire again and the controller
+  // was a one-way ratchet for the rest of the session. Nothing in the suite
+  // exercised a session whose interval history was erratic BEFORE recovery was
+  // needed.
+  //
+  // So: churn the frame time hard — gut and un-gut repeatedly, which swings the
+  // interval between the 16.7 ms floor and 30-60 ms and drags a running minimum
+  // down — and only then remove the load for good and demand full recovery.
+  {
+    const s = await session(2, '?adaptive=1');
+    await sleep(HOLD);
+    await s.page.evaluate((src) => { eval(src)(); }, KIT_SRC);
+    for (let i = 0; i < 3; i++) {
+      await s.page.evaluate(() => window.__abl.on('allscene'));
+      await sleep(5000);
+      await s.page.evaluate(() => window.__abl.allOff());
+      await sleep(5000);
+    }
+    const churned = await s.info();
+    await s.page.evaluate(() => window.__abl.on('allscene'));
+    await sleep(8000);
+    const gutted = await s.page.evaluate(() => new Promise((res) => {
+      const d = []; let last = 0, n = 0;
+      const f = (t) => {
+        if (last) d.push(t - last);
+        last = t;
+        if (++n < 150) requestAnimationFrame(f);
+        else { d.sort((a, b) => a - b); res(d[Math.floor(d.length * 0.7)]); }
+      };
+      requestAnimationFrame(f);
+    }));
+    if (gutted > 19) {
+      check('recover-after-churn', false,
+        `PRECONDITION FAILED — gutted frame is ${gutted.toFixed(1)} ms p70; machine too loaded.`);
+    } else {
+      let back = await s.info();
+      const deadline = Date.now() + 90000;
+      while (Date.now() < deadline && back.resolutionScale < 1) {
+        await sleep(2000);
+        back = await s.info();
+      }
+      check('recover-after-churn', back.resolutionScale === 1,
+        `after 3 gut/un-gut cycles (scale was ${churned.resolutionScale}): -> ${back.resolutionScale} `
+        + `(${back.megapixels} Mpx), gutted p70 ${gutted.toFixed(1)} ms`
         + (back.resolutionScale < 1 ? `, stuck at ${JSON.stringify(back.lastDecision)}` : ''));
     }
     await s.close();
