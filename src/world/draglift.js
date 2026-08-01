@@ -44,11 +44,54 @@ const lerp = (a, b, t) => a + (b - a) * t;
 const _tmpA = new THREE.Vector3();
 
 // --- placement ---------------------------------------------------------------
-// Metres from the CHAIR line to the T-bar line. The chair runs 68 m to the
-// skier's right of the corridor centreline, so +98 puts this 30 m to the LEFT
-// of it: inside the 46 m cleared corridor (no tree grows through a pylon) and
-// clear of the 38-43 m marker line and the snow-gun row at 41-47 m.
+/**
+ * Metres from the CHAIR line to the T-bar line. The chair runs 68 m to the
+ * skier's right of the corridor centreline, so this puts the T-bar
+ * `OFFSET_FROM_CHAIR - 68` metres to the LEFT of it: 30.0 m, inside the 46 m
+ * cleared corridor, clear of the marker line at 38-43 m.
+ *
+ * ### Why it is not outside the piste furniture, which is where it belongs
+ *
+ * It should be. A drag lift standing inboard of the marker line is in the middle
+ * of the groomed run and nobody builds one there. The problem is that there is
+ * nowhere else on this mountain to put it. `terrain.js` and `scatter.js` derive
+ * the treeline from `PISTE_HALF`, so the cleared ground ENDS at 46 m and the
+ * forest starts immediately: swept in 2 m steps from +24 to +112 m off the
+ * centreline, the nearest scatter instance to the rider's own path measures
+ *
+ *   +24 m  13.2 m (markers)      +52 m   0.5 m (drift)
+ *   +30 m   7.5 m (markers)      +64 m   0.9 m (drift, 2 trees inside 5 m)
+ *   +40 m   0.9 m (markers)      +76 m   0.2 m (tree, 6 trees inside 5 m)
+ *
+ * At the +62 m the obvious reading of "outside the furniture" asks for, the line
+ * runs 2.42 m from a conifer trunk, 0.82 m from a snow drift, and the rope at
+ * 3.5-6.4 m goes through crowns. That is not a lift outside the piste, it is a
+ * lift inside the wood — strictly worse than a plinth beside a run, and it
+ * cannot be fixed from this file: cutting a lane means changing the tree mask,
+ * which lives in scatter.js.
+ *
+ * So the line stays at the widest offset that is genuinely clear, and the thing
+ * that was actually in the skier's way — the pylons standing ON the ride line —
+ * is fixed below instead.
+ */
 const OFFSET_FROM_CHAIR = 98;
+/**
+ * Metres the pylons stand to the side of the line the rider is dragged along,
+ * along the plan normal (which points inboard, towards the corridor centreline).
+ *
+ * They used to stand ON it. `sample(pyS[i])` is exactly the point `resort.js`
+ * puts the rider on, so every one of the nine plinths — 1.24 x 1.24 m of
+ * concrete standing 0.40 m proud of the snow — was something the rider passed
+ * through every ~22 s, and at progress 0.25 and 0.50 the mast filled the centre
+ * of frame with the rider entirely behind it.
+ *
+ * Which is not how a drag lift is built anyway: the mast stands beside the
+ * track and a cross-arm reaches back in over both ropes. Inboard rather than
+ * outboard because that is the side with room — measured, the masts clear the
+ * nearest piste marker by 9.9 m there against 5.1 m on the other side — and
+ * because it keeps the arm to 2.95 m instead of 4.45 m.
+ */
+const PYLON_OFFSET = 2.6;
 const Z_BOTTOM = -1080;
 const Z_TOP = -400;
 const N_PYLON = 9;
@@ -321,27 +364,35 @@ export function createDragLift(scene, terrain, opts = {}) {
     dirAt(pyS[i], dTmp);
     const nx = -dTmp.z, nz = dTmp.x;          // plan normal, +x-ish side
     const yaw = Math.atan2(dTmp.x, dTmp.z);
+    // The mast stands PYLON_OFFSET out, past the return strand; the ropes stay
+    // where they were, so the arm now reaches back across both of them (-n) and
+    // the rider's lane is clear ground.
+    const mx = p.x + nx * PYLON_OFFSET, mz = p.z + nz * PYLON_OFFSET;
+    const my = terrain.height(mx, mz);
 
     // footing: a plinth standing proud of the snow, like the chair's
-    b.box(p.x, p.y - 0.15, p.z, 0.62, 0.55, 0.62, yaw, CONCRETE);
+    b.box(mx, my - 0.15, mz, 0.62, 0.55, 0.62, yaw, CONCRETE);
     // mast, leaning very slightly uphill the way a drag pylon does
-    _a.set(p.x, p.y + 0.25, p.z);
-    _b2.set(p.x + dTmp.x * 0.28, ry + 0.32, p.z + dTmp.z * 0.28);
+    _a.set(mx, my + 0.25, mz);
+    _b2.set(mx + dTmp.x * 0.28, ry + 0.32, mz + dTmp.z * 0.28);
     b.tube(_a, _b2, 0.115, STEEL, 8);
-    // top arm out over the two strands, plus a diagonal stay back to the mast
-    const armEnd = new THREE.Vector3(_b2.x + nx * (STRAND + 0.35), ry + 0.28, _b2.z + nz * (STRAND + 0.35));
+    // top arm in over the two strands, plus a diagonal stay back to the mast
+    const reach = PYLON_OFFSET + 0.35;
+    const armEnd = new THREE.Vector3(_b2.x - nx * reach, ry + 0.28, _b2.z - nz * reach);
     b.tube(_b2, armEnd, 0.075, STEEL, 6);
-    b.tube(new THREE.Vector3(p.x + dTmp.x * 0.1, ry - 1.5, p.z + dTmp.z * 0.1),
+    b.tube(new THREE.Vector3(mx + dTmp.x * 0.1, ry - 1.5, mz + dTmp.z * 0.1),
       new THREE.Vector3(lerp(_b2.x, armEnd.x, 0.75), ry + 0.28, lerp(_b2.z, armEnd.z, 0.75)),
       0.042, STEEL, 5);
-    // the two sheaves, axes across the line
+    // the two sheaves, axes across the line, hanging under the arm at the
+    // strand offsets — which are measured from the LINE, not from the mast
     for (const k of [0, 1]) {
-      const cx = _b2.x + nx * (STRAND * k), cz = _b2.z + nz * (STRAND * k);
+      const cx = p.x + nx * (STRAND * k) + dTmp.x * 0.28;
+      const cz = p.z + nz * (STRAND * k) + dTmp.z * 0.28;
       b.wheel(new THREE.Vector3(cx, ry, cz), new THREE.Vector3(nx, 0, nz), 0.30, STEEL_L, 12);
       b.box(cx, ry + 0.18, cz, 0.10, 0.14, 0.24, yaw, STEEL);
     }
     // a numbered pylon plate, because every real pylon has one
-    b.box(p.x + nx * 0.22, p.y + 2.1, p.z + nz * 0.22, 0.02, 0.22, 0.16, yaw, SIGN);
+    b.box(mx + nx * 0.22, my + 2.1, mz + nz * 0.22, 0.02, 0.22, 0.16, yaw, SIGN);
   }
 
   // rope: two strands as swept tubes over the pylon tops
