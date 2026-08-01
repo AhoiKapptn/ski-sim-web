@@ -70,6 +70,21 @@ const SYSTEMS = [terrain, sky, scatter, draglift, skier, spray, tracks, postfx, 
 const SUSPENDED = new Set([skier, spray, tracks]);
 const rideSuspends = () => state.mode === 'lift' || state.mode === 'hut';
 
+/**
+ * The one subsystem that has to see the RIDE's clock rather than the wall clock.
+ *
+ * A chairlift is honest at 4.6 m/s and unwatchable at 4 km, so `resort` runs the
+ * middle of a ride as a timelapse (`resort.timeScale`). The chairs coming the
+ * other way are scatter's, integrated from its own `chairPhase += dt * 4.6`, and
+ * the whole reason resort copies that 4.6 is to stay in step with them. Scaling
+ * one and not the other would put the player's chair through the down-side line
+ * at eight times the closing speed — so scatter gets the same clock.
+ *
+ * Nothing else does. The clouds, the wind, the audio and the HUD's smoothing all
+ * want real seconds, and none of them are in shot next to a moving reference.
+ */
+const dtFor = (sys, dt) => (sys === scatter ? dt * resort.timeScale : dt);
+
 // Same list, named, for per-subsystem frame-time attribution. `update()` walks
 // SYSTEMS on the hot path and STEPS only while `perf` is recording, so the
 // instrumented order is identical to the live one by construction.
@@ -117,7 +132,7 @@ function update(dt) {
   const skip = rideSuspends();
   for (const s of SYSTEMS) {
     if (skip && SUSPENDED.has(s)) continue;
-    s.update?.(dt, state);
+    s.update?.(dtFor(s, dt), state);
   }
 }
 
@@ -143,7 +158,7 @@ function updateInstrumented(dt) {
   t1 = performance.now(); perf.step(3, t1 - t0); t0 = t1;
   const skip = rideSuspends();
   for (let i = 0; i < SYSTEMS.length; i++) {
-    if (!(skip && SUSPENDED.has(SYSTEMS[i]))) SYSTEMS[i].update?.(dt, state);
+    if (!(skip && SUSPENDED.has(SYSTEMS[i]))) SYSTEMS[i].update?.(dtFor(SYSTEMS[i], dt), state);
     t1 = performance.now(); perf.step(4 + i, t1 - t0); t0 = t1;
   }
 }
@@ -672,7 +687,9 @@ const WARM_AT = new Set([30, 120, 300, 600]);
  * having to write a puppeteer script:
  *
  *   ?resort=hut&drink=beer          sitting in the restaurant with a beer
+ *   ?resort=hut&drink=beer&beat=1   ...and play the look across at the counter
  *   ?resort=lift&at=mid&progress=.4 on the chair, 40% up from the mid-station
+ *   ?resort=lift&to=summit          the full line rather than the mid-station leg
  *   ?resort=drag&progress=.45       on the T-bar
  *   ?resort=tbar                    standing at the T-bar with the prompt up
  *
@@ -687,8 +704,10 @@ function applyStartMode() {
   if (!which) return;
   const o = {};
   if (q.has('at')) o.at = q.get('at');
+  if (q.has('to')) o.to = q.get('to');
   if (q.has('progress')) o.progress = +q.get('progress');
   if (q.has('drink')) o.drink = q.get('drink');
+  if (q.has('beat')) o.beat = true;
   if (which === 'lift' || which === 'drag' || which === 'hut' || which === 'ski') resort.enter(which, o);
   else resort.goto(which);
 }

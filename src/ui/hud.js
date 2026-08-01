@@ -277,8 +277,17 @@ const CSS = `
 #alp-hud .ride .rail2 u{position:absolute;top:-2px;width:1.4px;height:7px;
   transform:translateX(calc(var(--rp,0) * clamp(160px,20vw,300px)));
   background:rgba(var(--ink),.95);box-shadow:0 0 6px rgba(var(--accent),.6)}
-#alp-hud .ride .h{font-size:clamp(8px,1.05vh,11px);font-weight:600;letter-spacing:.2em;
-  text-transform:uppercase;color:rgba(var(--ink),.62);text-shadow:var(--halo)}
+
+/* The ride's controls line lives at the BOTTOM, with the contact prompts.
+   It shipped at the top of the frame at 0.62 opacity and clamp(8px,1.05vh,11px),
+   i.e. the escape hatch from a long ride was the least legible thing on screen,
+   in the one place this game never trains you to look. Everything that tells the
+   player what a key does is now in the same band. */
+#alp-hud .ridehint{position:absolute;left:50%;bottom:clamp(56px,8.8vh,108px);
+  transform:translate(-50%,calc(6px - 6px*var(--ride)));
+  font-size:clamp(10px,1.3vh,14px);font-weight:600;letter-spacing:.18em;
+  text-transform:uppercase;white-space:nowrap;opacity:calc(var(--ride) * .92);
+  color:rgba(var(--ink),.86);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.55)}
 
 /* ----------------------------------------------------------------- card --- */
 /* The bar card. Anchored bottom-left over the empty part of the interior shot
@@ -359,8 +368,8 @@ export function createHUD(opts = {}) {
     <div class="ride">
       <span class="n" id="alp-rn">Chairlift</span>
       <span class="rail2"><b></b><i></i><u></u></span>
-      <span class="h" id="alp-rh"></span>
     </div>
+    <div class="ridehint" id="alp-rh"></div>
     <div class="prompt">
       <span class="kb" id="alp-pk">E</span>
       <span class="tx" id="alp-pt">Ride the chairlift</span>
@@ -403,6 +412,7 @@ export function createHUD(opts = {}) {
   let dUI = 1, dPrompt = 0, dRide = 0, dCard = 0, dWarmVis = 0;
   let lastPromptTx = '', lastPromptK = '', lastPromptSb = '', lastRideN = '', lastRideH = '';
   let lastOpts = '', lastNote = '', lastCard = '';
+  let lastCR = '', lastCD = '', lastCX2 = '', lastCA = '';
   const w = {
     live: -1, heat: -1, edge: -9, carve: -1, p: -1, kick: -1, land: -1,
     ui: -1, veil: -1, glow: -1, prompt: -1, ride: -1, card: -1, warm: -1, warmvis: -1, rp: -1,
@@ -571,12 +581,21 @@ export function createHUD(opts = {}) {
     setVar('card', dCard);
     if (ht) {
       if (ht.name !== lastCard) { lastCard = ht.name; elCN.textContent = ht.name; }
+      // Diffed like everything else in this file. The run these four report is
+      // frozen the moment the door shuts — `lastRun` in resort.js — so writing
+      // four innerHTML/textContent per frame was rewriting four constants sixty
+      // times a second for the whole time the player sat there, in the block
+      // whose own docstring says every text node is diffed before it is written.
       const r = ht.run || { time: 0, distance: 0, top: 0, air: 0 };
-      elCR.textContent = fmtTime(r.time || 0);
       const dm = r.distance || 0;
-      elCD.innerHTML = (dm < 1000 ? Math.round(dm) + '<s>m</s>' : (dm / 1000).toFixed(2) + '<s>km</s>');
-      elCX.innerHTML = Math.round((r.top || 0) * 3.6) + '<s>km/h</s>';
-      elCA.innerHTML = (r.air || 0).toFixed(2) + '<s>s</s>';
+      const cr = fmtTime(r.time || 0);
+      const cd = (dm < 1000 ? Math.round(dm) + '<s>m</s>' : (dm / 1000).toFixed(2) + '<s>km</s>');
+      const cx = Math.round((r.top || 0) * 3.6) + '<s>km/h</s>';
+      const ca = (r.air || 0).toFixed(2) + '<s>s</s>';
+      if (cr !== lastCR) { lastCR = cr; elCR.textContent = cr; }
+      if (cd !== lastCD) { lastCD = cd; elCD.innerHTML = cd; }
+      if (cx !== lastCX2) { lastCX2 = cx; elCX.innerHTML = cx; }
+      if (ca !== lastCA) { lastCA = ca; elCA.innerHTML = ca; }
       const opts = (ht.choices || []).map((c) => `<div class="opt${ht.drink && c.label.toLowerCase() === ht.drink ? ' on' : ''}">`
         + `<span class="kb">${c.key}</span><span class="l">${c.label}</span><span class="n">${c.note || ''}</span></div>`).join('')
         + `<div class="opt"><span class="kb">E</span><span class="l">Back outside</span></div>`;

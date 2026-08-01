@@ -16,8 +16,20 @@ const OUT = path.resolve(ROOT, process.argv[2] || 'shots/resort');
 const W = +(process.argv[3] || 1600), H = +(process.argv[4] || 900);
 
 const SHOTS = [
+  // A0 — the boarding move, frame by frame. `instant: false` keeps the 'board'
+  // phase, which is the whole point: this is the transition, not the seat.
+  // Note the 12 render steps every shot takes after `settle`: the step counts
+  // here are the labelled time MINUS 0.20 s.
+  ['board-020s', "h.debug.resort.goto('chair-mid'); h.step(1/60, 30); h.debug.resort.enter('lift', { at: 'mid', instant: false });", 0],
+  ['board-045s', "h.debug.resort.goto('chair-mid'); h.step(1/60, 30); h.debug.resort.enter('lift', { at: 'mid', instant: false }); h.step(1/60, 15);", 0],
+  ['board-070s', "h.debug.resort.goto('chair-mid'); h.step(1/60, 30); h.debug.resort.enter('lift', { at: 'mid', instant: false }); h.step(1/60, 30);", 0],
+  ['board-100s', "h.debug.resort.goto('chair-mid'); h.step(1/60, 30); h.debug.resort.enter('lift', { at: 'mid', instant: false }); h.step(1/60, 48);", 0],
+  ['board-130s', "h.debug.resort.goto('chair-mid'); h.step(1/60, 30); h.debug.resort.enter('lift', { at: 'mid', instant: false }); h.step(1/60, 66);", 0],
   // A — the chair
   ['chair-board', "h.debug.resort.goto('chair-mid'); h.step(1/60, 30); h.debug.resort.enter('lift', { at: 'mid' });", 150],
+  // the one choice on the way up: the ride ends at the mid-station unless you
+  // say otherwise, so this is the approach to it from the valley station
+  ['chair-choice', "h.debug.resort.enter('lift', { progress: 0.505 });", 150],
   ['chair-ride', "h.debug.resort.enter('lift', { at: 'mid', progress: 0.35 });", 150],
   ['chair-valley', "h.debug.resort.enter('lift', { progress: 0.06 });", 150],
   ['chair-look-back', "h.debug.resort.enter('lift', { at: 'mid', progress: 0.5 }); window.__inputOverride = { steer: 1 };", 220],
@@ -33,7 +45,12 @@ const SHOTS = [
   ['hut-inside', "window.__inputOverride = null; h.debug.resort.enter('hut');", 90],
   ['hut-coffee', "h.debug.resort.enter('hut', { drink: 'coffee' });", 90],
   ['hut-beer', "h.debug.resort.enter('hut', { drink: 'beer' });", 130],
-  ['hut-look', "h.debug.resort.enter('hut', { drink: 'coffee' }); window.__inputOverride = { steer: -1 }; h.step(1/60, 120);", 60],
+  ['hut-look-l', "h.debug.resort.enter('hut', { drink: 'coffee' }); window.__inputOverride = { steer: -1 }; h.step(1/60, 120);", 60],
+  ['hut-look-r', "h.debug.resort.enter('hut', { drink: 'coffee' }); window.__inputOverride = { steer: 1 }; h.step(1/60, 120);", 60],
+  // the counter you ordered from: `beat: true` plays the look across, and 1.1 s
+  // in is the hold on the bar
+  ['hut-bar', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20); h.debug.resort.enter('hut', { drink: 'coffee', beat: true }); h.step(1/60, 60);", 0],
+  ['hut-exit', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20); window.__inputOverride = { action: true }; h.step(1/60, 2); window.__inputOverride = null; h.step(1/60, 60);", 0],
   ['hut-prompt', "h.debug.resort.enter('ski'); window.__inputOverride = { brake: 1 }; h.debug.resort.goto('hut');", 26],
   ['chair-prompt', "h.debug.resort.enter('ski'); window.__inputOverride = { brake: 1 }; h.debug.resort.goto('chair-mid');", 26],
 ];

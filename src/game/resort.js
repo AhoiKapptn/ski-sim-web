@@ -63,9 +63,12 @@ const ease = (t) => t * t * (3 - 2 * t);
 
 // --- timings -----------------------------------------------------------------
 const T_BOARD = 1.45;      // chase view -> seated on the chair
+const T_SHOW_SKIER = 0.62; // ...of which the rider is still standing on the snow
+const T_BOARD_HOLD = 0.42; // ...and of which the camera has not moved yet (fraction)
 const T_OFF = 1.05;        // seated -> chase view, after the unload
 const T_DOOR = 0.42;       // veil in / out through a doorway
 const T_SIP = 1.30;        // the drink comes up to the lens
+const T_BAR_BEAT = 2.40;   // the look across at the counter when a drink is ordered
 
 // --- the chair ---------------------------------------------------------------
 /**
@@ -75,8 +78,38 @@ const T_SIP = 1.30;        // the drink comes up to the lens
  * number in this file that is a copy, and it is deliberately not hidden behind
  * an abstraction — if the lift is ever re-geared, this line is the second half
  * of that change.
+ *
+ * The number being right is only half of staying in phase; the other half is
+ * integrating it over the SAME dt scatter does. `scatter.update` does not clamp
+ * dt and this file used to clamp to 0.1 before advancing `rideS`, so any caller
+ * stepping in coarse slices desynchronised the two — measured, `harness.step(0.25)`
+ * for 40 frames moved the player 18.35 m and scatter 46 m, 25.5 m of drift (70%
+ * of chair spacing) in ten seconds of sim. main.js clamps to 0.05 before either
+ * sees it, so this was never reachable live, but every capture tool in tools/
+ * can reach it. The ride therefore integrates the RAW dt (see `update`), and the
+ * clamp survives only for the eases and smoothing, which genuinely do want it.
  */
 const CHAIR_SPEED = 4.6;
+
+// --- ride time compression ---------------------------------------------------
+/**
+ * A chairlift is honest at 4.6 m/s and unwatchable at 4 km. The full line is
+ * 3998.8 m — **867 seconds** — and only the first couple of hundred metres carry
+ * it: the village, the towers, the down-side chairs going past. After that it is
+ * six unbroken minutes of snow with a girder across the bottom third.
+ *
+ * The honest fix is not a faster lift, it is a timelapse: REAL time while there
+ * is something to look at — leaving a station, arriving at the next one — and up
+ * to LAPSE_MAX in between. The scale is applied to `rideS` here AND, through
+ * `resort.timeScale` in main.js, to the dt `scatter.update` integrates, so the
+ * chairs coming the other way stay exactly in step at every speed. That is the
+ * whole reason CHAIR_SPEED is 4.6 in the first place; a compression that moved
+ * only the player would throw it away.
+ */
+const LAPSE_HEAD = 92;     // metres of real-time travel after boarding (20 s)
+const LAPSE_TAIL = 78;     // ...and before the unload (17 s)
+const LAPSE_RAMP = 120;    // metres to wind up and down over
+const LAPSE_MAX = 8;       // 36.8 m/s at full lapse
 /** Seat pad below the cable, from scatter.js' chair geometry (grip at y = 0). */
 const SEAT_DROP = 2.92;
 const EYE_UP = 1.06;       // seated eye above the pad
@@ -88,6 +121,23 @@ const BOARD_MARGIN = 9;    // ...and how far past the bottom one it picks you up
 const REACH_LIFT = 26;     // metres, boarding zone radius
 const REACH_DOOR = 15;
 const BOARD_SPEED = 10;    // m/s — above this you are asked to scrub first
+/**
+ * Minimum seconds between two orders at the bar. `controls.js` publishes `pick`
+ * as a LEVEL, and this file used to guard only "not already drinking that", so
+ * alternating 1 and 2 for two seconds pushed 120 entries into `state.runs`, fired
+ * 120 `sip()` one-shots and advanced the sun by 0.74 of a day — measured. The
+ * edge test below is the real fix; this is the belt to that braces, and it also
+ * stops a held key re-ordering the instant you switch drinks.
+ */
+const PICK_COOLDOWN = 1.0;
+/**
+ * The sun may not be driven past closing time. Every number in CLAUDE.md's
+ * quality-baseline table is measured at tod 0.302, and `serve()` is the only
+ * thing in the game that moves it: 26 beers took it to 0.822 and the scene mean
+ * from 176.8 to 44.0 — a night scene reachable by holding a key. A stop still
+ * costs time (that is the point), but the day ends when the last lift does.
+ */
+const TOD_LAST_LIFT = 0.66;
 
 // --- warmth ------------------------------------------------------------------
 // A full tank is ~11 minutes of skiing, which is 3-6 runs: long enough that it
@@ -270,6 +320,72 @@ function buildInterior(b) {
     dst.quad(q[3], q[0], q[4], q[7], col);      // -a
   };
 
+  /**
+   * A swept 4-sided tube through a polyline given in the room's (a, c, y) frame.
+   *
+   * This exists because BX cannot describe anything that is not axis-aligned in
+   * the room, and the ONE piece of furniture that is not — the mug handle — was
+   * built out of world-axis AABBs around pairs of arc points, the exact bug BX's
+   * own comment says was swept out of the tables and benches. At this hut's yaw
+   * that turned a 6 cm arc of ceramic into a staircase of little slabs pointing
+   * the wrong way.
+   */
+  const TUBE = (dst, pts, r, col) => {
+    const W3 = pts.map(([a, c, y]) => P(a, c, y));
+    const d = new THREE.Vector3(), u = new THREE.Vector3(), v = new THREE.Vector3();
+    const up = new THREE.Vector3();
+    const ring = (o) => {
+      const out = [];
+      for (let k = 0; k < 4; k++) {
+        const t = k * Math.PI * 0.5;
+        const ct = Math.cos(t), st = Math.sin(t);
+        out.push(new THREE.Vector3(o.x + u.x * ct + v.x * st, o.y + u.y * ct + v.y * st,
+          o.z + u.z * ct + v.z * st));
+      }
+      return out;
+    };
+    for (let i = 0; i < W3.length - 1; i++) {
+      const A = W3[i], B = W3[i + 1];
+      d.subVectors(B, A);
+      if (d.lengthSq() < 1e-10) continue;
+      d.normalize();
+      up.set(0, 1, 0);
+      if (Math.abs(d.y) > 0.9) up.set(1, 0, 0);
+      u.crossVectors(up, d).normalize().multiplyScalar(r);
+      v.crossVectors(d, u).normalize().multiplyScalar(r);
+      const r0 = ring(A), r1 = ring(B);
+      for (let k = 0; k < 4; k++) dst.quad(r0[k], r0[(k + 1) % 4], r1[(k + 1) % 4], r1[k], col);
+    }
+  };
+
+  /**
+   * Emit a quad with its normal facing INTO the room, whichever order its
+   * corners were given in.
+   *
+   * Every surface of the shell is a single-sided quad, and three of them were
+   * wound the wrong way: the +c wall, the -a wall and — the one that matters —
+   * the FLOOR, whose 22 boards and 22 seam lines all faced down. From inside
+   * they did not exist, so the room's timber floor was actually the snow outside
+   * showing through, and the -a end of the room was open onto the terrace.
+   *
+   * It survived because nothing could ever look at it: the camera is fixed, and
+   * the "A/D look around" that would have swung onto the missing wall was
+   * reading a channel the mode machine zeroes (see updateHut). The moment that
+   * was fixed, the hole was the first thing in frame. `side: DoubleSide` is not
+   * the fix — `bakeInterior` bakes the lighting into the vertex colours off
+   * these same normals, so a back-facing floor comes back lit from underneath.
+   */
+  const CTR = P(0, 0, (y0 + y1) * 0.5);
+  const _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3();
+  const _nn = new THREE.Vector3(), _to = new THREE.Vector3();
+  const FACE = (dst, p0, p1, p2, p3, col) => {
+    _e1.subVectors(p1, p0); _e2.subVectors(p2, p0);
+    _nn.crossVectors(_e1, _e2);
+    _to.subVectors(CTR, p0);
+    if (_nn.dot(_to) >= 0) dst.quad(p0, p1, p2, p3, col);
+    else dst.quad(p3, p2, p1, p0, col);
+  };
+
   // ---- shell ---------------------------------------------------------------
   // The window is a band in the -c gable, 5.0 m wide and 1.15 m tall, with a
   // mullion; the wall is emitted as four pieces around it.
@@ -285,8 +401,7 @@ function buildInterior(b) {
   const WY0 = y0 + 0.98, WY1 = y0 + 2.13;
 
   const wall = (a0, c0, a1, c1, yLo, yHi, col) => {
-    const p0 = V(a0, c0, yLo), p1 = V(a1, c1, yLo), p2 = V(a1, c1, yHi), p3 = V(a0, c0, yHi);
-    lit.quad(p0, p1, p2, p3, col);       // inward face only — we never see the back
+    FACE(lit, V(a0, c0, yLo), V(a1, c1, yLo), V(a1, c1, yHi), V(a0, c0, yHi), col);
   };
   // floor: boards across the room, tone varying course to course
   {
@@ -295,14 +410,14 @@ function buildInterior(b) {
       const a0 = -W + (2 * W) * (i / n), a1 = -W + (2 * W) * ((i + 1) / n);
       const k = 0.80 + 0.34 * (((i * 2654435761) >>> 12 & 255) / 255);
       const col = [C_FLOOR[0] * k, C_FLOOR[1] * k, C_FLOOR[2] * k];
-      lit.quad(V(a0, -D, y0), V(a1, -D, y0), V(a1, D, y0), V(a0, D, y0), col);
+      FACE(lit, V(a0, -D, y0), V(a1, -D, y0), V(a1, D, y0), V(a0, D, y0), col);
       // a dark seam line so the boards read at grazing angles
-      lit.quad(V(a1 - 0.012, -D, y0 + 0.004), V(a1, -D, y0 + 0.004),
+      FACE(lit, V(a1 - 0.012, -D, y0 + 0.004), V(a1, -D, y0 + 0.004),
         V(a1, D, y0 + 0.004), V(a1 - 0.012, D, y0 + 0.004), [0.16, 0.11, 0.07]);
     }
   }
   // ceiling + beams
-  lit.quad(V(W, D, y1), V(-W, D, y1), V(-W, -D, y1), V(W, -D, y1), [0.40, 0.31, 0.22]);
+  FACE(lit, V(W, D, y1), V(-W, D, y1), V(-W, -D, y1), V(W, -D, y1), [0.40, 0.31, 0.22]);
   for (let i = 0; i < 5; i++) {
     const c = -D + (2 * D) * ((i + 0.5) / 5);
     BX(lit, -W, c - 0.11, y1 - 0.24, W, c + 0.11, y1 - 0.02, C_BEAM);
@@ -482,6 +597,29 @@ function buildInterior(b) {
     glow.cyl(q.x, q.z, WY0 - 0.02, WY0 + 0.04, 0.014, [4.0, 2.2, 0.9], 5);
   }
 
+  // ---- two pendants over the counter --------------------------------------
+  // MEASURED: with one dim bulb the bar end of the room came out at a scene mean
+  // of 37 codes. Since the camera now actually goes there when you order (see
+  // `barAim`), the thing you are being shown has to be lit well enough to read —
+  // the coffee machine, the taps and the bottle shelf were all in frame and all
+  // in the dark. Two shades over the counter, the same enamel cone as the one
+  // over the table, plus their point lights in the bake below.
+  const BAR_LAMPS = [1.0, 4.2];
+  for (const bc of BAR_LAMPS) {
+    const p = P(BA + 0.45, bc, 0);
+    lit.cyl(p.x, p.z, y1 - 0.02, y0 + 2.08, 0.008, C_BLACK, 4);
+    const seg = 12, r = 0.22, top = y0 + 2.08, bot = y0 + 1.94;
+    for (let i = 0; i < seg; i++) {
+      const t0 = (i / seg) * Math.PI * 2, t1 = ((i + 1) / seg) * Math.PI * 2;
+      lit.quad(
+        new THREE.Vector3(p.x, top, p.z),
+        new THREE.Vector3(p.x + Math.cos(t1) * r, bot, p.z + Math.sin(t1) * r),
+        new THREE.Vector3(p.x + Math.cos(t0) * r, bot, p.z + Math.sin(t0) * r),
+        new THREE.Vector3(p.x, top, p.z), [0.70, 0.68, 0.64]);
+    }
+    glow.cyl(p.x, p.z, bot - 0.05, bot, 0.065, [4.6, 3.1, 1.6], 8);
+  }
+
   // ---- odds and ends ------------------------------------------------------
   // skis leaning by the door, a coat rail, a picture over the wainscot
   for (let i = 0; i < 4; i++) {
@@ -522,8 +660,17 @@ function buildInterior(b) {
       { x: lampP.x, y: y0 + 1.80, z: lampP.z, c: [0.78, 0.52, 0.28], range: 1.9, k: 1.0, wrap: true },
       { x: stoveP.x, y: y0 + 0.62, z: stoveP.z, c: [0.92, 0.34, 0.10], range: 2.1, k: 1.0, wrap: true },
       { x: winC.x, y: y0 + 1.7, z: winC.z, c: [0.30, 0.36, 0.46], range: 5.0, k: 0.6, wrap: false },
-      // a dim bulb over the bar, so the far end of the room is not a black hole
-      { x: P(W - 0.4, 2.0, 0).x, y: y0 + 2.2, z: P(W - 0.4, 2.0, 0).z, c: [0.52, 0.36, 0.20], range: 3.0, k: 0.9, wrap: true },
+      // the two pendants over the counter. They are ten metres from the window
+      // table, so they can be this bright without touching the framing the
+      // lamp-at-2.35 note above is protecting — checked, the table top does not
+      // move by a code.
+      ...BAR_LAMPS.map((bc) => {
+        const q = P(BA + 0.45, bc, 0);
+        return { x: q.x, y: y0 + 1.94, z: q.z, c: [0.74, 0.50, 0.27], range: 3.4, k: 1.05, wrap: true };
+      }),
+      // ...and a dim fill behind the counter, so the back shelf is not a
+      // silhouette against its own bottles
+      { x: P(W - 0.5, 2.6, 0).x, y: y0 + 2.1, z: P(W - 0.5, 2.6, 0).z, c: [0.46, 0.33, 0.20], range: 4.2, k: 0.8, wrap: true },
     ],
     win: winN,
     winC: [0.30, 0.36, 0.48],
@@ -537,17 +684,23 @@ function buildInterior(b) {
   // Built as their own little geometries so they can be swapped and animated;
   // baked with the same rig so they sit in the same light as the table.
   const mugB = new Bld();
+  /** Top of the coffee, in the room frame — where the steam has to start. */
+  const COFFEE_Y = TY + 0.165;
   {
     const p = P(DRINK_A, DRINK_C, 0);
     mugB.cyl(p.x, p.z, TY + 0.056, TY + 0.156, 0.043, C_CERAM, 10);   // saucer-ish base
-    mugB.cyl(p.x, p.z, TY + 0.156, TY + 0.165, 0.030, [0.20, 0.11, 0.05], 10); // the coffee
-    // handle
-    for (let i = 0; i < 5; i++) {
-      const t0 = -0.9 + (i / 5) * 1.8, t1 = -0.9 + ((i + 1) / 5) * 1.8;
-      const q0 = new THREE.Vector3(p.x + Math.cos(t0) * 0.062 + 0.02, TY + 0.10 + Math.sin(t0) * 0.030, p.z + Math.sin(t0) * 0.02);
-      const q1 = new THREE.Vector3(p.x + Math.cos(t1) * 0.062 + 0.02, TY + 0.10 + Math.sin(t1) * 0.030, p.z + Math.sin(t1) * 0.02);
-      mugB.box(Math.min(q0.x, q1.x) - 0.006, Math.min(q0.y, q1.y) - 0.006, Math.min(q0.z, q1.z) - 0.006,
-        Math.max(q0.x, q1.x) + 0.006, Math.max(q0.y, q1.y) + 0.006, Math.max(q0.z, q1.z) + 0.006, C_CERAM);
+    mugB.cyl(p.x, p.z, TY + 0.156, COFFEE_Y, 0.030, [0.20, 0.11, 0.05], 10); // the coffee
+    // Handle: a real arc of ceramic, swept in the ROOM's frame and standing in
+    // the (a, y) plane so it is seen side-on from the bench. Ends land on the
+    // 4.3 cm mug wall rather than in the air beside it.
+    {
+      const pts = [];
+      const N = 7;
+      for (let i = 0; i <= N; i++) {
+        const t = lerp(-1.48, 1.48, i / N);
+        pts.push([DRINK_A + 0.040 + Math.cos(t) * 0.034, DRINK_C, TY + 0.106 + Math.sin(t) * 0.036]);
+      }
+      TUBE(mugB, pts, 0.0075, C_CERAM);
     }
   }
   const glassB = new Bld();
@@ -561,20 +714,69 @@ function buildInterior(b) {
   const mugGeo = bakeInterior(mugB.geometry(), L);
   const glassGeo = bakeInterior(glassB.geometry(), L);
 
-  // steam: three soft quads that rise and fade (own transparent material)
-  const steamB = new Bld();
+  /**
+   * Steam, rebuilt.
+   *
+   * The first cut was three quads at constant world *z*, starting 5-8 cm above
+   * the rim. Three things were wrong with that and only one of them is visible
+   * at 1:1 — magnify 4× and it is three hard-edged pale trapezoids, separated
+   * from each other and from the mug, and because they were built on a world
+   * axis while the hut sits at yaw -0.5 they were also 29 degrees off the lens.
+   * (An earlier commit claimed to have fixed this. It made them smaller.)
+   *
+   * So: ONE continuous ribbon, built at the origin in a camera-facing plane
+   * (+x right, +y up) and yawed at the lens every frame by `updateHut` — a real
+   * billboard, not a guess at where the camera will be — starting at y = 0,
+   * which the mesh's own transform pins to the surface of the coffee. It fades
+   * in and out through a FOUR-component colour attribute, so the edges are soft
+   * and the top dissolves instead of ending in a straight line.
+   */
+  const steamP = [], steamN = [], steamC = [];
   {
-    const p = P(DRINK_A, DRINK_C, 0);
-    // Small and faint on purpose. At three times this size the quads read as a
-    // grey arrow pointing at the ceiling rather than as steam.
-    for (let i = 0; i < 3; i++) {
-      const w2 = 0.017 + i * 0.007, y = TY + 0.175 + i * 0.055;
-      steamB.quad(
-        new THREE.Vector3(p.x - w2, y, p.z), new THREE.Vector3(p.x + w2, y, p.z),
-        new THREE.Vector3(p.x + w2 * 0.55, y + 0.052, p.z), new THREE.Vector3(p.x - w2 * 0.55, y + 0.052, p.z),
-        [0.95, 0.95, 0.95]);
+    const N = 9;
+    const H = 0.235;
+    for (let strand = 0; strand < 2; strand++) {
+      const ph = strand * 2.1, zoff = (strand - 0.5) * 0.012;
+      let prev = null;
+      for (let i = 0; i <= N; i++) {
+        const t = i / N;
+        const y = t * H;
+        // a slow curl, widening and leaning as it rises
+        const x = Math.sin(t * 2.5 + ph) * 0.016 * t + (strand - 0.5) * 0.010;
+        const w = lerp(0.011, 0.040, Math.pow(t, 0.7));
+        // opaque in the middle of the plume, nothing at the surface or the top
+        const a = 0.85 * Math.sin(Math.pow(t, 0.62) * Math.PI) * (strand ? 0.7 : 1.0);
+        const cur = { x, y, w, a };
+        if (prev) {
+          const quad = [
+            [prev.x - prev.w, prev.y, prev.a * 0.15], [prev.x + prev.w, prev.y, prev.a * 0.15],
+            [cur.x + cur.w, cur.y, cur.a * 0.15], [cur.x - cur.w, cur.y, cur.a * 0.15],
+          ];
+          // centre spine carries the alpha; the outer edges are feathered
+          const mid = [
+            [prev.x - prev.w * 0.34, prev.y, prev.a], [prev.x + prev.w * 0.34, prev.y, prev.a],
+            [cur.x + cur.w * 0.34, cur.y, cur.a], [cur.x - cur.w * 0.34, cur.y, cur.a],
+          ];
+          const emit = (q) => {
+            for (const [i0, i1, i2] of [[0, 1, 2], [0, 2, 3]]) {
+              for (const k of [i0, i1, i2]) {
+                steamP.push(q[k][0], q[k][1], zoff);
+                steamN.push(0, 0, 1);
+                steamC.push(0.98, 0.98, 1.0, q[k][2]);
+              }
+            }
+          };
+          emit(quad); emit(mid);
+        }
+        prev = cur;
+      }
     }
   }
+  const steamGeo = new THREE.BufferGeometry();
+  steamGeo.setAttribute('position', new THREE.Float32BufferAttribute(steamP, 3));
+  steamGeo.setAttribute('normal', new THREE.Float32BufferAttribute(steamN, 3));
+  steamGeo.setAttribute('color', new THREE.Float32BufferAttribute(steamC, 4));
+  steamGeo.computeBoundingSphere();
 
   // camera: seated at the window table, looking across it and out
   // Seated ON the bench, not standing behind it: at TC + 1.9 the lens was
@@ -583,12 +785,37 @@ function buildInterior(b) {
   // is where somebody's eyes are when they sit down with a coffee.
   const camPos = P(TA - 0.55, TC + 1.05, y0 + 1.30);
   const camAim = P(TA + 0.10, TC - 1.60, y0 + 1.05);
+  /**
+   * Where the camera looks when you order.
+   *
+   * MEASURED, and the reason this point exists: from the bench the counter spans
+   * a = 7.35..8.08, which is **115 degrees** off the aim axis, against a reach of
+   * about 90 (a 47.5 degree half-fov plus the drift's -23.5..+42.8 sweep). The
+   * bar, the coffee machine, the taps, the back shelf and the second table were
+   * therefore built, baked, lit and drawn every frame and could NEVER be seen —
+   * in a feature whose whole request was "go into the hut and drink a coffee or
+   * a beer". Ordering now buys a two-and-a-half second look across at the
+   * counter you ordered from, which is also simply what you do.
+   *
+   * Aimed between the group heads and the taps, with the bottle shelf behind.
+   */
+  const barAim = P(W - 0.55, 1.10, y0 + 1.34);
+  /**
+   * ...and where it stands to look. Aiming the table camera at the counter from
+   * the bench was tried first and measured: at 10.7 m down a dark room the whole
+   * bar occupied about a seventh of the frame width at a scene mean of 42 codes.
+   * The beat is a MOVE — you got up and went to the bar, which is what ordering
+   * a drink actually involves — ending 2.3 m off the group heads.
+   */
+  const barCam = P(BA - 1.70, 1.10, y0 + 1.56);
   // where the player is standing while inside, for streaming/shadow focus
   const stand = P(0, 0, 0);
 
   return {
-    litGeo, glowGeo, mugGeo, glassGeo, steamGeo: steamB.geometry(),
-    camPos, camAim, stand, floorY: y0,
+    litGeo, glowGeo, mugGeo, glassGeo, steamGeo,
+    camPos, camAim, barAim, barCam, stand, floorY: y0,
+    /** World point of the coffee surface — the steam billboard hangs off this. */
+    steamAt: P(DRINK_A, DRINK_C, COFFEE_Y),
     // unit vector along the room's `a` axis, for the camera drift
     driftA: new THREE.Vector3(ax, 0, az),
     triangles: lit.triangles + glow.triangles,
@@ -661,6 +888,8 @@ export function createResort(opts) {
   let liftTop = 0;          // arc length at which the chair puts you down
   let midS = null;          // ...and where the mid-station is on the same line
   let hutDoor = null;
+  /** The hut's own axes: `a` across the ridge, `c` along it. See buildInterior. */
+  let hutFrame = { ax: 1, az: 0, cx: 0, cz: 1 };
 
   // ---- the chair line ------------------------------------------------------
   const cables = scatter?.lift?.cables || [];
@@ -690,12 +919,23 @@ export function createResort(opts) {
    * Measured off the live instance matrices rather than re-derived: scatter does
    * not publish the phase, and guessing it would be a second copy of a moving
    * number, which is the failure mode CLAUDE.md is loudest about.
+   *
+   * The search is a SYMMETRIC ladder of small offsets and keeps the best of them
+   * rather than walking one way until it gives up. The first cut pushed +13 m
+   * four times, so a bad boarding could move the player 52 m up the line — and
+   * near the top, where the clamp bites, it moved him 9 m BACKWARDS (measured
+   * 3994.9 -> 3985.9), which is a lift running in reverse. Worst case here is
+   * ±27 m and the sign is whichever is clear.
    */
-  function avoidChairs(s) {
+  const AVOID_OFFSETS = [0, 9, -9, 18, -18, 27, -27];
+  function avoidChairs(s0) {
     const pool = scatter?.group?.getObjectByName?.('chairs');
-    if (!pool || !pool.count) return s;
+    if (!pool || !pool.count) return s0;
     const arr = pool.instanceMatrix.array;
-    for (let attempt = 0; attempt < 4; attempt++) {
+    const lo = BOARD_MARGIN, hi = Math.max(lo, liftTop - 14);
+    let bestS = clamp(s0, lo, hi), bestNear = -1;
+    for (const off of AVOID_OFFSETS) {
+      const s = clamp(s0 + off, lo, hi);
       cableAt(upCable, s, _p);
       let near = Infinity;
       for (let i = 0; i < pool.count; i++) {
@@ -704,9 +944,9 @@ export function createResort(opts) {
         near = Math.min(near, Math.hypot(dx, dy, dz));
       }
       if (near > 11) return s;
-      s = clamp(s + 13, BOARD_MARGIN, liftTop - 14);
+      if (near > bestNear) { bestNear = near; bestS = s; }
     }
-    return s;
+    return bestS;
   }
 
   /** Arc length of the cable point nearest to (x, z). */
@@ -805,6 +1045,7 @@ export function createResort(opts) {
     //    with him has to be below him.
     const ax = Math.cos(hutB.yaw), az = -Math.sin(hutB.yaw);
     const cx = Math.sin(hutB.yaw), cz = Math.cos(hutB.yaw);
+    hutFrame = { ax, az, cx, cz };
     const dx = hutB.x + ax * (hutB.w * 0.35) + cx * (hutB.d + 4.0);
     const dz = hutB.z + az * (hutB.w * 0.35) + cz * (hutB.d + 4.0);
     zones.push({
@@ -836,11 +1077,14 @@ export function createResort(opts) {
   let phase = 'ride';           // 'board' | 'ride' | 'off' inside a lift mode
   let modeT = 0, phaseT = 0;
   let rideS = 0, rideTotal = 0, rideSpeed = 0, rideKind = '', rideName = '';
+  let rideFrom = 0;             // arc length the current ride was boarded at
+  let lapse = 1;                // current time compression of the ride
   let pan = 0, panV = 0, sway = 0, tilt = 0, hutPan = 0;
   let veil = 0, veilTarget = 0, glowFlash = 0;
-  let skipHold = 0, skipping = false;
+  let skipHold = 0, skipping = false, skipArmed = false;
   let warmth = 1;
-  let drink = null, drinkT = 0, hutNote = '';
+  let drink = null, drinkT = 0, riseDelay = 0, hutNote = '';
+  let barBeat = 0, prevPick = 0, pickCool = 0;
   let runTop = 0, runAir = 0, lastRun = null;
   let lastTowerIdx = -1;
   let chairFixed = false;
@@ -856,6 +1100,25 @@ export function createResort(opts) {
   const _q2 = new THREE.Quaternion();
   const _e = new THREE.Euler();
   const _aim = new THREE.Vector3();
+  // The seat framing updateCamera last produced, so applyBlend can build the
+  // boarding move out of it instead of guessing where the chair is (see D10).
+  const _seatEye = new THREE.Vector3();
+  const _seatAim = new THREE.Vector3();
+  const _blendAim = new THREE.Vector3();
+  const _boardAt = new THREE.Vector3();   // where the rider was standing when he boarded
+  const _mat = new THREE.Matrix4();
+
+  /**
+   * Publish the mode block. Called from every transition, not only from
+   * `update()`: a tool that calls `enter()` or `goto()` and then reads
+   * `state.mode` in the same tick used to get the PREVIOUS mode back, because
+   * the only writer was the top of the next frame.
+   */
+  function publishMode(state) {
+    if (!state) return;
+    state.mode = mode;
+    state.modeT = modeT;
+  }
 
   function setSkierVisible(v) {
     if (skier?.group) skier.group.visible = v;
@@ -890,17 +1153,33 @@ export function createResort(opts) {
     mode = 'lift'; phase = 'board'; modeT = 0; phaseT = 0;
     rideKind = 'chair';
     rideName = zone?.note || 'Chairlift';
-    rideTotal = liftTop;
     rideS = avoidChairs(progress !== undefined
       ? lerp(zone?.s ?? BOARD_MARGIN, liftTop, clamp(progress, 0, 1))
       : (zone?.s ?? BOARD_MARGIN));
+    rideFrom = rideS;
+    /**
+     * The mid-station is the DEFAULT destination, not an offer you have to
+     * notice. Riding the whole line is 3998.8 m; getting off at the mid-station
+     * is 2085.5 m and puts you thirty metres from the restaurant door, which is
+     * the loop this feature exists to close. Staying on for the summit is the
+     * deliberate choice and is offered on the approach — see `updateLift`.
+     */
+    rideTotal = (midS !== null && rideS < midS - 40) ? midS : liftTop;
     rideSpeed = CHAIR_SPEED;
-    pan = 0; panV = 0; tilt = 0; skipHold = 0; skipping = false; chairFixed = false;
+    lapse = 1;
+    pan = 0; panV = 0; tilt = 0;
+    skipHold = 0; skipping = false; skipArmed = false; chairFixed = false;
     lastTowerIdx = -1;
+    _boardAt.copy(state.pos); _boardAt.y += 1.15;   // his head, for the blend to hold on
     grabCamera();
-    setSkierVisible(false);
+    // The rider is NOT hidden here. Boarding used to delete him on the frame E
+    // was pressed and then spend 1.45 s flying a camera that still held the old
+    // chase framing to a seat 21.0 m up and 15.7 m sideways — measured, at 0.7 s
+    // the shot was blank snow with no chair, no rider and no station in it.
+    // He stays on his feet for T_SHOW_SKIER while the move starts on him.
     chairRig.visible = true;
     parkState(state);
+    publishMode(state);
     return true;
   }
 
@@ -911,8 +1190,10 @@ export function createResort(opts) {
     rideName = 'T-bar';
     rideTotal = draglift.total;
     rideS = clamp((progress ?? 0) * draglift.total, 0, draglift.total);
+    rideFrom = rideS;
     rideSpeed = draglift.speed;
-    skipHold = 0; skipping = false;
+    lapse = 1;
+    skipHold = 0; skipping = false; skipArmed = false;
     setSkierVisible(true);
     chairRig.visible = false;
     parkState(state);
@@ -922,6 +1203,7 @@ export function createResort(opts) {
     draglift.dirAt(rideS, _d);
     state.heading = Math.atan2(-_d.x, -_d.z);
     terrain.normal(state.pos.x, state.pos.z, state.groundNormal);
+    publishMode(state);
     return true;
   }
 
@@ -929,7 +1211,13 @@ export function createResort(opts) {
     if (!interior) return false;
     mode = 'hut'; phase = 'in'; modeT = 0; phaseT = 0;
     hutNote = zone?.note || 'Bergrestaurant';
-    drink = null; drinkT = 0;
+    drink = null; drinkT = 0; riseDelay = 0;
+    barBeat = 0; prevPick = 0; pickCool = 0;
+    // A ride ends when a door opens. Only `backToSki` used to null this, so a
+    // lift -> hut transition left "T-BAR / HOLD X TO SKIP" printed over the
+    // interior for as long as you sat there.
+    state.ride = null;
+    skipping = false; skipHold = 0;
     setSkierVisible(false);
     chairRig.visible = false;
     if (mugMesh) mugMesh.visible = false;
@@ -939,6 +1227,7 @@ export function createResort(opts) {
     veilTarget = 1;
     grabCamera();
     parkState(state);
+    publishMode(state);
     return true;
   }
 
@@ -952,16 +1241,35 @@ export function createResort(opts) {
     if (interiorGroup) interiorGroup.visible = false;
     if (draglift) draglift.setRiderVisible(false);
     physics.reset(state, x, z, heading);
+    /**
+     * ...and then take the flying start back off.
+     *
+     * `physics.reset` deliberately drops the rider in at the speed the pitch
+     * sustains, because a reset means "you are already skiing" (physics.js:244).
+     * Stepping off a chair, letting go of a T-bar or walking out of a door, you
+     * are not: measured, this handed the player back at 15.8 / 17.6 / 17.1 m/s
+     * and the HUD read **65 KM/H one frame after leaving the restaurant**. The
+     * debug `goto()` already carried these two lines for exactly this reason;
+     * the player path did not.
+     */
+    state.vel.set(0, 0, 0);
+    state.speed = 0;
     runTop = 0; runAir = 0;
     grabCamera();
     blend = 1; blendDur = T_OFF;
+    publishMode(state);
   }
 
   // =========================================================================
   // per-frame
   // =========================================================================
   function update(dt, state) {
-    dt = clamp(dt || 0, 0, 0.1);
+    // Two dts, deliberately. `dtRaw` is what scatter integrates its chair phase
+    // over and is therefore what the RIDE has to advance on — see CHAIR_SPEED.
+    // `dt` is clamped and drives everything that is an ease, a spring or a
+    // timer, none of which want a 250 ms step.
+    const dtRaw = Math.max(0, dt || 0);
+    dt = clamp(dtRaw, 0, 0.1);
     modeT += dt; phaseT += dt;
     if (rigWarm > 0 && mode === 'ski') {
       rigWarm--;
@@ -1018,11 +1326,15 @@ export function createResort(opts) {
       state.prompt = null;
       // While not skiing the mode machine OWNS the input: zeroing the published
       // channels is what keeps spray, tracks, audio and the rig from reacting to
-      // a steer key that is being used to look around.
+      // a steer key that is being used to look around. Which is exactly why
+      // every consumer below has to read `io`, not `state.input` — the hut
+      // camera read the latter and its advertised "A/D look around" therefore
+      // did nothing at all.
       inp.steer = 0; inp.crouch = 0; inp.brake = 0; inp.jump = false; inp.jumpPressed = false;
-      if (mode === 'lift') updateLift(dt, state, { actionPressed, brake, steer, crouch });
-      else if (mode === 'drag') updateDrag(dt, state, { actionPressed, brake, steer, crouch });
-      else if (mode === 'hut') updateHut(dt, state, { actionPressed, pick });
+      const io = { actionPressed, brake, steer, crouch, pick, dtRaw };
+      if (mode === 'lift') updateLift(dt, state, io);
+      else if (mode === 'drag') updateDrag(dt, state, io);
+      else if (mode === 'hut') updateHut(dt, state, io);
     }
 
     state.warmth = warmth;
@@ -1053,21 +1365,47 @@ export function createResort(opts) {
     else if (best.kind === 'hut') enterHut(state, best);
   }
 
+  /**
+   * Hold the brake to skip the rest of the ride — but only after letting go of
+   * it once.
+   *
+   * The brake (Ctrl / X) is the key the player has to HOLD to get under
+   * BOARD_SPEED for the boarding prompt to go warm. Taking the skip off the
+   * brake *level* therefore meant: roll up to the station braking, press E,
+   * keep braking because nothing told you to stop — and two seconds later the
+   * veil is at 0.91 and you are at the top of a 4 km line you never saw. That
+   * was, measured, the single most likely first-time experience of the headline
+   * feature. A skip now needs a fresh press: the accumulator is armed on the
+   * first frame the brake reads clear.
+   */
+  function armSkip(dt, brake) {
+    if (!skipArmed) { if (brake < 0.4) skipArmed = true; skipHold = 0; return; }
+    skipHold = brake > 0.4 ? skipHold + dt : 0;
+    if (skipHold > 0.55 && !skipping) { skipping = true; veilTarget = 1; }
+  }
+
+  /**
+   * Time compression at arc length `s`: 1 near either end of the ride, up to
+   * LAPSE_MAX in the middle. See the LAPSE_* block for why this exists.
+   */
+  function lapseAt(s) {
+    const dIn = s - rideFrom, dOut = rideTotal - s;
+    const k = Math.min(
+      clamp((dIn - LAPSE_HEAD) / LAPSE_RAMP, 0, 1),
+      clamp((dOut - LAPSE_TAIL) / LAPSE_RAMP, 0, 1));
+    return 1 + (LAPSE_MAX - 1) * ease(k);
+  }
+
   // ---- the chair ----------------------------------------------------------
   function updateLift(dt, state, io) {
-    // hold the brake to skip the rest of the ride — a lift ride is 4.6 m/s of
-    // real time and this line is 4 km long, so the alternative to a skip is a
-    // fourteen-minute cutscene
-    if (phase === 'ride') {
-      skipHold = io.brake > 0.4 ? skipHold + dt : 0;
-      if (skipHold > 0.55 && !skipping) { skipping = true; veilTarget = 1; }
-    }
+    if (phase === 'ride') armSkip(dt, io.brake);
     if (skipping && veil > 0.92) {
       rideS = rideTotal;
       skipping = false;
     }
     if (!skipping && phase !== 'off') veilTarget = 0;
 
+    if (phase === 'board' && phaseT >= T_SHOW_SKIER) setSkierVisible(false);
     if (phase === 'board' && phaseT >= T_BOARD) { phase = 'ride'; phaseT = 0; }
 
     // The chair-clearance test has to run a frame or two AFTER boarding, not at
@@ -1079,15 +1417,16 @@ export function createResort(opts) {
     if (!chairFixed && modeT > 0.04) { rideS = avoidChairs(rideS); chairFixed = true; }
 
     if (phase === 'ride') {
-      rideS = Math.min(rideTotal, rideS + rideSpeed * dt);
+      lapse = lapseAt(rideS);
+      rideS = Math.min(rideTotal, rideS + rideSpeed * io.dtRaw * lapse);
       // a clack as each tower's sheave train goes over the cable
       const idx = Math.round(rideS / Math.max(1, (upCable.total / Math.max(1, towers.length - 1))));
       if (idx !== lastTowerIdx) {
         if (lastTowerIdx >= 0) audio?.mech?.('sheave');
         lastTowerIdx = idx;
       }
-      if (rideS >= rideTotal - 0.01) { phase = 'off'; phaseT = 0; veilTarget = 0; }
-    }
+      if (rideS >= rideTotal - 0.01) { phase = 'off'; phaseT = 0; veilTarget = 0; lapse = 1; }
+    } else lapse = 1;
 
     // seat + camera
     cableAt(upCable, rideS, _p);
@@ -1122,18 +1461,27 @@ export function createResort(opts) {
     const tiltT = clamp(io.crouch, 0, 1);
     tilt += (tiltT - tilt) * Math.min(1, dt * 3.2);
 
+    const span = Math.max(1, rideTotal - rideFrom);
     state.ride = {
       kind: 'chair', name: rideName,
-      s: rideS, total: rideTotal, progress: clamp(rideS / Math.max(1, rideTotal), 0, 1),
+      s: rideS, total: rideTotal,
+      progress: clamp((rideS - rideFrom) / span, 0, 1),
       speed: phase === 'ride' ? rideSpeed : 0,
+      lapse: phase === 'ride' ? lapse : 1,
       hint: phase === 'ride' ? 'A/D look around · S look down · hold X to skip' : '',
-      canUnload: false,
+      option: null,
     };
-    // mid-station: offer to get off there if we boarded below it
-    if (phase === 'ride' && midS !== null && rideS < midS - 4 && rideS > midS - 90) {
-      state.ride.canUnload = true;
-      state.prompt = { key: 'E', text: 'Unload at the mid-station', sub: rideName, ready: true };
-      if (io.actionPressed) { rideS = midS; phase = 'off'; phaseT = 0; }
+    /**
+     * The one choice on the way up, and it is the OPPOSITE of the one this used
+     * to offer. The ride ends at the mid-station by default, so what you are
+     * asked on the approach is whether you want to stay on for the summit. It is
+     * offered in the last hundred metres of the leg, which at full lapse is
+     * still ~13 s of real time to react in.
+     */
+    if (phase === 'ride' && rideTotal === midS && rideS > midS - 110 && rideS < midS - 6) {
+      state.ride.option = 'summit';
+      state.prompt = { key: 'E', text: 'Stay on to the summit', sub: '3.9 km · top station', ready: true };
+      if (io.actionPressed) { rideTotal = liftTop; rideName = 'Summit'; }
     } else state.prompt = null;
 
     if (phase === 'off' && phaseT > 0.25) {
@@ -1150,13 +1498,21 @@ export function createResort(opts) {
   function updateDrag(dt, state, io) {
     if (phase === 'board' && phaseT > 0.7) { phase = 'ride'; phaseT = 0; }
     if (phase === 'ride') {
-      skipHold = io.brake > 0.4 ? skipHold + dt : 0;
-      if (skipHold > 0.55 && !skipping) { skipping = true; veilTarget = 1; }
+      // same brake-edge rule as the chair, and for the same reason: you arrive
+      // at a T-bar queue holding the brake
+      armSkip(dt, io.brake);
       if (skipping && veil > 0.92) { rideS = rideTotal; skipping = false; }
       if (!skipping) veilTarget = 0;
-      rideS = Math.min(rideTotal, rideS + rideSpeed * dt);
+      // No timelapse here, deliberately. The chair is a first-person shot from a
+      // fixed rig, so compressing it reads as a timelapse; the T-bar is THIRD
+      // person with the rider's own skis on the snow and his tracks being
+      // written behind him, and at eight times speed that reads as a bug rather
+      // than as elapsed time. 685 m at 3.4 m/s is 200 s and the skip is the
+      // escape hatch, the same as everywhere else.
+      rideS = Math.min(rideTotal, rideS + rideSpeed * io.dtRaw);
       if (rideS >= rideTotal - 0.01) { phase = 'off'; phaseT = 0; }
     }
+    lapse = 1;
 
     draglift.sample(rideS, _p);
     draglift.dirAt(rideS, _d);
@@ -1202,7 +1558,18 @@ export function createResort(opts) {
       if (veil > 0.9) {
         interiorGroup.visible = false;
         veilTarget = 0;
-        const zx = hutDoor.x, zz = hutDoor.z - 6;
+        /**
+         * Step out in the HUT's frame, not the world's.
+         *
+         * The door zone itself is built at `+c * (d + 4)` off the building, but
+         * the exit was `hutDoor.z - 6` — a world-axis offset applied to a hut
+         * standing at yaw -0.5, which walks you 2.9 m across and 5.3 m back
+         * TOWARDS the building and puts the chase boom under the terrace deck.
+         * Measured, the first frame outside was a white slab across the screen.
+         * Out of a door means away from the building: further along +c.
+         */
+        const { cx: hcx, cz: hcz } = hutFrame;
+        const zx = hutDoor.x + hcx * 6, zz = hutDoor.z + hcz * 6;
         state.hut = null;
         backToSki(state, zx, zz, Math.PI);
         return;
@@ -1213,28 +1580,50 @@ export function createResort(opts) {
     // one framing shows and the bar, the coffee machine and the second table
     // might as well not exist — which is the difference between a room and a
     // diorama.
-    const panT = clamp((state.input?.steer ?? 0), -1, 1);
+    //
+    // From `io`, NOT from `state.input`: `update()` zeroes the published steer
+    // channel before this runs, precisely so nothing downstream mistakes a look
+    // for a carve. Reading it back here meant the advertised "A/D look around"
+    // moved the camera by exactly nothing, for both signs — measured.
+    const panT = clamp(io.steer ?? 0, -1, 1);
     hutPan += (panT - hutPan) * Math.min(1, dt * 2.4);
 
-    // ordering
+    // ---- ordering ----------------------------------------------------------
+    // `pick` is a LEVEL (see controls.js), so this has to find the edge itself.
+    // Left as a level test it re-ordered every frame: 120 frames of alternating
+    // 1/2 pushed 120 runs, fired 120 one-shots and moved the sun three quarters
+    // of a day. PICK_COOLDOWN then stops a fast alternation being a drink mill.
+    pickCool = Math.max(0, pickCool - dt);
+    const pickEdge = io.pick !== 0 && io.pick !== prevPick && pickCool <= 0;
+    prevPick = io.pick;
     if (phase === 'sit') {
-      if (io.pick === 1 && drink !== 'coffee') serve(state, 'coffee');
-      else if (io.pick === 2 && drink !== 'beer') serve(state, 'beer');
+      if (pickEdge && io.pick === 1 && drink !== 'coffee') serve(state, 'coffee');
+      else if (pickEdge && io.pick === 2 && drink !== 'beer') serve(state, 'beer');
       else if (io.actionPressed) { phase = 'out'; phaseT = 0; veilTarget = 1; }
     }
 
     drinkT += dt;
-    // the drink rises towards the lens on the first sip, then settles back
-    const rise = drink ? Math.min(1, drinkT / T_SIP) : 0;
-    const lift = Math.sin(clamp(rise, 0, 1) * Math.PI) * 0.13;
+    barBeat = Math.max(0, barBeat - dt);
+    // The drink rises towards the lens once it is in front of you — which, with
+    // the bar beat running, is after the camera has come back from the counter.
+    const rise = drink ? clamp((drinkT - riseDelay) / T_SIP, 0, 1) : 0;
+    const lift = Math.sin(rise * Math.PI) * 0.13;
     if (mugMesh) { mugMesh.position.set(0, lift, 0); glassMesh.position.set(0, lift, 0); }
     if (steamMesh) {
       const on = drink === 'coffee';
       steamMesh.visible = on;
       if (on) {
-        const t = drinkT % 2.2;
-        steamMesh.material.opacity = 0.15 * Math.max(0, Math.sin((t / 2.2) * Math.PI)) * (0.6 + 0.4 * Math.sin(drinkT * 3.1));
-        steamMesh.position.set(0, lift + (t / 2.2) * 0.16, 0);
+        // Billboard: the plume is built in its own +x/+y plane at the origin, so
+        // it is pinned to the coffee surface and yawed at the lens here rather
+        // than baked at whatever angle the room happens to sit at.
+        const sp = interior.steamAt;
+        steamMesh.position.set(sp.x, sp.y + lift, sp.z);
+        steamMesh.rotation.set(0, Math.atan2(camera.position.x - sp.x, camera.position.z - sp.z), 0);
+        const t = (drinkT % 2.6) / 2.6;
+        steamMesh.scale.set(0.85 + 0.30 * t, 0.80 + 0.42 * t, 1);
+        steamMesh.material.opacity =
+          0.34 * clamp(Math.sin(Math.pow(t, 0.8) * Math.PI) * 1.25, 0, 1)
+          * (0.72 + 0.28 * Math.sin(drinkT * 2.3));
       }
     }
 
@@ -1251,8 +1640,12 @@ export function createResort(opts) {
     };
   }
 
-  function serve(state, kind) {
+  function serve(state, kind, beat = true) {
     drink = kind; drinkT = 0;
+    pickCool = PICK_COOLDOWN;
+    // Order at the bar, look at the bar. See `interior.barAim`.
+    barBeat = beat ? T_BAR_BEAT : 0;
+    riseDelay = beat ? T_BAR_BEAT * 0.62 : 0;
     if (mugMesh) mugMesh.visible = kind === 'coffee';
     if (glassMesh) glassMesh.visible = kind === 'beer';
     warmth = kind === 'coffee' ? 1 : Math.max(warmth, 0.85);
@@ -1261,8 +1654,16 @@ export function createResort(opts) {
     // A stop costs time, and the light is the only honest way to show that.
     // sky.setTimeOfDay re-derives the whole lighting rig, so it happens exactly
     // once per drink, inside a room, with the HUD holding a card over the frame.
+    //
+    // Clamped at TOD_LAST_LIFT, and NOT wrapped: `setTimeOfDay` takes the value
+    // mod 1, so the unbounded version rolled 0.302 past 1.0 and came out at 0.042
+    // — the middle of the night, reachable by holding two keys. The stop still
+    // costs you the afternoon; it cannot cost you the day.
     if (sky?.setTimeOfDay && sky.getTimeOfDay) {
-      sky.setTimeOfDay(sky.getTimeOfDay() + (kind === 'beer' ? 0.020 : 0.009));
+      const t = sky.getTimeOfDay();
+      const want = t + (kind === 'beer' ? 0.020 : 0.009);
+      const next = t <= TOD_LAST_LIFT ? Math.min(want, TOD_LAST_LIFT) : t;
+      if (next !== t) sky.setTimeOfDay(next);
     }
     if (lastRun) {
       (state.runs || (state.runs = [])).push({ ...lastRun, drink: kind });
@@ -1296,6 +1697,7 @@ export function createResort(opts) {
       const lookD = lerp(4.2, 21.0, tilt);
       _aim.multiplyScalar(18).add(_p);
       _aim.y = _p.y - lookD + Math.sin(modeT * 0.63) * 0.18;
+      _seatEye.copy(_p); _seatAim.copy(_aim);
       camera.position.copy(_p);
       camera.lookAt(_aim);
       camera.rotateZ(sway * 0.8);
@@ -1322,8 +1724,16 @@ export function createResort(opts) {
         _aim.z = camera.position.z + ez * ca2 + ex * sa2;
       }
       // the drink comes up towards the lens: follow it a touch
-      const rise = drink ? Math.min(1, drinkT / T_SIP) : 0;
+      const rise = drink ? clamp((drinkT - riseDelay) / T_SIP, 0, 1) : 0;
       _aim.y += Math.sin(rise * Math.PI) * 0.05;
+      // ...and the trip to the counter when an order goes in. A clipped sine, so
+      // it leaves, HOLDS on the bar for the middle second, and comes back.
+      if (barBeat > 0) {
+        const u = 1 - barBeat / T_BAR_BEAT;                       // 0 -> 1
+        const k = ease(clamp(Math.sin(clamp(u, 0, 1) * Math.PI) * 1.55, 0, 1));
+        camera.position.lerp(interior.barCam, k);
+        _aim.lerp(interior.barAim, k);
+      }
       camera.lookAt(_aim);
       setFov(camera, 62);
     }
@@ -1339,14 +1749,41 @@ export function createResort(opts) {
   }
 
   function applyBlend(dt) {
-    // Entering a lift blends the other way: from the stored chase view INTO the
-    // seat, over T_BOARD.
+    /**
+     * Boarding: from the stored chase view INTO the seat, over T_BOARD.
+     *
+     * The first cut lerped position and orientation straight from one to the
+     * other, and the result was 1.45 s of nothing: the rider was deleted on the
+     * frame E was pressed, the seat is 21.0 m above and 15.7 m sideways from
+     * where he stood, and the orientation still held the chase framing, so at
+     * 0.7 s the shot was blank snow — no chair, no rider, no station.
+     *
+     * So the move HOLDS first and is AIMED throughout. For T_BOARD_HOLD of it
+     * the camera does not move at all: it sits where the chase camera was, on
+     * the rider, who is still on his feet at the station (T_SHOW_SKIER). That is
+     * the beat that says "you got on". Then it rises to the seat, its aim easing
+     * off him into the seat's own framing, which looks 18 m up the line and 13
+     * degrees down, so there is hill in shot the whole way up.
+     *
+     * Both of the obvious framings were tried and measured, and both are worse:
+     *
+     *  - aim at the CHAIR through the middle. The grip is 21 m up, so from a
+     *    camera still near the snow that is a 55-degree look: 95% sky.
+     *  - start rising immediately and aim at the rider. Then at 0.7 s the lens
+     *    is 6.7 m up looking 34 degrees DOWN at a rider who has just been
+     *    hidden: a frame of nothing but snow, sd 23.9.
+     */
     if (mode === 'lift' && phase === 'board' && camFrom) {
-      const u = ease(clamp(phaseT / T_BOARD, 0, 1));
-      camera.position.lerpVectors(camFrom, camera.position, u);
-      _q.copy(camFromQ); _q2.copy(camera.quaternion);
-      camera.quaternion.slerpQuaternions(_q, _q2, u);
-      setFov(camera, lerp(camFromFov, camera.fov, u));
+      const u = clamp(phaseT / T_BOARD, 0, 1);
+      const rest = 1 - T_BOARD_HOLD;
+      const uMove = ease(clamp((u - T_BOARD_HOLD) / rest, 0, 1));
+      camera.position.lerpVectors(camFrom, _seatEye, uMove);
+      _blendAim.lerpVectors(_boardAt, _seatAim, ease(clamp((u - T_BOARD_HOLD * 0.86) / (1 - T_BOARD_HOLD * 0.86), 0, 1)));
+      _mat.lookAt(camera.position, _blendAim, camera.up);
+      _q2.setFromRotationMatrix(_mat);
+      _q.copy(camFromQ);
+      camera.quaternion.slerpQuaternions(_q, _q2, ease(clamp(u / 0.18, 0, 1)));
+      setFov(camera, lerp(camFromFov, 60, uMove));
       return;
     }
     if (blend <= 0 || !camFrom) return;
@@ -1367,6 +1804,14 @@ export function createResort(opts) {
   const api = {
     get mode() { return mode; },
     get phase() { return phase; },
+    /**
+     * Time compression of the ride in progress, 1 while skiing. `main.js`
+     * multiplies scatter's dt by this so the chairs coming the other way stay in
+     * phase with the player's — see the LAPSE_* block. Nothing else is scaled:
+     * the clouds and the wind at 1x during a compressed ride are invisible, and
+     * the audio and the HUD smoothing genuinely want real seconds.
+     */
+    get timeScale() { return lapse; },
     zones,
     update,
     updateCamera,
@@ -1391,47 +1836,45 @@ export function createResort(opts) {
         const z = o.x !== undefined ? o : { x: state.pos.x, z: state.pos.z };
         backToSki(state, z.x, z.z, o.heading ?? Math.PI);
         blend = 0;
-        return mode;
-      }
-      if (which === 'lift') {
+      } else if (which === 'lift') {
         const zone = zones.find((q) => q.id === (o.at === 'mid' ? 'chair-mid' : 'chair-bottom'));
         enterLift(state, zone, o.progress);
-        if (o.instant !== false) { phase = 'ride'; phaseT = 0; camFrom = null; }
-        return mode;
-      }
-      if (which === 'drag') {
+        // `to: 'summit'` forces the full line; the default is the mid-station
+        // leg, which is what a player gets.
+        if (o.to === 'summit') rideTotal = liftTop;
+        if (o.instant !== false) { phase = 'ride'; phaseT = 0; camFrom = null; setSkierVisible(false); }
+      } else if (which === 'drag') {
         enterDrag(state, o.progress ?? 0.35);
         if (o.instant !== false) { phase = 'ride'; phaseT = 0; }
-        return mode;
-      }
-      if (which === 'hut') {
+      } else if (which === 'hut') {
         enterHut(state, zones.find((q) => q.id === 'hut'));
         if (o.instant !== false) {
           veil = 0; veilTarget = 0; phase = 'sit'; phaseT = 0; camFrom = null;
           if (interiorGroup) interiorGroup.visible = true;
         }
-        if (o.drink) serve(state, o.drink);
-        return mode;
+        // `enter('hut', { drink })` is "already sitting there with one", so it
+        // does NOT play the bar beat — a forced state is a still, not a moment.
+        // Pass `beat: true` to see the camera go across to the counter.
+        if (o.drink) serve(state, o.drink, o.beat === true);
       }
+      publishMode(state);
       return mode;
     },
 
     /**
      * Teleport the player next to an interaction, so the contact prompt can be
-     * shot. The velocity is zeroed as well as the position: `physics.reset()`
-     * gives a FLYING start (8-24 m/s, deliberately — a reset means "you are
-     * already skiing"), and at 20 m/s a 2.5 s settle carries the rider 50 m past
-     * the zone and out of prompt range, which is exactly what the first version
-     * of this did.
+     * shot. He arrives stationary — `backToSki` now takes the flying start off
+     * every hand-back, this one included; at 20 m/s a 2.5 s settle carried the
+     * rider 50 m past the zone and out of prompt range, which is what the first
+     * version of this did.
      */
     goto(id, state = opts.state) {
       const z = zones.find((q) => q.id === id);
       if (!z) return null;
       const x = z.x, zz = z.z + 7;
       backToSki(state, x, zz, Math.PI);
-      state.vel.set(0, 0, 0);
-      state.speed = 0;
       blend = 0;
+      publishMode(state);
       return { x, z: zz };
     },
 
@@ -1440,7 +1883,8 @@ export function createResort(opts) {
 
     info() {
       return {
-        mode, phase, modeT, rideS, rideTotal, warmth, drink,
+        mode, phase, modeT, rideS, rideTotal, rideFrom, lapse: +lapse.toFixed(2),
+        skipArmed, warmth, drink, barBeat: +barBeat.toFixed(2),
         zones: zones.map((z) => ({ id: z.id, x: +z.x.toFixed(1), z: +z.z.toFixed(1), r: z.r, s: z.s })),
         cable: upCable ? { total: +upCable.total.toFixed(1), unloadAt: +liftTop.toFixed(1), midS: midS && +midS.toFixed(1) } : null,
         interiorTris: interior ? interior.triangles : 0,
