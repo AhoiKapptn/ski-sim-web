@@ -154,12 +154,19 @@ import * as THREE from 'three';
  * is not the presented interval, and this build does not have one (the GPU timer
  * is inflated by submission count; gl.finish() does not drain — see trap 7).
  *
- * Defaults: aa off, scale 1, adaptive ON above MIN_MPX (2.5 Mpx) with a 0.7
- * floor. Independent review measured the quality cost at that floor as −0.3% to
- * −5.4% snow micro-contrast, ≤0.4 L* and ≤0.003 B/R, no rings, no fireflies and
- * corduroy still parallel — against the alternative of every frame missing 20 ms.
- * `?adaptive=0` opts out. It does NOT hold a locked 60 at 5.76 Mpx (0.7 measures
- * p50 21.8 / p99 25.7 ms); what it guarantees is no frame over 33 ms.
+ * Defaults: aa off, adaptive ON above MIN_MPX (2.5 Mpx) with a 0.7 floor that
+ * RELAXES BY DISPLAY SIZE (see FLOOR_MPX below: a rung under 0.7 is allowed
+ * whenever it still renders >= 2.3 Mpx), and a START capped at INIT_MPX
+ * (5.8 Mpx) so a fullscreen 5K display does not boot into a 15 s slideshow
+ * while the ladder walks down. Independent review measured the quality cost of
+ * the 0.7 floor on a 5.76 Mpx backbuffer as −0.3% to −5.4% snow
+ * micro-contrast, ≤0.4 L* and ≤0.003 B/R, no rings, no fireflies and corduroy
+ * still parallel — against the alternative of every frame missing 20 ms.
+ * `?adaptive=0` opts out. It does NOT hold a locked 60 at 5.76 Mpx (0.7
+ * measures p50 21.8 / p99 25.7 ms); what it guarantees is no frame over 33 ms
+ * — a guarantee that only holds because of the Mpx-based floor: at a
+ * fullscreen 14.7 Mpx backbuffer the old 0.7 fraction still rendered 7.2 Mpx,
+ * which is slower than the "before" this feature was built against.
  *
  * Override per-session with query params — no rebuild needed:
  *
@@ -176,7 +183,9 @@ import * as THREE from 'three';
  *     ?adaptive=1      enable (still inert below MIN_MPX)
  *     ?adaptive=force  enable AND bypass the MIN_MPX guard — testing only
  *     ?fpstarget=30    budget in fps the controller aims to hold (default 60)
- *     ?rfloor=0.6      lowest linear scale it may fall to (default 0.7)
+ *     ?rfloor=0.6      lowest linear scale it may fall to (default 0.7, and an
+ *                      explicit value is honoured to the letter — the
+ *                      display-size relaxation only applies to the default)
  *
  * or at runtime via `window.__harness.gfx`.
  */
@@ -209,12 +218,46 @@ export function createEngine(container, opts = {}) {
   // "every frame misses 33 ms" into "no frame does", but it is NOT a locked 60.
   // 0.7 is the default floor because 36% of native is a large visible cut to make
   // on someone's behalf; `?rfloor=0.6` goes further.
-  const STEPS = [1.0, 0.9, 0.8, 0.7, 0.6];
+  const STEPS = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4];
   let minScale = num('rfloor', opts.minResolutionScale ?? 0.7);
+  // Was the floor an explicit instruction? An explicit `?rfloor=` is honoured
+  // to the letter, like `?rscale=`. Only the DEFAULT floor gets the
+  // display-size relaxation below.
+  const rfloorExplicit = qs.get('rfloor') !== null || opts.minResolutionScale !== undefined;
+  /**
+   * The FLOOR IS IN MEGAPIXELS, not only in scale — the 0.7 default was
+   * calibrated on a 5.76 Mpx backbuffer (1600x900 CSS at DPR 2), where it
+   * renders 2.8 Mpx and costs -0.3% to -5.4% micro-contrast. Nobody ever
+   * measured a real fullscreen window: a 16" MacBook is 7.7 Mpx and a 5K
+   * display is 14.7 Mpx, where the same 0.7 still renders 7.2 Mpx — measured
+   * at p50 53.3 ms NATIVE (n=224, every frame over 33 ms) — so the controller
+   * bottomed out deep in slideshow territory and its "no frame over 33 ms"
+   * guarantee silently broke exactly on the displays that needed it. The
+   * cost curve is also superlinear past ~5.8 Mpx (77.5 ms at 9.0 Mpx where
+   * every linear fit predicts 40-54; CLAUDE.md trap 5), which is why the
+   * breakage grows faster than the display does.
+   *
+   * So a rung below the linear floor is allowed when it still yields at least
+   * FLOOR_MPX — more pixels than the 1.44 Mpx every review of this project
+   * actually looked at. On a 5.76 Mpx backbuffer 0.6 gives 2.07 Mpx < FLOOR_MPX
+   * and stays forbidden, so every previously measured configuration is
+   * bit-identical; on 14.7 Mpx the ladder can reach 0.4 (2.36 Mpx), which is
+   * what turns 19 fps into a playable frame.
+   */
+  const FLOOR_MPX = 2.3;
+  /** Native (scale-1) megapixels, before the renderer exists on first call. */
+  const nativeMpx = () => {
+    const pr = Math.min(devicePixelRatio || 1, maxPixelRatio);
+    return (innerWidth * pr * innerHeight * pr) / 1e6;
+  };
   /** Deepest ladder index the floor allows. */
   const maxStep = () => {
     let m = 0;
-    for (let i = 0; i < STEPS.length; i++) if (STEPS[i] >= minScale - 1e-6) m = i;
+    for (let i = 0; i < STEPS.length; i++) {
+      const ok = STEPS[i] >= minScale - 1e-6
+        || (!rfloorExplicit && nativeMpx() * STEPS[i] * STEPS[i] >= FLOOR_MPX);
+      if (ok) m = i;
+    }
     return m;
   };
   /**
@@ -266,6 +309,28 @@ export function createEngine(container, opts = {}) {
   // so "verified inert at DPR 1" was vacuous: at 1.44 Mpx it would step. Only
   // `?adaptive=force` bypasses the guard now.
   const forceAdaptive = adaptiveQ === 'force' || opts.forceAdaptive === true;
+
+  // --- capped START, in megapixels -------------------------------------------
+  // The controller always began at scale 1 and walked down one rung per
+  // HOLD_MS-plus-a-45-frame-window — which at the 53 ms frames a fullscreen 5K
+  // display produces natively is a 15-20 s slideshow after every boot before
+  // it even reaches the floor. The walk exists to find the UNKNOWN budget rung;
+  // there is nothing unknown about the start being over the top of the measured
+  // cost window (5.8 Mpx, past which the cost curve is superlinear — trap 5).
+  // So when the controller is on and nothing is pinned, the starting rung is
+  // the largest one at or under INIT_MPX, and the ladder still climbs from
+  // there if the machine turns out to afford more. Every backbuffer at or
+  // under 5.8 Mpx — which includes every configuration this project has ever
+  // measured or reviewed — starts at native exactly as before.
+  const INIT_MPX = 5.8;
+  if (adaptive && !rscalePinned && explicitPixelRatio === null) {
+    for (let i = 0; i < STEPS.length; i++) {
+      if (nativeMpx() * STEPS[i] * STEPS[i] <= INIT_MPX || i === maxStep()) {
+        if (STEPS[i] < resolutionScale) resolutionScale = STEPS[i];
+        break;
+      }
+    }
+  }
 
   let targetFps = num('fpstarget', opts.targetFps ?? 60);
   const budget = () => 1000 / Math.max(15, targetFps);

@@ -72,8 +72,8 @@ function check(name, pass, detail) {
 const server = await startServer({ port: 5331 });
 
 /** Boot a fresh page, drive the carve path, return a probe handle. */
-async function session(dpr, query) {
-  const { browser, page, errors } = await launch({ dpr });
+async function session(dpr, query, size = {}) {
+  const { browser, page, errors } = await launch({ ...size, dpr });
   // NOT frozen: the controller is the thing under test here.
   await boot(page, server.url + (query || ''), { freezeAdaptive: false });
   await installPath(page, { lead: 1.2, amp: 0.85, period: 2.6 });
@@ -299,10 +299,20 @@ try {
     const s = await session(2, '?rscale=0.6&adaptive=1&rfloor=0.6');
     await sleep(HOLD);
     const i = await s.info();
-    // 0.6 is the floor here, so the only legal outcome is "stayed at 0.6".
-    // The bug produced 0.90 — 2.25x the pixels — while trying to reduce cost.
-    check('rscale-nostepup', i.resolutionScale <= 0.6 + 1e-6,
-      `explicit rscale 0.6 + adaptive: scale ${i.resolutionScale} (bug gave 0.90), events ${i.adaptiveEvents}`);
+    // This case used to assert "stayed at 0.6", which was true only while every
+    // rung above 0.6 was over budget on the test machine — the header has
+    // always documented that ?rscale + ?adaptive may legitimately climb once
+    // the frame has headroom, and the snow-shader rock gate made 0.7 (2.8 Mpx)
+    // genuinely meet 60 fps here, so the old assertion now fails on correct
+    // behaviour. The bug this case exists for is the index/scale desync that
+    // stepped UP to 0.90 — 2.25x the pixels — WHILE OVER BUDGET, in the very
+    // window that demanded a step down. So assert the actual invariant: no
+    // logged upward step may carry an over-budget p70. (b*1.02 = 17.0 ms is
+    // the controller's own "meeting" bound at 60 fps; 17.1 allows float noise.)
+    const badUp = (i.adaptiveLog || []).filter((e) => e.to > e.from && e.p70 > 17.1);
+    check('rscale-nostepup', badUp.length === 0,
+      `explicit rscale 0.6 + adaptive: scale ${i.resolutionScale}, events ${i.adaptiveEvents}, `
+      + `up-steps while over budget: ${JSON.stringify(badUp)} (the desync bug stepped 0.6 -> 0.90 over budget)`);
     await s.close();
   }
 
@@ -332,6 +342,41 @@ try {
     const a = await s.info();
     check('pixelratio-pin', Math.abs(a.megapixels - b.megapixels) < 0.01 && a.adaptiveEvents === eventsAtPin,
       `pinned ${b.megapixels} Mpx -> ${a.megapixels} Mpx, events ${eventsAtPin} -> ${a.adaptiveEvents} (bug gave 0.706 Mpx)`);
+    await s.close();
+  }
+
+  // --- 8: display-size awareness --------------------------------------------
+  // Every measurement in this project's history used a 1600x900 CSS viewport.
+  // A real fullscreen window is 7.7 Mpx (16" MacBook) to 14.7 Mpx (5K), where
+  // the fractional 0.7 floor still rendered 7.2 Mpx — measured p50 53.3 ms
+  // NATIVE, i.e. the controller's "no frame over 33 ms" guarantee silently
+  // broke exactly on big displays — and the walk down from a scale-1 start was
+  // a 15-20 s slideshow after every boot. Both fixes are config-visible, so
+  // these assertions are deterministic and do not depend on this machine's
+  // frame cost.
+  {
+    // A 5K fullscreen backbuffer: 2560x1440 CSS at DPR 2 = 14.75 Mpx native.
+    const s = await session(2, '', { w: 2560, h: 1440 });
+    const i = await s.info();
+    // START must be capped at INIT_MPX (5.8): sqrt(5.8 / 14.75) = 0.63, so the
+    // starting rung is 0.6 (5.3 Mpx) — not native, and no slideshow-walk.
+    check('start-capped', i.resolutionScale <= 0.6 + 1e-6 && i.megapixels < 5.9,
+      `5K start: scale ${i.resolutionScale}, ${i.megapixels} Mpx (was scale 1 = 14.75 Mpx)`);
+    // The FLOOR must relax by display size: 0.4 renders 2.36 Mpx >= FLOOR_MPX
+    // (2.3) here, so the deepest allowed rung must be 0.4, not 0.7.
+    check('floor-mpx-relaxed', i.adaptiveSteps[i.adaptiveMaxStep] <= 0.4 + 1e-6,
+      `5K floor: deepest rung ${i.adaptiveSteps[i.adaptiveMaxStep]} (fractional floor left 7.2 Mpx)`);
+    await s.close();
+  }
+  {
+    // ...and on the 5.76 Mpx backbuffer every prior review looked at, both are
+    // unchanged: 0.6 would render 2.07 Mpx < FLOOR_MPX, so the floor stays 0.7,
+    // and 5.76 <= INIT_MPX so the start stays native.
+    const s = await session(2, '');
+    const i = await s.info();
+    check('floor-mpx-inert', Math.abs(i.adaptiveSteps[i.adaptiveMaxStep] - 0.7) < 1e-6
+      && i.resolutionScale === 1,
+      `5.76 Mpx: deepest rung ${i.adaptiveSteps[i.adaptiveMaxStep]}, start scale ${i.resolutionScale} (both must be untouched)`);
     await s.close();
   }
 } catch (e) {
