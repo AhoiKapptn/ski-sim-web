@@ -3481,6 +3481,40 @@ export function createScatter(scene, terrain) {
   const matRider = patchProp(new THREE.MeshStandardMaterial({
     vertexColors: true, roughness: 0.72, metalness: 0.04,
   }), 'sc-rider', uRiderMinR, 140);
+  // Snow bounce, the same radiance argument the buildings and the player rig
+  // already won (skier.js: "on the shaded side of a backlit skier that bounce
+  // IS the light"). The sky IBL's lower hemisphere is empty, so a figure
+  // standing mid-piste on a 0.82-albedo reflector integrated to almost nothing
+  // on every face not aimed at the sun — and since a rider at 40-100 m shows
+  // the camera mostly its shaded side, the whole field read as burnt
+  // silhouettes: a green jacket and a black one were the same figure. Same
+  // weights as matBuild; a rider has the same unobstructed view of the
+  // snowfield and the dome that a hut wall has.
+  {
+    const inner = matRider.onBeforeCompile;
+    matRider.onBeforeCompile = (shader) => {
+      inner(shader);
+      shader.uniforms.uBounce = uniforms.uBounce;
+      shader.uniforms.uSkyFill = uniforms.uSkyFill;
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', /* glsl */`
+          #include <common>
+          uniform vec3 uBounce;
+          uniform vec3 uSkyFill;
+        `)
+        .replace('#include <lights_fragment_end>', /* glsl */`
+          #include <lights_fragment_end>
+          {
+            float wUp = dot( normal, viewMatrix[ 1 ].xyz );
+            float dwn = clamp( 0.5 - 0.5 * wUp, 0.0, 1.0 );
+            vec3 amb = uBounce * ( 0.80 * ( 0.34 + 0.66 * dwn ) )
+                     + uSkyFill * ( 0.22 * ( 0.30 + 0.70 * ( 1.0 - dwn ) ) );
+            reflectedLight.indirectDiffuse += amb * material.diffuseColor;
+          }
+        `);
+    };
+    matRider.customProgramCacheKey = () => 'sc-rider';
+  }
 
   /**
    * Buildings, and the same radiance argument the near-field conifers already
@@ -5577,8 +5611,14 @@ export function createScatter(scene, terrain) {
     head.dispose();
     // goggles
     boxAt(gb, new THREE.Vector3(0, 1.63, 0.20), new THREE.Vector3(0.20, 0.075, 0.08), 0, [0.30, 0.55, 0.75]);
-    // small pack, so the back silhouette is not a smooth cylinder
-    boxAt(gb, new THREE.Vector3(0, 1.24, -0.14), new THREE.Vector3(0.30, 0.36, 0.14), 0, DARK);
+    // Small pack, so the back silhouette is not a smooth cylinder. It used to
+    // be a 0.30 x 0.36 near-black box — which is the whole torso, seen from
+    // behind, and behind is the default view of a skier you are following: the
+    // jacket colour only survived on the arms and every rider read as a dark
+    // silhouette with coloured sleeves. Smaller, and tinted as jacket-matched
+    // kit (the vertex colour multiplies the per-instance jacket), so the
+    // colour identity survives the view that actually matters.
+    boxAt(gb, new THREE.Vector3(0, 1.26, -0.13), new THREE.Vector3(0.24, 0.28, 0.11), 0, [0.42, 0.42, 0.46]);
     return gb.geo();
   }
 
