@@ -369,14 +369,19 @@ try {
     await s.close();
   }
   {
-    // ...and on the 5.76 Mpx backbuffer every prior review looked at, both are
-    // unchanged: 0.6 would render 2.07 Mpx < FLOOR_MPX, so the floor stays 0.7,
-    // and 5.76 <= INIT_MPX so the start stays native.
+    // ...and on the 5.76 Mpx backbuffer, the START is unchanged (5.76 <=
+    // INIT_MPX, so captures still boot at native), and the deepest rung is 0.5
+    // — 1.44 Mpx, exactly the 1600x900 every review of this project was judged
+    // at, and never less (0.4 would render 0.92 Mpx and stays forbidden).
+    // FLOOR_MPX was recalibrated from 2.3 to 1.4 after measuring pinned rungs
+    // in a HEADED browser: the real environment is 3-5 ms/frame slower than
+    // headless at equal Mpx, and the old cutoff pinned the controller at 0.7 =
+    // p50 20.5 ms with downTest=true — wanting a rung it was not allowed.
     const s = await session(2, '');
     const i = await s.info();
-    check('floor-mpx-inert', Math.abs(i.adaptiveSteps[i.adaptiveMaxStep] - 0.7) < 1e-6
+    check('floor-mpx-576', Math.abs(i.adaptiveSteps[i.adaptiveMaxStep] - 0.5) < 1e-6
       && i.resolutionScale === 1,
-      `5.76 Mpx: deepest rung ${i.adaptiveSteps[i.adaptiveMaxStep]}, start scale ${i.resolutionScale} (both must be untouched)`);
+      `5.76 Mpx: deepest rung ${i.adaptiveSteps[i.adaptiveMaxStep]} (want 0.5 = 1.44 Mpx, the review resolution), start scale ${i.resolutionScale} (must stay native)`);
     await s.close();
   }
 } catch (e) {

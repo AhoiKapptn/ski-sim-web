@@ -238,13 +238,29 @@ export function createEngine(container, opts = {}) {
    * breakage grows faster than the display does.
    *
    * So a rung below the linear floor is allowed when it still yields at least
-   * FLOOR_MPX — more pixels than the 1.44 Mpx every review of this project
-   * actually looked at. On a 5.76 Mpx backbuffer 0.6 gives 2.07 Mpx < FLOOR_MPX
-   * and stays forbidden, so every previously measured configuration is
-   * bit-identical; on 14.7 Mpx the ladder can reach 0.4 (2.36 Mpx), which is
-   * what turns 19 fps into a playable frame.
+   * FLOOR_MPX. The first cut of this was 2.3 Mpx, derived from HEADLESS
+   * frame costs — and a real, headed browser on a live desktop is 3-5 ms
+   * SLOWER per frame than headless Chrome at the same megapixels (real
+   * compositor, real 120 Hz pacing, the desktop behind it). Measured in
+   * headed Brave on the 16" MBP (1728x866 CSS at DPR 2 = 5.99 Mpx native,
+   * pinned rungs, uncontended, canonical carve):
+   *
+   *     scale 1.0  5.99 Mpx   p50 31.0 ms          0.7  2.93 Mpx   p50 20.5
+   *     scale 0.8  3.83 Mpx   p50 23.6             0.6  2.15 Mpx   p50 17.4
+   *                                                0.5  1.50 Mpx   p50 12.7-14.9
+   *
+   * i.e. the rung that actually holds 60 fps in the game's real environment is
+   * 0.5-0.6, and a 2.3 Mpx cutoff forbade it — the controller sat pinned at
+   * 0.7 with downTest=true, wanting a rung it was not allowed. atFloor+
+   * downTest is exactly that signature in gfx.info().lastDecision.
+   *
+   * 1.4 Mpx is the floor instead, because 1.44 Mpx (1600x900) is the
+   * resolution every quality review and screenshot of this project was judged
+   * at — the documented look of the game IS the look at this pixel count. The
+   * floor is only permission, not a target: machines that meet budget at a
+   * higher rung never descend to it.
    */
-  const FLOOR_MPX = 2.3;
+  const FLOOR_MPX = 1.4;
   /** Native (scale-1) megapixels, before the renderer exists on first call. */
   const nativeMpx = () => {
     const pr = Math.min(devicePixelRatio || 1, maxPixelRatio);
