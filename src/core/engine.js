@@ -302,8 +302,22 @@ export function createEngine(container, opts = {}) {
   // controller out of the way of `shoot.mjs`, which boots, waits ~1.2 s and then
   // pauses the sim — without this grace period it had already stepped to 0.9 by
   // then and `--dpr 2` screenshots came out at 4.67 Mpx instead of 5.76.
-  const START_GRACE_MS = 4000;
+  //
+  // 2.5 s, down from 4. The capture-tool half of the argument no longer needs
+  // the length: `__setAuto(false)` now pauses the controller directly (see
+  // `simPaused`), and every capture tool pauses within ~1.2 s of boot. What the
+  // grace still has to cover is the link stalls, and those are over by ~2 s.
+  // The cost of every extra grace second is a second of the player's FIRST
+  // IMPRESSION spent at a rung the machine may not afford — measured in headed
+  // Brave, the whole pre-settle stretch runs 25-38 ms/frame.
+  const START_GRACE_MS = 2500;
   let firstFrameAt = 0;
+  // A first impression is also why the boot phase decides on less evidence: 24
+  // frames instead of 45. At 30 ms/frame the full window is 1.4 s of visible
+  // chop per decision; the boot phase trades statistical confidence for
+  // reaction time, and a wrong step is corrected one window later anyway.
+  const BOOT_WINDOW = 24;
+  const BOOT_PHASE_MS = 8000;   // after the grace; boot calibration lives here too
 
   // `?rscale=` / `opts.resolutionScale` is an explicit instruction about the
   // resolution. The header documents it as pinning, so it pins: the controller
@@ -398,7 +412,13 @@ export function createEngine(container, opts = {}) {
   // the image visibly breathes. A step down is evidence that that index was too
   // expensive a moment ago; respect it for a while, then let it be retried.
   const upBlockUntil = new Float64Array(STEPS.length);
-  const UP_BACKOFF_MS = 8000;
+  // 8 s was enough to stop the original 0.7 <-> 0.8 flip-flop, but a real run
+  // crosses cost boundaries with the TERRAIN — the forest belt is dearer than
+  // the open piste — so an 8 s retry re-probed a known-expensive rung several
+  // times per descent, and every hop reallocates ~12 render targets (a visible
+  // hitch) and visibly changes sharpness. A rung that was too expensive stays
+  // distrusted for 20 s; the terrain the player is on changes slower than that.
+  const UP_BACKOFF_MS = 20000;
   // Own log of steps taken. `perf.mark()` cannot be used here: it is a no-op
   // unless `perf.recording`, and the controller returns early whenever perf IS
   // recording, so that call could never once have fired.
@@ -512,9 +532,11 @@ export function createEngine(container, opts = {}) {
     const idx = nearestStep(resolutionScale);
     if (!forceAdaptive && mpxNow() < MIN_MPX && idx === 0) return;
 
+    const bootPhase = now - firstFrameAt < START_GRACE_MS + BOOT_PHASE_MS;
+    const effWindow = bootPhase ? BOOT_WINDOW : WINDOW;
     samples[sampleAt++ % WINDOW] = now - prev;
     if (nSamples < WINDOW) nSamples++;
-    if (nSamples < WINDOW || now - lastChange < HOLD_MS) return;
+    if (nSamples < effWindow || now - lastChange < HOLD_MS) return;
 
     const b = budget();
     // p70/p30 rather than a mean: the mean is dragged around by the vsync mode
@@ -543,6 +565,9 @@ export function createEngine(container, opts = {}) {
       // here is an integer multiple of the ~8.33 ms begin-frame tick.
       tickMultiple: +(p70 / 8.3333).toFixed(2),
       downTest: p70 > b * 1.12 && p30 > b * 1.05,
+      // fraction of the window landing a whole tick late — the judder signal
+      lateFrac: +(Array.prototype.reduce.call(samples.subarray(0, nSamples),
+        (a, v) => a + (v > b * 1.2 ? 1 : 0), 0) / nSamples).toFixed(2),
       atFloor: idx >= maxStep(),
       meeting: p70 <= b * 1.02,
       predictUp: predUp === null ? 'censored' : +predUp.toFixed(2),
@@ -563,9 +588,41 @@ export function createEngine(container, opts = {}) {
     // survivable rather than permanent is that the up-step below actually works:
     // when the lock lifts, the resolution comes back. It did not work before,
     // which is what turned a mode lock into irreversible damage.
-    if (p70 > b * 1.12 && p30 > b * 1.05) {
+    //
+    // THE JUDDER TEST, second clause. On a 120 Hz panel (every ProMotion Mac)
+    // the presented interval quantises to 8.33 ms ticks, so a rung whose true
+    // cost is 17-18 ms presents as an alternating 16.7 / 25.0 mix — visible
+    // judder — and the percentile test cannot see it: p70 reads 25 (over) but
+    // p30 reads 16.7 (under), so the controller PARKED there, juddering,
+    // indefinitely. Measured in headed Brave on the 16" MBP: rung 0.6 in the
+    // forest belt reads exactly that mix. The test that closes the dead zone
+    // is a FRACTION, not a percentile: if more than a third of the window
+    // lands a whole tick late (> b * 1.2 = 20 ms at 60 fps — a value that
+    // sits between the ticks of both a 60 Hz and a 120 Hz panel, so a clean
+    // 16.7 lock can never trip it), the rung is producing judder and is too
+    // expensive, whatever p30 says.
+    // 0.25, down from a first cut at 0.35: measured in headed Brave, rung 0.6
+    // on the early piste hovered at 25-34% late — mean interval ~19 ms,
+    // plainly choppy to look at — and sat under the 0.35 gate for ten seconds.
+    // A clean 60 lock reads 0% late, so the risk of lowering the gate is only
+    // spurious down-steps on compositor flutter, which the up-path undoes.
+    let late = 0;
+    for (let k = 0; k < nSamples; k++) if (samples[k] > b * 1.2) late++;
+    const judder = late / nSamples > 0.25;
+    if ((p70 > b * 1.12 && p30 > b * 1.05) || judder) {
       if (idx < maxStep()) {
-        next = idx + 1;
+        // BOOT CALIBRATION: during the first seconds after the grace period the
+        // start rung (capped at INIT_MPX, not measured) can be several rungs
+        // over budget, and walking down one rung per window is 3-4 render-target
+        // reallocations — each a visible hitch — plus ~10 s of 25-30 ms frames
+        // as the player's FIRST IMPRESSION of the game. While inside the boot
+        // phase, jump one extra rung per ~5 ms of measured overshoot in ONE
+        // step (one reallocation). This is not a fabricated prediction in the
+        // trap-5 sense: it is deliberately conservative in the safe direction,
+        // and the next window corrects it — downward overshoot is exactly the
+        // error the reliable up-path exists to undo.
+        const extra = bootPhase ? Math.floor(Math.max(0, p70 - b) / 5) : 0;
+        next = Math.min(maxStep(), idx + 1 + extra);
         // This index was too expensive a moment ago. Don't come straight back.
         upBlockUntil[idx] = now + UP_BACKOFF_MS;
       }
