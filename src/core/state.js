@@ -24,7 +24,12 @@ export function createState() {
     airTime: 0,
     distance: 0,
     time: 0,
-    input: { steer: 0, crouch: 0, jump: false, brake: 0, action: false, actionPressed: false, pick: 0 },
+    input: {
+      steer: 0, crouch: 0, jump: false, brake: 0,
+      action: false, actionPressed: false,
+      // hut menu channels — see player/controls.js
+      pick: 0, navY: 0, confirm: false, confirmPressed: false,
+    },
 
     // ---- resort mode machine (game/resort.js owns every field below) --------
     /** 'ski' | 'lift' | 'drag' | 'hut'. Physics runs only in 'ski'. */

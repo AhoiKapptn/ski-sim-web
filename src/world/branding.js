@@ -1,13 +1,20 @@
 /**
- * Slope-side branding — sponsor boards at the piste edge.
+ * Slope-side branding — sponsor boards at the piste edge, and the two brand
+ * plates the Bergrestaurant hangs indoors.
  *
- * Four objects on a 1.4 km run: two A-frame sandwich boards (AhoiKapptn!, the
- * black lockup printed on a light panel) and two low advertising banners on
+ * Nine objects on a 1.4 km run: four A-frame sandwich boards (AhoiKapptn!, the
+ * black lockup printed on a light panel) and five low advertising banners on
  * posts standing in front of the B-net runs (BTM, white PVC). Nothing else. The
  * brief was "keep it very subtle", which is read here as a hard constraint: this
  * is what a sponsored piste looks like from the chair, not an ad hoarding.
  * Sizes, tints and counts are all set against that, and the numbers are in the
  * block comment above PLACEMENTS.
+ *
+ * This module also owns the two CLEAN, unweathered plates of the same marks that
+ * hang inside the hut, but it does not place them: `api.atlas` hands the texture
+ * and the plate UVs to `game/resort.js`, which builds them into its own unlit
+ * interior. One canvas, one upload, one place either PNG is composited. See the
+ * accessor's own comment for the two rules a consumer has to follow.
  *
  * A fifth object — a feather flag near the start — was built and then DELETED.
  * Two measured reasons, both fatal, neither rescuable by tuning:
@@ -108,10 +115,12 @@
  *  * A capture must never quietly contain the fallback letterforms. The mesh is
  *    therefore HIDDEN until `ready` resolves; see the note at `scene.add`.
  *
- * Everything is merged into one geometry with one material: 188 triangles, and
- * MEASURED against a --nobrand run of the same framing, +3 draw calls and +1000
- * triangles per frame — the multiple is the shadow cascades, which the colour
- * pass alone does not show. No per-frame work beyond copying three uniforms.
+ * Everything on the slope is merged into one geometry with one material. At four
+ * objects that was 188 triangles, MEASURED against a --nobrand run of the same
+ * framing at +3 draw calls and +1000 triangles per frame — the multiple is the
+ * shadow cascades, which the colour pass alone does not show. Nine objects scale
+ * that linearly (`debug.tris`) and change neither the draw-call count nor the
+ * per-frame work, which is still copying three uniforms.
  */
 import * as THREE from 'three';
 
@@ -174,9 +183,25 @@ const BOARD_W = 1.30, BOARD_H = 0.76, BOARD_LEAN = 0.34;   // rad from vertical
  * close enough that the mark resolves for the second it is alongside, and far
  * enough that it is never in the ski line.
  *
- * Both banners are in front of a real B-net run: scatter's runs are
- * (sgn +1, z 560..300) and (sgn -1, z 120..-170), which is what fixes the SIGN
- * of the two banner offsets.
+ * Every banner is in front of a real B-net run, and that is what fixes the SIGN
+ * of its offset. scatter.js:4722 has THREE runs, not the two an earlier version
+ * of this comment listed — it missed the last one, which is why the bottom third
+ * of the piste had no hoarding at all:
+ *
+ *   sgn +1   z 560 .. 300      banners at z 516, 420
+ *   sgn -1   z 120 .. -170     banners at z -20, -104
+ *   sgn +1   z -420 .. -640    banner  at z -520
+ *
+ * A banner outside those spans is a hoarding standing on open snow with nothing
+ * behind it, which is the one placement that reads as a mistake rather than as
+ * a quiet sponsor.
+ *
+ * NINE objects over 1.4 km, up from four. The brief was and still is "keep it
+ * very subtle": at this count the player meets one roughly every 150 m, they are
+ * never two-in-frame except across the 516/420 pair (96 m apart, and the second
+ * is 0.6 of the first's height by then), and none of them is within 20 m of the
+ * ski line. That is a sponsored piste. Adding a tenth is not a free decision —
+ * the count is the whole difference between branding and an ad hoarding.
  */
 const PLACEMENTS = [
   // The run's first object. It stands where the deleted feather flag stood
@@ -185,8 +210,13 @@ const PLACEMENTS = [
   // board at the flag's old z on the board's own -26 m offset keeps that.
   { kind: 'board', z: 664, off: -26.0, yaw: 0.36, tint: 0.96 },
   { kind: 'banner', z: 516, off: 49.5, yaw: -0.20, tint: 0.97 },
+  { kind: 'banner', z: 420, off: 49.5, yaw: -0.24, tint: 0.94 },
+  { kind: 'board', z: 372, off: 26.0, yaw: -0.34, tint: 0.95 },
   { kind: 'board', z: 128, off: -26.0, yaw: 0.40, tint: 0.93 },
+  { kind: 'banner', z: -20, off: -49.5, yaw: 0.22, tint: 0.96 },
   { kind: 'banner', z: -104, off: -49.5, yaw: 0.26, tint: 0.95 },
+  { kind: 'board', z: -296, off: -26.0, yaw: 0.30, tint: 0.94 },
+  { kind: 'banner', z: -520, off: 49.5, yaw: -0.28, tint: 0.93 },
 ];
 
 // ------------------------------------------------------------------- utilities --
@@ -251,10 +281,17 @@ function centrelineFromSeam(scatter) {
 // ===========================================================================
 // Atlas
 // ===========================================================================
-// One 1024^2 canvas, one texture, one draw call. Regions in canvas pixels,
-// y = 0 at the TOP of the canvas; `uvR` flips because CanvasTexture uploads
-// with flipY.
-const AT = 1024;
+// ONE canvas, one texture. Regions in canvas pixels, y = 0 at the TOP of the
+// canvas; `uvR` flips because CanvasTexture uploads with flipY.
+//
+// The canvas is 2048 x 1024 and the LEFT 1024 of it is byte-for-byte the atlas
+// this module shipped with — same region rectangles, same paint order, same
+// `rnd` stream. That is deliberate and it is the only reason the measured
+// numbers in AK_BASE and BTM_INK_LIFT still describe this build: every
+// interior region below is painted AFTER all six outdoor ones, so nothing it
+// draws can shift a random draw that an outdoor region consumes. Keep it that
+// way, or re-measure both tables.
+const ATW = 2048, ATH = 1024;
 // The feather flag's 256x700 region went with the flag, and all of it went into
 // the two regions that carry print — which is the only place resolution does
 // anything. R_AK is 3.5x the pixels it had (960x561 against 512x300, i.e. 1.87x
@@ -268,12 +305,35 @@ const R_BOARDB = [256, 958, 248, 66];   // board reverse, unprinted panel
 const R_SNOW   = [512, 958, 248, 66];   // crust along a top edge, drift at a foot
 const R_PAINT  = [768, 958, 248, 66];   // galvanised post / frame
 
+/**
+ * The INDOOR column — the same two marks, printed clean.
+ *
+ * They are separate regions and not a second use of R_BTM/R_AK because the
+ * outdoor pair is WEATHERED: grit thrown up off the piste, a dirt wash along the
+ * bottom, and — the one that cannot be talked away — a lip of settled snow
+ * painted along R_AK's bottom edge. Indoors that is snow lying on a wall, ten
+ * metres from a lit stove. The choice was a t-inset that crops the crust (it
+ * also crops the wordmark's descenders, because `fitBox` only leaves a 10%
+ * margin) or clean plates. Clean plates.
+ *
+ * The column starts at x = 1096 rather than hard against R_BTM's right edge at
+ * 1024. That 72 px gutter is mip protection: `uvR`'s 2-texel inset only holds at
+ * mip 0, and an outdoor banner at 28 m samples about mip 3, where the whole
+ * atlas is 256 px wide and a shared edge is a shared texel. 72 px is 9 texels at
+ * mip 3 and 4 at mip 4, which is past anything these panels are ever sampled at.
+ *
+ * (x 1096..2040, y 634..1016 is free. Anything painted there must be painted
+ * LAST, for the reason in the ATW comment.)
+ */
+const R_IN_BTM = [1096, 8, 944, 353];    // 2.674:1, clean PVC, hung over the bar
+const R_IN_AK  = [1096, 377, 944, 249];  // 3.791:1, clean panel, a plank sign
+
 /** s,t in 0..1 across a region; t = 0 is its BOTTOM edge in world terms. */
 function uvR(r, s, t) {
   const e = 2.0;                                    // texel inset, keeps mip
   const x = r[0] + e + s * (r[2] - 2 * e);          // levels from bleeding
   const y = r[1] + e + (1 - t) * (r[3] - 2 * e);    // between regions
-  return [x / AT, 1 - y / AT];
+  return [x / ATW, 1 - y / ATH];
 }
 
 function makeCanvas(w, h) {
@@ -786,13 +846,13 @@ export function createBranding(scene, terrain, scatter) {
   const centre = cx || corridorFormula;
 
   // ------------------------------------------------------------- the atlas --
-  const cv = makeCanvas(AT, AT);
+  const cv = makeCanvas(ATW, ATH);
   const g2 = cv.getContext('2d', { willReadFrequently: true });
   let painted = 'fallback';
 
   function paint(imgs) {
     const rnd = mulberry32(0xb1a5);
-    g2.clearRect(0, 0, AT, AT);
+    g2.clearRect(0, 0, ATW, ATH);
     g2.imageSmoothingEnabled = true;
     g2.imageSmoothingQuality = 'high';
 
@@ -848,6 +908,50 @@ export function createBranding(scene, terrain, scatter) {
     weather(g2, ...R_BOARDB, rnd, { dark: false });
     noiseFill(g2, R_SNOW, '#eef3f8', [214, 222, 232], rnd);
     noiseFill(g2, R_PAINT, '#8d9298', [58, 60, 64], rnd);
+
+    // --- the indoor column, LAST ------------------------------------------
+    // Everything above consumes `rnd` in a fixed order and the measured tables
+    // depend on it. Nothing below may move, so nothing below may run first.
+    //
+    // These two are print with no weathering at all: no grit, no dirt wash, no
+    // snow crust. A banner that has hung over a bar since November is dusty, not
+    // sandblasted, and the indoor bake is dim enough (a wall integrates to
+    // roughly a third of the lamp) that a dirt gradient on top of it only makes
+    // the mark harder to read for nothing.
+    {
+      // Same white PVC as the slope banner, because it IS the same banner —
+      // a hut hangs the one the sponsor sent.
+      g2.fillStyle = '#eeefeb';
+      g2.fillRect(...R_IN_BTM);
+      const bb = imgs?.btm ? contentBox(imgs.btm, 'alpha') : { x: 0, y: 0, w: 1.43, h: 1 };
+      const [dx, dy, dw, dh] = fitBox(...R_IN_BTM, bb.w / bb.h, 0.03, 0.06);
+      paintBtmInk(g2, imgs?.btm, bb, dx, dy, dw, dh);
+      // eyelets at the four corners, which is how a banner is actually hung
+      for (const px of [R_IN_BTM[0] + 16, R_IN_BTM[0] + R_IN_BTM[2] - 16]) {
+        for (const py of [R_IN_BTM[1] + 14, R_IN_BTM[1] + R_IN_BTM[3] - 14]) {
+          g2.strokeStyle = 'rgba(96,100,104,0.5)'; g2.lineWidth = 2.4;
+          g2.beginPath(); g2.arc(px, py, 4.2, 0, 6.2832); g2.stroke();
+        }
+      }
+    }
+    {
+      // A plank sign, so the AK lockup gets a region shaped like the artwork
+      // (4.61:1 content) instead of the 1.711:1 sandwich-board panel, where it
+      // is height-limited and two thirds of the region is empty grey. Same
+      // AK_BASE, for the same reason it is light outdoors: this room's brightest
+      // surface is the table at well under half scale and a dark panel would be
+      // the darkest thing in the hut.
+      g2.fillStyle = AK_BASE;
+      g2.fillRect(...R_IN_AK);
+      const bb = imgs?.ak ? contentBox(imgs.ak, 'alpha') : { x: 0, y: 0, w: 4.61, h: 1 };
+      const [dx, dy, dw, dh] = fitBox(...R_IN_AK, bb.w / bb.h, 0.045, 0.14);
+      if (imgs?.ak) g2.drawImage(imgs.ak, bb.x, bb.y, bb.w, bb.h, dx, dy, dw, dh);
+      else drawAkFallback(g2, dx, dy, dw, dh, AK_INK);
+      // a hairline routed border, which is what turns a rectangle of colour into
+      // a made object at the 2-6 m this is read from
+      g2.strokeStyle = 'rgba(70,76,84,0.34)'; g2.lineWidth = 3;
+      g2.strokeRect(R_IN_AK[0] + 11, R_IN_AK[1] + 11, R_IN_AK[2] - 22, R_IN_AK[3] - 22);
+    }
   }
 
   paint(null);
@@ -1114,12 +1218,44 @@ export function createBranding(scene, terrain, scatter) {
       liftOffset: cx.liftOffset };
   }
 
+  /**
+   * The indoor plates, for anything in the scene that wants to hang one of the
+   * two marks somewhere this module does not place objects — today that is the
+   * Bergrestaurant's wall (game/resort.js).
+   *
+   * It is an ACCESSOR and not a second atlas, and that is the whole point: there
+   * is one canvas, one upload, one place where either PNG is composited, and one
+   * place to look when a mark is wrong. A consumer gets the texture and the UVs
+   * of a named plate and builds its own geometry with its own material — the
+   * hut's interior is unlit and vertex-baked (see resort.js) and could not share
+   * this module's MeshStandardMaterial anyway.
+   *
+   * Two things a consumer has to know:
+   *   * `aspect(name)` is the plate's width:height. A quad that does not match it
+   *     stretches the artwork, which is the defect that killed the feather flag.
+   *   * the texture is repainted once, asynchronously, when the PNGs land. It is
+   *     the SAME texture object, so nothing needs rebuilding — but a capture
+   *     taken before `ready` shows the fallback letterforms indoors, where this
+   *     module's own `group.visible` gate cannot help. Every capture tool gates
+   *     on `harness.ready`, which is `branding.ready`; keep it that way.
+   */
+  const PLATES = { btm: R_IN_BTM, ak: R_IN_AK };
+  const atlas = {
+    tex,
+    names: Object.keys(PLATES),
+    /** UV of (s,t) in a named plate; t = 0 is its BOTTOM edge in world terms. */
+    uv(name, s, t) { return uvR(PLATES[name] || R_IN_BTM, s, t); },
+    /** width : height of the plate, so a quad can be cut to the print. */
+    aspect(name) { const r = PLATES[name] || R_IN_BTM; return r[2] / r[3]; },
+  };
+
   const api = {
     group,
     ready,
     loaded: 'fallback',
+    atlas,
     get textured() { return painted; },
-    debug: { items, centrelineCheck, tris: gb.tris, canvas: cv, tex, mat, uniforms },
+    debug: { items, centrelineCheck, tris: gb.tris, canvas: cv, tex, mat, uniforms, plates: PLATES },
 
     update() { if (own) syncRadiance(); },
 

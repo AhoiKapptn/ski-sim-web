@@ -41,17 +41,23 @@ subsystem each frame. Read what you need; only the owner writes each field.
 | `crouch` | 0..1 | physics | tuck amount |
 | `gForce` | number | physics | lateral load, drives spray volume + cam shake |
 | `airTime`,`distance`,`time` | number | physics | run stats for HUD |
-| `input` | object | controls | `{steer,crouch,jump,brake,action,actionPressed,pick}` |
+| `input` | object | controls | `{steer,crouch,jump,brake,action,actionPressed,pick,navY,confirm,confirmPressed}` |
 | `mode` | string | resort | `'ski' \| 'lift' \| 'drag' \| 'hut'` — see below |
 | `modeT` | number | resort | seconds since the mode was entered |
 | `prompt` | object\|null | resort | contact prompt `{key,text,sub,ready}` |
 | `ride` | object\|null | resort | `{kind,name,s,total,progress,speed,lapse,hint,option}` |
-| `hut` | object\|null | resort | `{name,choices,drink,served,run,hint}` |
+| `hut` | object\|null | resort | the card: `{name,altitude,sections,menu,cursor,order,drink,served,run,hint}` — see below |
 | `warmth` | 0..1 | resort | drains while skiing, refilled by a hot drink |
 | `run` | object | resort | live maxima `{top,bestAir}` for the current run |
 | `runs` | array | resort | one entry per drink taken, with the run it closed |
 | `veil` | 0..1 | resort | screen dip through a door or a skipped ride |
 | `glow` | 0..1 | resort | warm flash on the first sip |
+
+`state.hut.menu` is `game/resort.js`' `MENU` table with two runtime flags folded
+in (`on` = in front of you, `sel` = under the cursor). `ui/hud.js` prints it and
+`buildInterior` letters the same rows onto the chalk board on the wall, so
+neither of them owns a price and the board and the card cannot disagree. Adding
+a line is one row in `MENU`; nothing else changes.
 
 ### `state.mode` — the one authority on "is the player skiing?"
 
@@ -99,6 +105,40 @@ The chairlift's default destination is the **mid-station**, which is where the
 restaurant is; staying on for the summit is offered as a prompt on the approach.
 A full-line ride is 152 s against the 867 s it would be at literal line speed.
 
+### The Bergrestaurant
+
+`buildings[0]` is `w: 8.5, d: 12.0` and those are HALF-extents, so the enterable
+room is **16.2 x 23.2 m** — 374 m of floor under a 2.62 m ceiling. It is
+furnished as a self-service hall: three columns of long communal tables with
+benches, a tray rail and a pastry case along the counter, a boot-and-coat zone at
+the door (the door is on the `+c` gable), bunting between the beams, and a
+pendant over every table. Thirteen patrons sit or stand in it.
+
+Two invariants the layout is built around, both of which the camera enforces:
+
+- the aisle `a = 3.6 .. 6.8` in front of the counter is left **clear**, because
+  `barCam` flies down it on every order;
+- nothing stands at the window table or between it and the glass, because that is
+  the hero framing and the player is sitting in it.
+
+It is **one unlit draw call for the timber**, plus one for the emissive bits, one
+for the patrons, one for the brand plates, one for the chalk board and one for
+whatever is on the table — 11 830 triangles, `visible = false` whenever the player
+is outside, and **222 draw calls per frame indoors against 531 on the snow**. The
+lighting is baked into the vertex colours by `bakeInterior`, so the room adds no
+light to the scene: a `PointLight` would change the lights uniform block and force
+every material in the scene to relink.
+
+Because the light is per-VERTEX, **every large surface has to be subdivided** —
+`SEG` is 1.15 m, a little under half the 3.0 m lamp range. The floor, walls and
+ceiling shipped as one quad each in the long direction, which is why the room
+looked flat and why nine pendants initially lit nothing at all.
+
+The patrons are static geometry with a nine-line vertex shader that leans each
+figure 1.2 cm on two slow periods (`SwayBld`). A baked room cannot have skinned
+people in it, and a dozen people frozen mid-gesture read as mannequins — the tell
+is that nothing moves, not that the pose is wrong.
+
 Forcing a mode from the harness (this is how the feature gets screenshot):
 
 ```js
@@ -106,7 +146,8 @@ harness.debug.resort.enter('lift', { at: 'mid', progress: 0.35 })
 harness.debug.resort.enter('lift', { to: 'summit' })       // the full line, not the mid leg
 harness.debug.resort.enter('lift', { instant: false })     // keep the boarding move
 harness.debug.resort.enter('drag', { progress: 0.45 })
-harness.debug.resort.enter('hut',  { drink: 'beer' })
+harness.debug.resort.enter('hut',  { drink: 'beer' })              // an alias; 'weissbier' also works
+harness.debug.resort.enter('hut',  { drink: 'gulasch' })           // any MENU id
 harness.debug.resort.enter('hut',  { drink: 'beer', beat: true })  // play the trip to the bar
 harness.debug.resort.enter('ski')
 harness.debug.resort.goto('chair-mid' | 'chair-bottom' | 'tbar' | 'hut')  // park next to it
@@ -139,8 +180,8 @@ Dispatch on `typeof third === 'number'`.
 | `world/snow-material.js` | `createSnowMaterial(opts)` | the snow shader: sparkle, sheen, subsurface, wind ripples |
 | `world/scatter.js` | `createScatter(scene, terrain)` | instanced trees, rocks, lift towers, gates, fences |
 | `world/draglift.js` | `createDragLift(scene, terrain, {towers})` | the T-bar: pylons, rope, circulating bars, stations. Places itself off `scatter.lift.towers[]` so it never re-derives the corridor |
-| `game/resort.js` | `createResort({...})` | the mode machine: boarding zones, the chair and T-bar rides, the hut interior, and every camera that is not `chaseCam` |
-| `world/branding.js` | `createBranding(scene, terrain, scatter)` | slope-side sponsor banners and boards at the piste edge — two BTM, two AhoiKapptn!, one merged geometry and one atlas, so the whole set is one draw call. Reads placement off scatter's public seam rather than re-deriving the corridor. Ships **the only binary assets in the repo** (`public/brand/*.png`), a scoped exception documented in the file header. Returns `ready`, which resolves once those PNGs are composited into the atlas; the group stays `visible = false` until then, so a capture taken too early contains *nothing* rather than silently containing the procedural fallback |
+| `game/resort.js` | `createResort({...})` | the mode machine: boarding zones, the chair and T-bar rides, the Bergrestaurant (a furnished 16 x 23 m hall, thirteen patrons, an eight-line menu), and every camera that is not `chaseCam`. Takes `branding` for its atlas alone |
+| `world/branding.js` | `createBranding(scene, terrain, scatter)` | slope-side sponsor banners and boards at the piste edge — five BTM, four AhoiKapptn!, one merged geometry and one atlas, so the whole set is one draw call. Also owns the two CLEAN plates of the same marks that the hut hangs indoors, handed to `game/resort.js` through `api.atlas` (texture + plate UVs) rather than composited twice. Reads placement off scatter's public seam rather than re-deriving the corridor. Ships **the only binary assets in the repo** (`public/brand/*.png`), a scoped exception documented in the file header. Returns `ready`, which resolves once those PNGs are composited into the atlas; the group stays `visible = false` until then, so a capture taken too early contains *nothing* rather than silently containing the procedural fallback |
 | `player/skier.js` | `createSkier(scene)` | skier mesh/rig + procedural animation from `state` |
 | `player/physics.js` | `class SkiPhysics` | carving dynamics, edges, air, landings |
 | `player/controls.js` | `createControls()` | keyboard/gamepad → `state.input` |

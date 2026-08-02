@@ -10,13 +10,27 @@
  *   Ctrl / X or LT               brake   (0..1, hockey stop)
  *   Space or A-button            pop     (hold to pre-load, release to unweight)
  *   E or Y-button                action  (board a lift, step into the hut, get off)
- *   1 / 2                        pick    (order at the bar)
+ *   1 .. 9                       pick    (order that line off the hut's menu)
+ *   W/S, ↑/↓ or dpad up/down     navY    (move the menu cursor: +1 up, -1 down)
+ *   Enter, Space or A-button     confirm (order the highlighted line)
  *
- * `action` and `pick` exist for the resort mode machine (`game/resort.js`) and
- * are the ONLY keys that mean different things in different modes — everything
- * above always means the same thing. `action` is published both as a level and
- * as an edge (`actionPressed`), because the mode machine wants the edge and
- * because a level that is read twice in one frame would double-fire.
+ * `action`, `pick`, `navY` and `confirm` exist for the resort mode machine
+ * (`game/resort.js`) and are the ONLY keys that mean different things in
+ * different modes — everything above always means the same thing. `action` is
+ * published both as a level and as an edge (`actionPressed`), because the mode
+ * machine wants the edge and because a level that is read twice in one frame
+ * would double-fire; `confirm` is published the same way and for the same reason.
+ *
+ * ### The menu channels are separate from the driving channels ON PURPOSE
+ *
+ * `navY` is the same PHYSICAL keys as tuck, and `confirm` is the same key as the
+ * pop. They are not folded into `crouch`/`jump` because those two are *shaped*:
+ * `crouch` is an asymmetric ramp (3.0 up, 4.5 down) and `jump` fires physics on
+ * RELEASE. A menu wants a clean digital edge on the press, and deriving one from
+ * a smoothed level is how a cursor ends up skipping two rows or none. So the raw
+ * key state is published alongside, and only the hut reads it — the mode machine
+ * zeroes `crouch`/`jump` while indoors anyway (resort.js `update`), so there is
+ * no path by which a menu keystroke reaches the physics.
  *
  * There is no "forward" in skiing — gravity is the throttle — so both the
  * "forward" key (W/↑) and the "get low" key (S/↓/Shift) drive the same tuck
@@ -96,8 +110,19 @@ export function createControls() {
   let steer = 0, tuck = 0, brake = 0;
   let jumpPrev = false;
   let actPrev = false;
+  let cfmPrev = false;
 
   const k = (...codes) => codes.some((c) => keys[c]);
+
+  /**
+   * Which number row is held, 1..9, or 0 for none. Lowest wins, so a stuck key
+   * cannot mask the one the player just pressed; the mode machine takes the edge
+   * off this anyway (see PICK_COOLDOWN in resort.js).
+   */
+  function digit() {
+    for (let n = 1; n <= 9; n++) if (keys['Digit' + n] || keys['Numpad' + n]) return n;
+    return 0;
+  }
 
   function pad() {
     const gp = typeof navigator !== 'undefined' && navigator.getGamepads
@@ -115,6 +140,11 @@ export function createControls() {
       brake: clamp(Math.max(btn(6), btn(2) /* X */), 0, 1),         // LT
       jump: btn(0) > 0.5,                                           // A
       action: btn(3) > 0.5,                                         // Y
+      // dpad up/down drives the menu cursor; A doubles as the order key, which
+      // is safe because the pop it also fires is zeroed in every mode that has
+      // a menu in front of it.
+      navY: (btn(12) > 0.5 ? 1 : 0) - (btn(13) > 0.5 ? 1 : 0),
+      confirm: btn(0) > 0.5,
     };
   }
 
@@ -133,6 +163,10 @@ export function createControls() {
         i.actionPressed = i.action && !actPrev;
         actPrev = i.action;
         i.pick = ov.pick | 0;
+        i.navY = clamp(ov.navY | 0, -1, 1);
+        i.confirm = !!ov.confirm;
+        i.confirmPressed = i.confirm && !cfmPrev;
+        cfmPrev = i.confirm;
         steer = i.steer; tuck = i.crouch; brake = i.brake;
         return;
       }
@@ -187,7 +221,15 @@ export function createControls() {
       i.action = act;
       i.actionPressed = act && !actPrev;
       actPrev = act;
-      i.pick = k('Digit1', 'Numpad1') ? 1 : k('Digit2', 'Numpad2') ? 2 : 0;
+      i.pick = digit();
+      // Raw, unshaped, unramped — see the header. `navY` is a level and the
+      // menu takes its own edge and repeat off it.
+      i.navY = clamp((k('KeyW', 'ArrowUp') ? 1 : 0) - (k('KeyS', 'ArrowDown') ? 1 : 0)
+        + (g ? g.navY : 0), -1, 1);
+      const cfm = k('Enter', 'NumpadEnter', 'Space') || !!(g && g.confirm);
+      i.confirm = cfm;
+      i.confirmPressed = cfm && !cfmPrev;
+      cfmPrev = cfm;
     },
   };
 }

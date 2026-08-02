@@ -37,6 +37,7 @@ const out = await page.evaluate(() => {
   const run = (n, o, label) => {
     set(o);
     for (let i = 0; i < n; i++) h.step(1 / 60, 1);
+    if (label === null) return;          // a keystroke worth pressing, not printing
     log.push([label, st.mode, h.debug.resort.phase,
       +(st.ride?.progress ?? -1).toFixed(3),
       st.prompt ? st.prompt.text : null,
@@ -68,6 +69,16 @@ const out = await page.evaluate(() => {
   run(4, { brake: 1, action: true }, 'press E');
   run(60, { }, 'inside');
   const todBefore = h.debug.sky.getTimeOfDay();
+  // The cursor path, which is the ONLY thing that exercises navY/confirm through
+  // real input. Three presses down and Enter has to land on line 4 (Jagertee) —
+  // if `navY` were taken off the ramped `crouch` channel instead of the raw key
+  // state this is where it would skip a row or none.
+  for (let i = 0; i < 3; i++) { run(3, { navY: -1 }, null); run(3, { navY: 0 }, null); }
+  const cursorAfterNav = h.debug.resort.info().cursor;
+  run(4, { confirm: true }, 'order off the cursor');
+  run(60, { }, 'served');
+  const orderedByCursor = h.debug.resort.info().drink;
+  // ...and then the number-key path, which must move the cursor with it
   run(6, { pick: 1 }, 'order coffee');
   run(90, { }, 'drinking');
   const todAfter = h.debug.sky.getTimeOfDay();
@@ -80,6 +91,8 @@ const out = await page.evaluate(() => {
     warmth: +st.warmth.toFixed(3),
     runs: st.runs.length,
     tod: [+todBefore.toFixed(4), +todAfter.toFixed(4)],
+    cursorAfterNav,
+    orderedByCursor,
     mode: st.mode,
     skierVisible: h.debug.skier.group.visible,
     interiorVisible: h.debug.resort.interiorGroup.visible,
@@ -94,6 +107,8 @@ for (const r of out.log) {
 }
 console.log('\nwarmth', out.warmth, '| runs logged', out.runs, '| tod', out.tod,
   '| mode', out.mode, '| skier', out.skierVisible, '| interior', out.interiorVisible, '| chair', out.chairVisible);
+console.log('menu: cursor after 3 x down =', out.cursorAfterNav, '(expect 3)',
+  '| ordered off the cursor =', out.orderedByCursor, "(expect 'jagertee')");
 if (errs.length) console.error('\n--- page errors ---\n' + errs.slice(0, 20).join('\n'));
 await browser.close(); await server.close();
 process.exit(errs.length ? 1 : 0);

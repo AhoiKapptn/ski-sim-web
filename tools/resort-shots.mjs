@@ -45,6 +45,23 @@ const SHOTS = [
   ['hut-inside', "window.__inputOverride = null; h.debug.resort.enter('hut');", 90],
   ['hut-coffee', "h.debug.resort.enter('hut', { drink: 'coffee' });", 90],
   ['hut-beer', "h.debug.resort.enter('hut', { drink: 'beer' });", 130],
+  // the rest of the card. `coffee` and `beer` above are the two aliases the
+  // feature shipped with and they still have to resolve (resort.js MENU_ALIAS);
+  // these are the ids.
+  ['hut-gluehwein', "h.debug.resort.enter('hut', { drink: 'gluehwein' });", 110],
+  ['hut-gulasch', "h.debug.resort.enter('hut', { drink: 'gulasch' });", 110],
+  ['hut-schmarrn', "h.debug.resort.enter('hut', { drink: 'schmarrn' });", 110],
+  ['hut-radler', "h.debug.resort.enter('hut', { drink: 'radler' });", 110],
+  // the cursor, five lines down, with nothing ordered yet — this is the card as
+  // a player first meets it
+  ['hut-menu-nav', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20);"
+    + " for (let i = 0; i < 5; i++) { window.__inputOverride = { navY: -1 }; h.step(1/60, 2);"
+    + " window.__inputOverride = { navY: 0 }; h.step(1/60, 2); } window.__inputOverride = null;", 40],
+  // ...and ordering off the cursor with Enter rather than a number key
+  ['hut-menu-confirm', "window.__inputOverride = null; h.debug.resort.enter('hut'); h.step(1/60, 20);"
+    + " for (let i = 0; i < 3; i++) { window.__inputOverride = { navY: -1 }; h.step(1/60, 2);"
+    + " window.__inputOverride = { navY: 0 }; h.step(1/60, 2); }"
+    + " window.__inputOverride = { confirm: true }; h.step(1/60, 2); window.__inputOverride = null;", 200],
   ['hut-look-l', "h.debug.resort.enter('hut', { drink: 'coffee' }); window.__inputOverride = { steer: -1 }; h.step(1/60, 120);", 60],
   ['hut-look-r', "h.debug.resort.enter('hut', { drink: 'coffee' }); window.__inputOverride = { steer: 1 }; h.step(1/60, 120);", 60],
   // the counter you ordered from: `beat: true` plays the look across, and 1.1 s

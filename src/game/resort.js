@@ -50,7 +50,8 @@ import * as THREE from 'three';
  *   state.modeT     seconds since the mode was entered
  *   state.prompt    { key, text, sub } | null   — the "press E" contact prompt
  *   state.ride      { kind, name, s, total, progress, speed, hint } | null
- *   state.hut       { name, choices, drink, note, run } | null
+ *   state.hut       { name, altitude, sections, menu, cursor, order, drink,
+ *                     served, run, hint } | null   — the card, see MENU
  *   state.warmth    0..1, drains while skiing, refilled by a hot drink
  *   state.run       { top, bestAir } live maxima for the current run
  *   state.veil      0..1 screen dip, driven through a door or a skipped ride
@@ -139,11 +140,89 @@ const PICK_COOLDOWN = 1.0;
  */
 const TOD_LAST_LIFT = 0.66;
 
+/** Seconds a held nav key waits before repeating, and the repeat period after. */
+const NAV_DELAY = 0.34, NAV_REPEAT = 0.13;
+
 // --- warmth ------------------------------------------------------------------
 // A full tank is ~11 minutes of skiing, which is 3-6 runs: long enough that it
 // is never nagging, short enough that the hut is somewhere you actually go.
 const WARM_DRAIN = 1 / 660;
 const WARM_CHILL = 1 / 7200;   // per (m/s) per second — wind chill
+
+// =============================================================================
+// the card
+// =============================================================================
+/**
+ * What the Bergrestaurant sells.
+ *
+ * This is the single source of truth for the menu and it is read by three
+ * places that must never disagree: this file serves the order and puts the right
+ * object on the table, `ui/hud.js` prints the card (through `state.hut.menu`, so
+ * it never imports this), and `buildInterior` letters the same lines onto the
+ * chalk board on the wall. A room whose board and whose HUD list different
+ * prices is the kind of detail that makes everything else look fake, so there is
+ * one table and everything reads it.
+ *
+ * Two drinks became eight lines because two was not a menu, it was a switch. The
+ * shape is a real hut card — hot drinks, something from the kitchen, something
+ * cold — and every line is something an alpine Selbstbedienung actually sells.
+ *
+ * Per line:
+ *   sec      section key; SECTIONS below gives the printed heading
+ *   key      the number that orders it. Contiguous from 1, because the HUD
+ *            prints them as keycaps and a gap reads as a bug
+ *   price    euros, as a STRING — this is printed, never summed
+ *   vessel   which object appears on the table (see buildVessel)
+ *   liq      the liquid/food albedo, linear
+ *   hot      steams, and takes the coffee-cup sound rather than the glass one
+ *   warm     what `state.warmth` is refilled TO. A hot drink is a full tank; a
+ *            cold one leaves you where you were, which is the whole reason to
+ *            order the hot one when the pip is showing
+ *   tod      how far the sun moves. A stop costs time and the light is the only
+ *            honest way to say so — see `serve` for the clamp that stops the
+ *            afternoon becoming midnight
+ *   line     the one-line reply after it lands
+ */
+const SECTIONS = [
+  ['warm', 'Zum Aufwärmen'],
+  ['kitchen', 'Aus der Küche'],
+  ['cold', 'Kalt vom Fass'],
+];
+const MENU = [
+  { id: 'kaffee', sec: 'warm', label: 'Kaffee', note: 'black, and no nonsense',
+    price: '3.60', vessel: 'mug', liq: [0.20, 0.11, 0.05], hot: true,
+    warm: 1.00, tod: 0.009, line: 'Hot, black, and worth the stop.' },
+  { id: 'schoko', sec: 'warm', label: 'Heisse Schokolade', note: 'cream on top',
+    price: '4.20', vessel: 'mug', liq: [0.26, 0.14, 0.09], hot: true, cream: true,
+    warm: 1.00, tod: 0.011, line: 'Cream on top. Nobody is judging you.' },
+  { id: 'gluehwein', sec: 'warm', label: 'Glühwein', note: 'cinnamon and steam',
+    price: '4.80', vessel: 'mug', liq: [0.30, 0.05, 0.07], hot: true,
+    warm: 1.00, tod: 0.015, line: 'Cinnamon, cloves, and a long look at the view.' },
+  { id: 'jagertee', sec: 'warm', label: 'Jagertee', note: 'rum, and consequences',
+    price: '5.50', vessel: 'mug', liq: [0.34, 0.16, 0.04], hot: true,
+    warm: 1.00, tod: 0.019, line: 'Rum, tea, and a slower first turn.' },
+  { id: 'gulasch', sec: 'kitchen', label: 'Gulaschsuppe', note: 'bread on the side',
+    price: '9.50', vessel: 'bowl', liq: [0.28, 0.08, 0.04], hot: true,
+    warm: 1.00, tod: 0.023, line: 'Paprika, beef, and forty minutes gone.' },
+  { id: 'schmarrn', sec: 'kitchen', label: 'Kaiserschmarrn', note: 'with plum compote',
+    price: '11.00', vessel: 'plate', liq: [0.68, 0.48, 0.22], hot: true,
+    warm: 0.95, tod: 0.027, line: 'Half the mountain stops here for this.' },
+  { id: 'weissbier', sec: 'cold', label: 'Weissbier', note: 'half a litre, a long sit',
+    price: '4.90', vessel: 'glass', liq: [0.86, 0.52, 0.10], hot: false,
+    warm: 0.85, tod: 0.020, line: 'Prost. The afternoon can wait.' },
+  { id: 'radler', sec: 'cold', label: 'Radler', note: 'the sensible one',
+    price: '4.40', vessel: 'glass', liq: [0.90, 0.76, 0.22], hot: false,
+    warm: 0.85, tod: 0.016, line: 'Half beer, half lemonade, all afternoon.' },
+].map((m, i) => ({ ...m, key: String(i + 1) }));
+
+/**
+ * The two ids the feature shipped with. `?resort=hut&drink=beer`,
+ * `harness.debug.resort.enter('hut', { drink: 'coffee' })` and every entry in
+ * tools/resort-shots.mjs were written against them, and a rename that quietly
+ * breaks the capture harness is a rename that gets discovered by a reviewer.
+ */
+const MENU_ALIAS = { coffee: 'kaffee', beer: 'weissbier' };
+const menuItem = (id) => MENU.find((m) => m.id === (MENU_ALIAS[id] || id)) || null;
 
 // =============================================================================
 // interior geometry
@@ -176,21 +255,53 @@ class Bld {
 
   quad(a, b, c, d, col) { this.tri(a, b, c, col); this.tri(a, c, d, col); }
 
-  /** Box from world min/max corners. */
+  /**
+   * Box from world min/max corners.
+   *
+   * ### These windings were all six inverted, and it shipped
+   *
+   * `tri` derives the normal as `(b-a) x (c-a)`, which is three's own
+   * front-face convention, so a quad's winding IS its normal. Every face here
+   * was wound the other way: the top face's normal came out (0, -1, 0). The room
+   * and the chair rig were therefore drawn entirely from the INSIDE — front
+   * faces culled, back faces visible, and `bakeInterior` lighting every surface
+   * by a normal pointing into the object it belongs to.
+   *
+   * It survived because it is nearly invisible on a flat-shaded convex box: the
+   * silhouette is identical, and the far interior face is the same colour as the
+   * near exterior one would have been. What gave it away was the bar camera being
+   * moved up by 34 cm, which put the coffee machine at 2.5 m and 15 degrees — at
+   * which you can plainly see into the box, and the machine reads as hanging in
+   * the air above the counter rather than standing on it. Magnify
+   * `hut-bar.png` 3x at (520,300) on the old build; the machine's interior back
+   * wall and its inside floor are both in shot.
+   *
+   * The shell had already hit this and worked around it: `FACE()` in
+   * buildInterior picks whichever winding puts the normal on the room's side,
+   * and its comment records three walls and the floor coming out backwards. That
+   * fix never reached the primitives.
+   */
   box(x0, y0, z0, x1, y1, z1, col) {
     const V = (x, y, z) => new THREE.Vector3(x, y, z);
     const a = V(x0, y0, z0), b = V(x1, y0, z0), c = V(x1, y0, z1), d = V(x0, y0, z1);
     const e = V(x0, y1, z0), f = V(x1, y1, z0), g = V(x1, y1, z1), h = V(x0, y1, z1);
-    this.quad(e, f, g, h, col);
-    this.quad(d, c, b, a, col);
-    this.quad(a, b, f, e, col);
-    this.quad(c, d, h, g, col);
-    this.quad(b, c, g, f, col);
-    this.quad(d, a, e, h, col);
+    this.quad(h, g, f, e, col);      // top     -> +y
+    this.quad(a, b, c, d, col);      // bottom  -> -y
+    this.quad(e, f, b, a, col);      // -z
+    this.quad(g, h, d, c, col);      // +z
+    this.quad(f, g, c, b, col);      // +x
+    this.quad(h, e, a, d, col);      // -x
     return this;
   }
 
-  /** Vertical cylinder, y0..y1, no caps unless asked. */
+  /**
+   * Vertical cylinder, y0..y1, no caps unless asked.
+   *
+   * The SIDE and the BOTTOM cap were inverted; the top cap was already right,
+   * which is exactly the sort of half-correct that hides a winding bug. Checked
+   * term by term rather than reversed on principle — a blanket flip here would
+   * have broken the one face that was correct.
+   */
   cyl(x, z, y0, y1, r, col, seg = 8, cap = true) {
     for (let i = 0; i < seg; i++) {
       const t0 = (i / seg) * Math.PI * 2, t1 = ((i + 1) / seg) * Math.PI * 2;
@@ -198,10 +309,10 @@ class Bld {
       const b = new THREE.Vector3(x + Math.cos(t1) * r, y0, z + Math.sin(t1) * r);
       const c = new THREE.Vector3(x + Math.cos(t1) * r, y1, z + Math.sin(t1) * r);
       const d = new THREE.Vector3(x + Math.cos(t0) * r, y1, z + Math.sin(t0) * r);
-      this.quad(a, b, c, d, col);
+      this.quad(d, c, b, a, col);                        // outward radial
       if (cap) {
-        this.tri(new THREE.Vector3(x, y1, z), c, d, col);
-        this.tri(new THREE.Vector3(x, y0, z), b, a, col);
+        this.tri(new THREE.Vector3(x, y1, z), c, d, col);   // +y, already correct
+        this.tri(new THREE.Vector3(x, y0, z), a, b, col);   // -y
       }
     }
     return this;
@@ -217,6 +328,82 @@ class Bld {
   }
 
   get triangles() { return this.p.length / 9; }
+}
+
+/**
+ * `Bld` plus a per-vertex idle-sway weight and phase.
+ *
+ * The patrons are static geometry baked into vertex colours like everything else
+ * in the room — they have to be, because a room lit by one lamp and a window is
+ * baked, and a skinned figure would need a light in the scene (see Bld's note).
+ * But a dozen people frozen mid-gesture in a room you sit in for thirty seconds
+ * read as shop mannequins, and no amount of posing fixes that: the tell is that
+ * NOTHING moves, not that the pose is wrong.
+ *
+ * So the patrons get their own mesh and a nine-line vertex shader that leans
+ * each figure by up to `SWAY_A` on two slow incommensurate periods. `wAt` is set
+ * per body part — 0 at the boots, ~0.3 at the hips, 1 at the head — so a figure
+ * pivots about the floor rather than sliding across it, and `phAt` is set per
+ * figure so no two are in step. It is 1.2 cm at the head. That is deliberately
+ * under the threshold where you can see any individual move, and well over the
+ * one where the room stops being a photograph.
+ */
+class SwayBld extends Bld {
+  constructor() { super(); this.w = []; this.ph = []; this.wAt = 0; this.phAt = 0; }
+  tri(a, b, c, col) {
+    super.tri(a, b, c, col);
+    for (let i = 0; i < 3; i++) { this.w.push(this.wAt); this.ph.push(this.phAt); }
+  }
+  geometry() {
+    const g = super.geometry();
+    g.setAttribute('aSway', new THREE.Float32BufferAttribute(this.w, 1));
+    g.setAttribute('aPhase', new THREE.Float32BufferAttribute(this.ph, 1));
+    return g;
+  }
+}
+/** Metres of lean at full weight. See SwayBld. */
+const SWAY_A = 0.012;
+
+/**
+ * A builder for the printed things: the two brand plates and the chalk board.
+ *
+ * Separate from `Bld` because these are the only surfaces in the room that carry
+ * a texture, and a uv attribute on the other 30 000 vertices to serve six quads
+ * is a waste. Same bake, though — `bakeInterior` only wants position, normal and
+ * colour, so a sign is lit by the identical rig as the wall it hangs on, and the
+ * map multiplies the baked light exactly the way `vertexColors` + `map` does.
+ */
+class SignBld {
+  constructor() { this.p = []; this.n = []; this.u = []; this.c = []; }
+  /**
+   * Corners from the print's bottom-left, with uvs to match, and the outward
+   * normal given EXPLICITLY.
+   *
+   * Not derived from the winding, deliberately. The normal is what
+   * `bakeInterior` lights the panel by, so a quad wound the wrong way does not
+   * fail loudly by vanishing — it comes back lit from inside the wall it is
+   * screwed to, which is the failure the FACE() helper further down exists to
+   * catch for the shell and which is much harder to spot on a small sign.
+   */
+  quad(a, b, c, d, uv, n, col) {
+    const V = [a, b, c, a, c, d], U = [uv[0], uv[1], uv[2], uv[0], uv[2], uv[3]];
+    for (let i = 0; i < 6; i++) {
+      this.p.push(V[i].x, V[i].y, V[i].z);
+      this.n.push(n.x, n.y, n.z);
+      this.u.push(U[i][0], U[i][1]);
+      this.c.push(col[0], col[1], col[2]);
+    }
+  }
+  geometry() {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.p, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.n, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.u, 2));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(this.c, 3));
+    g.computeBoundingSphere();
+    return g;
+  }
+  get empty() { return this.p.length === 0; }
 }
 
 /**
@@ -266,6 +453,80 @@ const C_CLOTH = [0.72, 0.16, 0.12];
 const C_CERAM = [0.92, 0.90, 0.86];
 const C_PAPER = [0.88, 0.84, 0.74];
 
+// ---- the Tageskarte -----------------------------------------------------
+/** Width : height of the chalk board's canvas, and of the quad that carries it. */
+const TARIFF_AR = 1.44;
+/**
+ * Letter the menu onto a slate.
+ *
+ * The only texture this file generates, and the only one it needs: everything
+ * else in the room is flat colour with the light baked into the vertices, and a
+ * board with writing on it is the one thing that cannot be. Drawn from the same
+ * MENU table the HUD prints, so the wall and the screen agree — a hut whose
+ * board says one price and whose card says another is worse than a hut with no
+ * board.
+ *
+ * Read at 2-5 m across the room, so 720 px of canvas over 1.62 m of wall is
+ * about 2.2x the pixels it is ever sampled at. No binary asset: this is drawn in
+ * code like every other texture in the project.
+ */
+function paintTariffBoard() {
+  const w = 720, h = Math.round(w / TARIFF_AR);
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const g = cv.getContext('2d');
+  // slate, with the ghost of everything ever written on it
+  g.fillStyle = '#1d2422';
+  g.fillRect(0, 0, w, h);
+  for (let i = 0; i < 900; i++) {
+    const x = Math.random() * w, y = Math.random() * h;
+    g.fillStyle = `rgba(214,222,216,${0.006 + Math.random() * 0.018})`;
+    g.fillRect(x, y, 1 + Math.random() * 26, 1 + Math.random() * 3);
+  }
+  g.strokeStyle = 'rgba(226,232,226,0.30)';
+  g.lineWidth = 2;
+  g.strokeRect(11, 11, w - 22, h - 22);
+
+  const CHALK = 'rgba(238,243,236,0.92)';
+  const CHALK_DIM = 'rgba(224,231,222,0.62)';
+  const CHALK_WARM = 'rgba(246,220,150,0.90)';
+  g.textBaseline = 'alphabetic';
+  g.fillStyle = CHALK_WARM;
+  g.font = `700 ${Math.round(h * 0.088)}px "Inter", system-ui, sans-serif`;
+  g.fillText('TAGESKARTE', 34, h * 0.115);
+  g.fillStyle = CHALK_DIM;
+  g.font = `600 ${Math.round(h * 0.040)}px "Inter", system-ui, sans-serif`;
+  g.fillText('BERGRESTAURANT  ·  2 140 m', 36, h * 0.163);
+  g.strokeStyle = 'rgba(232,238,230,0.42)';
+  g.lineWidth = 1.6;
+  g.beginPath(); g.moveTo(34, h * 0.195); g.lineTo(w - 34, h * 0.198); g.stroke();
+
+  // one row per line, with the baseline wandering a little so it does not read
+  // as a spreadsheet printed onto a wall
+  let y = h * 0.275;
+  let sec = null;
+  const rowH = h * 0.078;
+  for (const m of MENU) {
+    if (m.sec !== sec) {
+      sec = m.sec;
+      g.fillStyle = CHALK_WARM;
+      g.font = `700 ${Math.round(h * 0.040)}px "Inter", system-ui, sans-serif`;
+      g.fillText((SECTIONS.find((s) => s[0] === sec)?.[1] || '').toUpperCase(), 36, y);
+      y += rowH * 0.62;
+    }
+    const jitter = ((m.label.charCodeAt(0) * 37) % 7) - 3;
+    g.fillStyle = CHALK;
+    g.font = `500 ${Math.round(h * 0.056)}px "Inter", system-ui, sans-serif`;
+    g.fillText(m.label, 46, y + jitter);
+    g.fillStyle = CHALK_DIM;
+    g.font = `500 ${Math.round(h * 0.050)}px "Inter", system-ui, sans-serif`;
+    const pr = m.price.replace('.', ',');
+    g.fillText(pr, w - 40 - g.measureText(pr).width, y + jitter);
+    y += rowH;
+  }
+  return cv;
+}
+
 /**
  * The room, built in WORLD space at a `scatter.buildings[]` entry.
  *
@@ -280,7 +541,7 @@ const C_PAPER = [0.88, 0.84, 0.74];
  * straight out at the mountain. The glazing boxes are solid, though, so the
  * aperture is placed on the stretch of gable wall between them.
  */
-function buildInterior(b) {
+function buildInterior(b, brand) {
   const yaw = b.yaw;
   // local axes: `a` across the ridge (the deck is at +a), `c` along it
   const ax = Math.cos(yaw), az = -Math.sin(yaw);
@@ -312,12 +573,26 @@ function buildInterior(b) {
       P(A0, C0, Y0), P(A1, C0, Y0), P(A1, C1, Y0), P(A0, C1, Y0),
       P(A0, C0, Y1), P(A1, C0, Y1), P(A1, C1, Y1), P(A0, C1, Y1),
     ];
-    dst.quad(q[4], q[5], q[6], q[7], col);      // top
-    dst.quad(q[3], q[2], q[1], q[0], col);      // bottom
-    dst.quad(q[0], q[1], q[5], q[4], col);      // -c
-    dst.quad(q[2], q[3], q[7], q[6], col);      // +c
-    dst.quad(q[1], q[2], q[6], q[5], col);      // +a
-    dst.quad(q[3], q[0], q[4], q[7], col);      // -a
+    /**
+     * ...and the room's frame is LEFT-handed, which inverted all six faces.
+     *
+     * `a` is (cos yaw, 0, -sin yaw) and `c` is (sin yaw, 0, cos yaw), so
+     * `a x c = (0, -1, 0)` at every yaw — the (a, c, y) frame is a MIRROR of the
+     * world's, not a rotation of it. This helper was written with the winding a
+     * right-handed frame wants, so the top face's normal came out pointing at
+     * the floor and every box in this room was drawn inside-out. See `Bld.box`,
+     * which had the same bug for the same reason and where the symptom is
+     * written up.
+     *
+     * Each quad is therefore the reverse of the obvious one, and if this frame's
+     * handedness ever changes they all flip back together.
+     */
+    dst.quad(q[7], q[6], q[5], q[4], col);      // top     -> +y
+    dst.quad(q[0], q[1], q[2], q[3], col);      // bottom  -> -y
+    dst.quad(q[4], q[5], q[1], q[0], col);      // -c
+    dst.quad(q[6], q[7], q[3], q[2], col);      // +c
+    dst.quad(q[5], q[6], q[2], q[1], col);      // +a
+    dst.quad(q[7], q[4], q[0], q[3], col);      // -a
   };
 
   /**
@@ -403,21 +678,54 @@ function buildInterior(b) {
   const wall = (a0, c0, a1, c1, yLo, yHi, col) => {
     FACE(lit, V(a0, c0, yLo), V(a1, c1, yLo), V(a1, c1, yHi), V(a0, c0, yHi), col);
   };
+  /**
+   * SUBDIVISION, and it is not a detail — it is what the light in this room is
+   * made of.
+   *
+   * The lighting is baked per VERTEX (see bakeInterior), so a surface is lit at
+   * its corners and Gouraud-interpolated between them. This room's floor, walls
+   * and ceiling shipped as one quad each in the long direction: the floor was 22
+   * boards each spanning the full 23 m in `c`, i.e. two vertices, and the ceiling
+   * was a single 16 x 23 m quad with FOUR. With one dim lamp over one table that
+   * merely looked flat. With a pendant over every table in the hall it is a
+   * straightforward bug — nine local lights writing into four corner vertices
+   * produce a ceiling that is uniformly black and a floor that is four bands.
+   *
+   * So every large surface is now cut to roughly SEG metres. 1.15 m is a little
+   * under half the 3.0 m lamp range, which is the sampling rate an inverse-square
+   * falloff needs before the interpolation stops inventing its own shape, and it
+   * costs about 3 400 triangles in a mesh that is drawn only while the player is
+   * inside the building.
+   */
+  const SEG = 1.15;
+  const nSeg = (len) => Math.max(1, Math.round(Math.abs(len) / SEG));
   // floor: boards across the room, tone varying course to course
   {
-    const n = 22;
+    const n = 22, m = nSeg(2 * D);
     for (let i = 0; i < n; i++) {
       const a0 = -W + (2 * W) * (i / n), a1 = -W + (2 * W) * ((i + 1) / n);
       const k = 0.80 + 0.34 * (((i * 2654435761) >>> 12 & 255) / 255);
       const col = [C_FLOOR[0] * k, C_FLOOR[1] * k, C_FLOOR[2] * k];
-      FACE(lit, V(a0, -D, y0), V(a1, -D, y0), V(a1, D, y0), V(a0, D, y0), col);
-      // a dark seam line so the boards read at grazing angles
-      FACE(lit, V(a1 - 0.012, -D, y0 + 0.004), V(a1, -D, y0 + 0.004),
-        V(a1, D, y0 + 0.004), V(a1 - 0.012, D, y0 + 0.004), [0.16, 0.11, 0.07]);
+      for (let j = 0; j < m; j++) {
+        const c0 = lerp(-D, D, j / m), c1 = lerp(-D, D, (j + 1) / m);
+        FACE(lit, V(a0, c0, y0), V(a1, c0, y0), V(a1, c1, y0), V(a0, c1, y0), col);
+        // a dark seam line so the boards read at grazing angles
+        FACE(lit, V(a1 - 0.012, c0, y0 + 0.004), V(a1, c0, y0 + 0.004),
+          V(a1, c1, y0 + 0.004), V(a1 - 0.012, c1, y0 + 0.004), [0.16, 0.11, 0.07]);
+      }
     }
   }
   // ceiling + beams
-  FACE(lit, V(W, D, y1), V(-W, D, y1), V(-W, -D, y1), V(W, -D, y1), [0.40, 0.31, 0.22]);
+  {
+    const na = nSeg(2 * W), nc = nSeg(2 * D);
+    for (let i = 0; i < na; i++) {
+      for (let j = 0; j < nc; j++) {
+        const a0 = lerp(-W, W, i / na), a1 = lerp(-W, W, (i + 1) / na);
+        const c0 = lerp(-D, D, j / nc), c1 = lerp(-D, D, (j + 1) / nc);
+        FACE(lit, V(a1, c1, y1), V(a0, c1, y1), V(a0, c0, y1), V(a1, c0, y1), [0.40, 0.31, 0.22]);
+      }
+    }
+  }
   for (let i = 0; i < 5; i++) {
     const c = -D + (2 * D) * ((i + 0.5) / 5);
     BX(lit, -W, c - 0.11, y1 - 0.24, W, c + 0.11, y1 - 0.02, C_BEAM);
@@ -425,16 +733,27 @@ function buildInterior(b) {
   // walls: planked above a dark wainscot
   const WAINY = y0 + 0.92;
   for (const [a0, c0, a1, c1] of [[-W, D, W, D], [W, -D, W, D], [-W, -D, -W, D]]) {
-    // planks
+    // planks. Vertical courses too: the planks already cut the wall every 34 cm
+    // ACROSS, but a 1.7 m tall quad has no vertex anywhere near a lamp's height.
     const len = Math.hypot(a1 - a0, c1 - c0);
     const n = Math.max(3, Math.round(len / 0.34));
+    const rows = nSeg(y1 - WAINY);
     for (let i = 0; i < n; i++) {
       const t0 = i / n, t1 = (i + 1) / n;
       const k = 0.82 + 0.30 * (((i * 40503 + 7) >>> 9 & 255) / 255);
-      wall(lerp(a0, a1, t0), lerp(c0, c1, t0), lerp(a0, a1, t1), lerp(c0, c1, t1), WAINY, y1,
-        [C_WALL[0] * k, C_WALL[1] * k, C_WALL[2] * k]);
+      const col = [C_WALL[0] * k, C_WALL[1] * k, C_WALL[2] * k];
+      for (let r = 0; r < rows; r++) {
+        wall(lerp(a0, a1, t0), lerp(c0, c1, t0), lerp(a0, a1, t1), lerp(c0, c1, t1),
+          lerp(WAINY, y1, r / rows), lerp(WAINY, y1, (r + 1) / rows), col);
+      }
     }
-    wall(a0, c0, a1, c1, y0, WAINY, C_WAIN);
+    // the wainscot is one dark band, but it still has to be cut ALONG the wall
+    // or a 23 m plinth is lit by whatever happens to be at its two ends
+    const m = nSeg(len);
+    for (let i = 0; i < m; i++) {
+      wall(lerp(a0, a1, i / m), lerp(c0, c1, i / m),
+        lerp(a0, a1, (i + 1) / m), lerp(c0, c1, (i + 1) / m), y0, WAINY, C_WAIN);
+    }
   }
   // window wall (-c), in four pieces around the aperture
   wall(-W, -D, WA0, -D, y0, y1, C_WALL);
@@ -494,9 +813,11 @@ function buildInterior(b) {
     lit.cyl(q.x, q.z, y0 + 1.30, y0 + 1.42, 0.018, C_STEEL, 6);
     BX(lit, qa - 0.03, c - 0.03, y0 + 1.44, qa + 0.03, c + 0.03, y0 + 1.60, [0.30, 0.06, 0.05]);
   }
-  // the coffee machine — the most recognisable object in an alpine hut
+  // The coffee machine — the most recognisable object in an alpine hut. Moved
+  // from c = 0.0 to 0.95: `barAim` is at c = 1.65, and at 0.0 the machine sat
+  // hard on the left edge of the one shot it exists for.
   {
-    const ma = W - 0.62, mc = 0.0;
+    const ma = W - 0.62, mc = 0.95;
     BX(lit, ma - 0.34, mc - 0.32, y0 + 1.14, ma + 0.30, mc + 0.32, y0 + 1.62, [0.58, 0.14, 0.10]);
     BX(lit, ma - 0.36, mc - 0.34, y0 + 1.62, ma + 0.32, mc + 0.34, y0 + 1.70, C_STEEL);
     for (const dc of [-0.18, 0.18]) {
@@ -584,11 +905,22 @@ function buildInterior(b) {
     const seg = 12, r = 0.26, top = y0 + 1.92, bot = y0 + 1.74;
     for (let i = 0; i < seg; i++) {
       const t0 = (i / seg) * Math.PI * 2, t1 = ((i + 1) / seg) * Math.PI * 2;
-      lit.quad(
-        new THREE.Vector3(p.x, top, p.z),
-        new THREE.Vector3(p.x + Math.cos(t1) * r, bot, p.z + Math.sin(t1) * r),
-        new THREE.Vector3(p.x + Math.cos(t0) * r, bot, p.z + Math.sin(t0) * r),
-        new THREE.Vector3(p.x, top, p.z), [0.72, 0.70, 0.66]);
+      // BOTH windings. A shade is an open cone and you sit UNDER it, so the
+      // surface you actually see is its inside — which a single outward-wound
+      // cone culls, leaving the bulb hanging in a hole in the ceiling. Two faces
+      // also let `bakeInterior` light them separately off their own normals, so
+      // the inside comes back bright from the bulb 6 cm below it and the outside
+      // stays dim. (One winding was the state before the Bld.box fix and it only
+      // looked right because everything was inside-out.)
+      const apex = new THREE.Vector3(p.x, top, p.z);
+      const e0 = new THREE.Vector3(p.x + Math.cos(t0) * r, bot, p.z + Math.sin(t0) * r);
+      const e1 = new THREE.Vector3(p.x + Math.cos(t1) * r, bot, p.z + Math.sin(t1) * r);
+      lit.tri(apex, e0, e1, [0.72, 0.70, 0.66]);          // outside
+      // The inside is albedo [0.26, 0.25, 0.23], not the enamel's own: it sits 0-12 cm
+      // from the bulb, where the bake's falloff is ~1.0, and at the outer
+      // albedo it returned 0.60 linear and blew out into a pale disc in the
+      // top of the hero frame. A shade you cannot look at is a shade.
+      lit.tri(apex, e1, e0, [0.26, 0.25, 0.23]);          // ...and the lit inside
     }
     glow.cyl(p.x, p.z, bot - 0.06, bot, 0.075, [5.0, 3.4, 1.7], 8);
     // and a candle on the sill
@@ -611,13 +943,239 @@ function buildInterior(b) {
     const seg = 12, r = 0.22, top = y0 + 2.08, bot = y0 + 1.94;
     for (let i = 0; i < seg; i++) {
       const t0 = (i / seg) * Math.PI * 2, t1 = ((i + 1) / seg) * Math.PI * 2;
-      lit.quad(
-        new THREE.Vector3(p.x, top, p.z),
-        new THREE.Vector3(p.x + Math.cos(t1) * r, bot, p.z + Math.sin(t1) * r),
-        new THREE.Vector3(p.x + Math.cos(t0) * r, bot, p.z + Math.sin(t0) * r),
-        new THREE.Vector3(p.x, top, p.z), [0.70, 0.68, 0.64]);
+      // BOTH windings. A shade is an open cone and you sit UNDER it, so the
+      // surface you actually see is its inside — which a single outward-wound
+      // cone culls, leaving the bulb hanging in a hole in the ceiling. Two faces
+      // also let `bakeInterior` light them separately off their own normals, so
+      // the inside comes back bright from the bulb 6 cm below it and the outside
+      // stays dim. (One winding was the state before the Bld.box fix and it only
+      // looked right because everything was inside-out.)
+      const apex = new THREE.Vector3(p.x, top, p.z);
+      const e0 = new THREE.Vector3(p.x + Math.cos(t0) * r, bot, p.z + Math.sin(t0) * r);
+      const e1 = new THREE.Vector3(p.x + Math.cos(t1) * r, bot, p.z + Math.sin(t1) * r);
+      lit.tri(apex, e0, e1, [0.70, 0.68, 0.64]);          // outside
+      // The inside is albedo [0.25, 0.24, 0.23], not the enamel's own: it sits 0-12 cm
+      // from the bulb, where the bake's falloff is ~1.0, and at the outer
+      // albedo it returned 0.60 linear and blew out into a pale disc in the
+      // top of the hero frame. A shade you cannot look at is a shade.
+      lit.tri(apex, e1, e0, [0.25, 0.24, 0.23]);          // ...and the lit inside
     }
     glow.cyl(p.x, p.z, bot - 0.05, bot, 0.065, [4.6, 3.1, 1.6], 8);
+  }
+
+  // ---- the hall ------------------------------------------------------------
+  /**
+   * MEASURED, and it is the reason this whole section exists: buildings[0] is
+   * `w: 8.5, d: 12.0` and those are HALF-extents, so this room is 16.2 m across
+   * and 23.2 m long — 374 m of floor. It shipped with two tables in it.
+   *
+   * That is the actual defect behind "the hut feels weak". It was never the
+   * lighting or the framing: at the seated camera the shot is fine, and the
+   * moment the player uses the look-around the file's own docstring advertises,
+   * the room is a hangar with a stove in it. A Bergrestaurant this size seats a
+   * hundred and twenty, so it gets a self-service hall's worth of furniture:
+   * three columns of long communal tables, benches, a tray rail along the
+   * counter, and a boot-and-coat zone at the door.
+   *
+   * The layout is not decorative. It is built around the two things the camera
+   * actually does:
+   *   * the aisle a = 3.6 .. 6.8 in front of the counter is left CLEAR, because
+   *     `barCam` flies down it on every order and a table in it is a table the
+   *     camera goes through;
+   *   * nothing is placed at the window table (a 4.2, c -10.0) or between it and
+   *     the glass, because that is the hero framing and the player is sitting in
+   *     it.
+   * The door is on the +c gable (see `hutDoor`), so the entrance clutter is at
+   * high c and the bar is on your right as you come in, which is why the tray
+   * rail runs the way it does.
+   */
+  const HALL_A = [-6.0, -2.6, 0.8];        // table columns, across the room
+  const HALL_C = [-4.8, 0.4, 5.6];         // ...and rows, down it
+  const T_LEN = 3.4, T_HALF = 0.42;        // long table: 3.4 m of it, 0.84 wide
+  const BENCH_A = 0.72;                    // bench centreline off the table's
+  const TOP_Y = y0 + 0.74, BEN_Y = y0 + 0.46;
+  const hallSeats = [];                    // filled in for the patrons below
+  for (const ta of HALL_A) {
+    for (const tc of HALL_C) {
+      const c0 = tc - T_LEN * 0.5, c1 = tc + T_LEN * 0.5;
+      // top, and a pair of stretcher rails under it so it is not a floating slab
+      BX(lit, ta - T_HALF, c0, TOP_Y, ta + T_HALF, c1, TOP_Y + 0.048, [0.60, 0.43, 0.26]);
+      BX(lit, ta - T_HALF + 0.06, c0 + 0.08, TOP_Y - 0.10, ta + T_HALF - 0.06, c1 - 0.08,
+        TOP_Y - 0.04, [0.40, 0.28, 0.17]);
+      for (const sc of [-1, 1]) {
+        // trestle legs, splayed, at the quarter points
+        const lc = tc + sc * T_LEN * 0.32;
+        for (const sa of [-1, 1]) {
+          const p = P(ta + sa * (T_HALF - 0.10), lc, 0);
+          lit.cyl(p.x, p.z, y0, TOP_Y, 0.044, C_BEAM, 5);
+        }
+        // bench: seat, and its own two legs
+        BX(lit, ta + sc * (BENCH_A - 0.15), c0 + 0.10, BEN_Y,
+          ta + sc * (BENCH_A + 0.15), c1 - 0.10, BEN_Y + 0.052, C_BAR);
+        for (const q of [-1, 1]) {
+          const p = P(ta + sc * BENCH_A, tc + q * T_LEN * 0.30, 0);
+          lit.cyl(p.x, p.z, y0, BEN_Y, 0.038, C_BEAM, 5);
+        }
+        hallSeats.push({ a: ta + sc * BENCH_A, c: tc, face: sc > 0 ? 'a-' : 'a+', ta, tc });
+      }
+      // what is left on a table between sittings: a cruet, a menu card, a mat
+      BX(lit, ta - 0.07, tc - 0.20, TOP_Y + 0.048, ta + 0.07, tc - 0.06, TOP_Y + 0.13, C_CERAM);
+      BX(lit, ta - 0.11, tc + 0.10, TOP_Y + 0.048, ta + 0.11, tc + 0.24, TOP_Y + 0.054, C_PAPER);
+    }
+  }
+
+  // ---- the serving line ----------------------------------------------------
+  // A tray rail along the counter front, a stack of trays and a cutlery caddy at
+  // its downhill end. This is what makes the counter read as Selbstbedienung
+  // rather than as a pub bar, and it is three boxes.
+  {
+    const ra = BA - 0.34;
+    for (const rc of [[-1.0, 5.4]]) {
+      const q0 = P(ra, rc[0], y0 + 0.94), q1 = P(ra, rc[1], y0 + 0.94);
+      const seg = 5, rr = 0.028;
+      for (let i = 0; i < seg; i++) {
+        const t0 = (i / seg) * Math.PI * 2, t1 = ((i + 1) / seg) * Math.PI * 2;
+        const off = (t, p) => new THREE.Vector3(p.x + Math.cos(t) * rr * ax, p.y + Math.sin(t) * rr,
+          p.z + Math.cos(t) * rr * az);
+        lit.quad(off(t0, q0), off(t1, q0), off(t1, q1), off(t0, q1), C_STEEL);
+      }
+    }
+    for (const bc of [0.2, 2.6, 5.0]) {
+      const p = P(ra, bc, 0);
+      lit.cyl(p.x, p.z, y0 + 0.94, y0 + 1.06, 0.022, C_STEEL, 5);
+    }
+    // trays, a leaning stack of them
+    for (let i = 0; i < 7; i++) {
+      BX(lit, BA + 0.10, 5.05 + i * 0.004, y0 + 1.14 + i * 0.022, BA + 0.62,
+        5.55 + i * 0.004, y0 + 1.152 + i * 0.022, [0.42, 0.29, 0.18]);
+    }
+    // cutlery caddy, three compartments
+    BX(lit, BA + 0.16, 4.30, y0 + 1.14, BA + 0.60, 4.86, y0 + 1.28, C_STEEL);
+    for (let i = 0; i < 3; i++) {
+      BX(lit, BA + 0.20 + i * 0.14, 4.40, y0 + 1.28, BA + 0.30 + i * 0.14, 4.76,
+        y0 + 1.40, [0.74, 0.75, 0.78]);
+    }
+    // a glass-fronted case of pastry at the other end. Tinted well down from
+    // white: at C_STEEL it was the brightest object in the room and the eye went
+    // straight to a box of buns instead of to the taps.
+    BX(lit, BA + 0.14, -1.15, y0 + 1.14, BA + 0.66, -0.25, y0 + 1.18, [0.40, 0.41, 0.43]);
+    BX(lit, BA + 0.14, -1.15, y0 + 1.18, BA + 0.66, -0.25, y0 + 1.52, [0.44, 0.47, 0.50]);
+    for (let i = 0; i < 4; i++) {
+      BX(lit, BA + 0.22 + (i % 2) * 0.22, -1.05 + Math.floor(i / 2) * 0.40, y0 + 1.20,
+        BA + 0.40 + (i % 2) * 0.22, -0.73 + Math.floor(i / 2) * 0.40, y0 + 1.32,
+        [0.62, 0.44, 0.22]);
+    }
+  }
+
+  // ---- the door end --------------------------------------------------------
+  // Boots, jackets and a wet floor: the first two metres of a mountain
+  // restaurant are always this, and it is the only part of the room that says
+  // people came in from outside.
+  {
+    const dc = D - 1.5;
+    // boot rack: two rails and eight pairs slotted into it
+    BX(lit, -6.8, dc - 0.30, y0 + 0.40, -1.2, dc - 0.24, y0 + 0.46, C_BEAM);
+    BX(lit, -6.8, dc + 0.24, y0 + 0.40, -1.2, dc + 0.30, y0 + 0.46, C_BEAM);
+    const BOOTC = [[0.14, 0.14, 0.16], [0.52, 0.10, 0.08], [0.10, 0.20, 0.40],
+      [0.72, 0.60, 0.10], [0.20, 0.20, 0.22]];
+    for (let i = 0; i < 8; i++) {
+      const ba = -6.6 + i * 0.68;
+      const col = BOOTC[i % BOOTC.length];
+      for (const s of [-1, 1]) {
+        BX(lit, ba + s * 0.13 - 0.10, dc - 0.20, y0 + 0.02, ba + s * 0.13 + 0.10,
+          dc + 0.22, y0 + 0.40, col);
+      }
+    }
+    // a rail of hung jackets, sleeves down
+    BX(lit, -0.4, dc - 0.06, y0 + 1.86, 4.6, dc + 0.06, y0 + 1.94, C_STEEL);
+    const JK = [[0.60, 0.12, 0.09], [0.09, 0.20, 0.42], [0.66, 0.48, 0.10],
+      [0.10, 0.34, 0.24], [0.30, 0.30, 0.34], [0.52, 0.20, 0.36]];
+    for (let i = 0; i < 6; i++) {
+      const ja = -0.1 + i * 0.78;
+      BX(lit, ja - 0.21, dc - 0.15, y0 + 1.16, ja + 0.21, dc + 0.15, y0 + 1.84,
+        JK[i % JK.length]);
+    }
+    // a doormat, and a puddle of melt that has not been mopped
+    BX(lit, -1.6, D - 0.55, y0 + 0.002, 2.4, D - 0.06, y0 + 0.014, [0.20, 0.18, 0.16]);
+    BX(lit, -0.6, D - 1.30, y0 + 0.003, 1.6, D - 0.62, y0 + 0.006, [0.46, 0.36, 0.26]);
+  }
+
+  // ---- bunting between the beams -------------------------------------------
+  // Five beams at c = -D + 2D*(i+0.5)/5. A pennant garland strung under them is
+  // one triangle a flag, and it is the single cheapest thing in this file that
+  // says "somebody runs this place".
+  {
+    const PEN = [[0.72, 0.16, 0.12], [0.92, 0.88, 0.84], [0.20, 0.34, 0.62],
+      [0.86, 0.66, 0.12], [0.16, 0.42, 0.28]];
+    for (let row = 0; row < 2; row++) {
+      const a2 = -4.4 + row * 4.6;
+      for (let i = 0; i < 26; i++) {
+        const c = -D + 1.2 + i * 0.84;
+        if (c > D - 1.2) break;
+        const sag = 0.05 + 0.05 * Math.sin(i * 0.8 + row);
+        const top = y1 - 0.30 - sag;
+        // the cord
+        BX(lit, a2 - 0.008, c, top, a2 + 0.008, c + 0.84, top + 0.014, [0.30, 0.26, 0.22]);
+        // the pennant, a downward triangle
+        const col = PEN[(i + row * 2) % PEN.length];
+        const l = P(a2, c + 0.10, top), r = P(a2, c + 0.62, top);
+        const tip = P(a2, c + 0.36, top - 0.24);
+        lit.tri(l, r, tip, col);
+        lit.tri(tip, r, l, col);
+      }
+    }
+  }
+
+  // ---- a pendant over every hall table -------------------------------------
+  /**
+   * Nine more shades, and nine more point lights in the bake below.
+   *
+   * The furniture above is worth nothing if it is in the dark, and it was: with
+   * only the table lamp, the two over the counter and the back-bar fill, the
+   * ambient term (0.055) is all that reaches the middle of a 23 m room. Every one
+   * of them is at least 6.2 m from the window table, which is the constraint the
+   * `lamp at 2.35` note is protecting — nothing here moves the hero framing.
+   */
+  const HALL_LAMPS = [];
+  for (const la of HALL_A) for (const lc of HALL_C) HALL_LAMPS.push([la, lc]);
+  /**
+   * ...and two over the serving aisle, which are not decoration either.
+   *
+   * The counter's FRONT face points at -a, away from every light behind the bar,
+   * so it baked to almost nothing — and it is the surface the sponsor banner is
+   * cable-tied to and the surface `barCam` is pointed at. A light over the queue
+   * is what a serving line has and it is what makes the banner, the tray rail and
+   * the people standing there exist at all.
+   */
+  for (const lc of [0.6, 4.0]) HALL_LAMPS.push([BA - 1.35, lc]);
+  const shadeIn = [0.24, 0.23, 0.22];
+  const shade = (a2, c2, top, bot, r, tint) => {
+    const p = P(a2, c2, 0);
+    lit.cyl(p.x, p.z, y1 - 0.02, top, 0.008, C_BLACK, 4);
+    const seg = 10;
+    for (let i = 0; i < seg; i++) {
+      const t0 = (i / seg) * Math.PI * 2, t1 = ((i + 1) / seg) * Math.PI * 2;
+      // BOTH windings. A shade is an open cone and you sit UNDER it, so the
+      // surface you actually see is its inside — which a single outward-wound
+      // cone culls, leaving the bulb hanging in a hole in the ceiling. Two faces
+      // also let `bakeInterior` light them separately off their own normals, so
+      // the inside comes back bright from the bulb 6 cm below it and the outside
+      // stays dim. (One winding was the state before the Bld.box fix and it only
+      // looked right because everything was inside-out.)
+      const apex = new THREE.Vector3(p.x, top, p.z);
+      const e0 = new THREE.Vector3(p.x + Math.cos(t0) * r, bot, p.z + Math.sin(t0) * r);
+      const e1 = new THREE.Vector3(p.x + Math.cos(t1) * r, bot, p.z + Math.sin(t1) * r);
+      lit.tri(apex, e0, e1, tint);          // outside
+      // The inside is albedo 0.35x, not the enamel's own: it sits 0-12 cm
+      // from the bulb, where the bake's falloff is ~1.0, and at the outer
+      // albedo it returned 0.60 linear and blew out into a pale disc in the
+      // top of the hero frame. A shade you cannot look at is a shade.
+      lit.tri(apex, e1, e0, shadeIn);          // ...and the lit inside
+    }
+    glow.cyl(p.x, p.z, bot - 0.05, bot, r * 0.30, [4.4, 3.0, 1.5], 8);
+  };
+  for (const [la, lc] of HALL_LAMPS) {
+    shade(la, lc, y0 + 2.14, y0 + 2.00, 0.21, [0.68, 0.66, 0.62]);
   }
 
   // ---- odds and ends ------------------------------------------------------
@@ -644,7 +1202,221 @@ function buildInterior(b) {
     // framed photograph of the massif
     BX(lit, -W + 0.02, 1.1, y0 + 1.35, -W + 0.07, 1.95, y0 + 2.0, C_BEAM);
     BX(lit, -W + 0.07, 1.16, y0 + 1.41, -W + 0.09, 1.89, y0 + 1.94, [0.50, 0.56, 0.66]);
+    // a set of antlers over the wainscot, which is the one prop no alpine
+    // Gaststube is allowed to be without
+    BX(lit, -W + 0.02, -1.5, y0 + 1.86, -W + 0.09, -1.16, y0 + 2.06, [0.34, 0.26, 0.18]);
+    for (const s of [-1, 1]) {
+      const base = P(-W + 0.14, -1.33 + s * 0.06, 0);
+      const tip = P(-W + 0.60, -1.33 + s * 0.52, 0);
+      lit.cyl(base.x, base.z, y0 + 2.02, y0 + 2.30, 0.022, [0.78, 0.72, 0.58], 4);
+      lit.cyl(tip.x, tip.z, y0 + 2.16, y0 + 2.40, 0.018, [0.78, 0.72, 0.58], 4);
+      BX(lit, -W + 0.12, -1.33 + s * 0.04, y0 + 2.28, -W + 0.62, -1.33 + s * 0.50,
+        y0 + 2.32, [0.78, 0.72, 0.58]);
+    }
   }
+
+  // ---- the two brand plates, and the tariff board --------------------------
+  /**
+   * The marks the hut hangs.
+   *
+   * They are the SAME two brand plates `world/branding.js` prints on the slope,
+   * fetched through its `atlas` accessor rather than re-composited here: one
+   * canvas, one upload, one place either PNG is touched. If the accessor is
+   * missing (a standalone probe that builds the resort without branding) the
+   * quads are simply not emitted — a hut with no sponsor is a hut, a hut with a
+   * grey rectangle where a logo should be is a bug.
+   *
+   * WHERE, and every one of the three was chosen against what the CAMERA
+   * actually does rather than against where a sign would look nice in a plan:
+   *
+   *   AK    across the front of the counter. `barCam` flies down the aisle and
+   *         holds on the counter for a second on EVERY order, and it looks
+   *         slightly down, so the counter's front face is the one surface in
+   *         this room the player is guaranteed to be shown at close range. A
+   *         banner cable-tied along a bar front is also simply what a sponsored
+   *         hut looks like.
+   *   BTM   the +a long wall at c = -9.4. Ten metres of that wall between the
+   *         window end and the start of the counter were completely blank, and
+   *         it is what fills the right of frame the moment the player uses the
+   *         look-around. MEASURED, not guessed: at c = -6.2 only the left end of
+   *         its two battens made it into `hut-look-r` at the extreme right edge,
+   *         which puts the frame's right edge on that wall at about c = -7.8. At
+   *         -9.4 the whole 3 m panel sits inside it, 4.5 m from the seat.
+   *   AK    the -a long wall at c = -4.6, the same surface on the other side, so
+   *         the look sweeps a mark whichever way it goes.
+   *
+   * The counter-front banner is deliberately NOT over the bottle shelf, which is
+   * where this went first: the shelf top is at y0 + 1.96 and the ceiling at
+   * y0 + 2.62, so a 2.3 m banner at that aspect either clips through the ceiling
+   * or hides the bottles, and `barAim` looks BELOW it in any case.
+   *
+   * All three are PRINT ON A PANEL with a timber batten top and bottom, standing
+   * 4.5 cm proud — the same argument branding.js makes outdoors: nothing is keyed
+   * out, nothing is alpha-tested, so there is no cut-out fringe to alias and no
+   * coverage mip chain to go wrong.
+   */
+  const signs = new SignBld();
+  const chalk = new SignBld();
+  const plate = (name, a2, c2, cy, width, faceA) => {
+    if (!brand) return;
+    const h = width / brand.aspect(name);
+    const off = faceA * 0.045;
+    const q = (dc, dy) => P(a2 + off, c2 + dc, cy + dy);
+    const hw = width * 0.5, hh = h * 0.5;
+    /**
+     * WHICH END OF THE PANEL uv s = 0 lands on, and it is not arbitrary.
+     *
+     * Looking at the -a wall (faceA = +1) the view direction is -a, and for a
+     * camera looking down -a with world up the screen's right hand side is -c.
+     * So the print's left edge is at +c, i.e. `+hw`. On the +a wall it is the
+     * other way. Get it backwards and the artwork is MIRRORED — which is a
+     * wordmark rendered as nonsense, and it is not obvious in a thumbnail.
+     */
+    const s0 = faceA * hw, s1 = -faceA * hw;
+    const nrm = new THREE.Vector3(ax * faceA, 0, az * faceA);
+    signs.quad(q(s0, -hh), q(s1, -hh), q(s1, hh), q(s0, hh),
+      [brand.uv(name, 0, 0), brand.uv(name, 1, 0), brand.uv(name, 1, 1), brand.uv(name, 0, 1)],
+      nrm, [1, 1, 1]);
+    // battens, in the untextured mesh
+    for (const sy of [-1, 1]) {
+      BX(lit, a2 - off * 0.4, c2 - hw - 0.07, cy + sy * (hh + 0.055) - 0.035,
+        a2 + off * 1.3, c2 + hw + 0.07, cy + sy * (hh + 0.055) + 0.035, C_BEAM);
+    }
+  };
+  plate('ak', BA, 1.80, y0 + 0.52, 2.60, -1);
+  plate('btm', W - 0.02, -9.40, y0 + 1.74, 3.00, -1);
+  plate('ak', -W + 0.02, -4.60, y0 + 1.78, 2.60, 1);
+  /**
+   * The Tageskarte, on the wall at the end of the counter.
+   *
+   * Lettered from the same MENU table the HUD prints, so the board on the wall
+   * and the card on screen can never disagree — which is the whole reason it is
+   * worth having. Its own little canvas rather than a region of branding.js'
+   * atlas: that atlas is where the brand PNGs live and its paint order is
+   * load-bearing for two measured tables, and a menu that changes has no business
+   * anywhere near it.
+   */
+  {
+    const bw = 1.62, bh = bw / TARIFF_AR;
+    const bc = -1.75, by = y0 + 1.86;
+    const q = (dc, dy) => P(W - 0.055, bc + dc, by + dy);
+    // s = 0 at -c, for the reason spelled out in `plate` above: this hangs on
+    // the +a wall, so the screen's left edge is -c.
+    chalk.quad(q(-bw * 0.5, -bh * 0.5), q(bw * 0.5, -bh * 0.5),
+      q(bw * 0.5, bh * 0.5), q(-bw * 0.5, bh * 0.5),
+      [[0, 0], [1, 0], [1, 1], [0, 1]], new THREE.Vector3(-ax, 0, -az), [1, 1, 1]);
+    // a chunky frame around it
+    for (const sy of [-1, 1]) {
+      BX(lit, W - 0.10, bc - bw * 0.5 - 0.06, by + sy * (bh * 0.5 + 0.045) - 0.045,
+        W - 0.02, bc + bw * 0.5 + 0.06, by + sy * (bh * 0.5 + 0.045) + 0.045, C_BEAM);
+    }
+    for (const sc of [-1, 1]) {
+      BX(lit, W - 0.10, bc + sc * (bw * 0.5 + 0.045) - 0.045, by - bh * 0.5 - 0.09,
+        W - 0.02, bc + sc * (bw * 0.5 + 0.045) + 0.045, by + bh * 0.5 + 0.09, C_BEAM);
+    }
+  }
+
+  // ---- the people ----------------------------------------------------------
+  /**
+   * Twelve patrons and a man behind the counter, in their own mesh so they can
+   * have the idle-sway shader (see SwayBld).
+   *
+   * `face` is one of the room's four axes and every figure is built axis-aligned
+   * in the room's frame. That is not a shortcut, it is the seating: the hall
+   * benches run along `c` so anyone on one faces +a or -a, the window-end tables
+   * have their benches across so anyone there faces +c or -c, and a man serving
+   * faces the counter. There is nowhere in this room a person would sit at 37
+   * degrees, and an axis-aligned figure goes straight through BX — which is the
+   * helper whose own comment records what happens when furniture is built in the
+   * world frame instead of the room's.
+   *
+   * NOBODY is placed at the window table. That is the hero framing and the
+   * player is sitting in it; a companion across it would be a 1.4 m box between
+   * the lens and the only window in the room.
+   */
+  const patrons = new SwayBld();
+  const FACES = { 'a+': [1, 0, 0, 1], 'a-': [-1, 0, 0, -1], 'c+': [0, 1, -1, 0], 'c-': [0, -1, 1, 0] };
+  const SKIN = [[0.72, 0.55, 0.44], [0.58, 0.42, 0.32], [0.80, 0.64, 0.52], [0.44, 0.31, 0.24]];
+  const HAIR = [[0.16, 0.11, 0.08], [0.34, 0.24, 0.14], [0.10, 0.09, 0.09], [0.52, 0.44, 0.34]];
+  const JACKET = [[0.62, 0.13, 0.10], [0.09, 0.22, 0.48], [0.72, 0.52, 0.10],
+    [0.11, 0.36, 0.26], [0.30, 0.30, 0.35], [0.54, 0.20, 0.38], [0.86, 0.86, 0.88]];
+  let pSeed = 0;
+  const person = (a2, c2, face, o = {}) => {
+    const [fa, fc, ra, rc] = FACES[face];
+    // one deterministic stream per figure, so a colour never depends on the
+    // order the calls happen to be written in
+    const h = (pSeed = (pSeed * 1664525 + 1013904223) >>> 0);
+    const pick = (arr, sh) => arr[((h >>> sh) & 0xff) % arr.length];
+    const jk = o.jacket || pick(JACKET, 3);
+    const sk = pick(SKIN, 11), hr = o.hat || pick(HAIR, 19);
+    const tall = o.tall ?? (0.95 + ((h >>> 5) & 0x3f) / 300);
+    const seat = o.seat ?? 0;                          // bench top, room-relative
+    patrons.phAt = ((h >>> 9) & 0x3ff) / 1024 * 6.2832;
+    // local (r = the figure's right, f = forward, y) -> the room's (a, c, y)
+    const B = (r0, f0, ly0, r1, f1, ly1, col, sway) => {
+      patrons.wAt = sway;
+      BX(patrons, a2 + ra * r0 + fa * f0, c2 + rc * r0 + fc * f0, y0 + seat + ly0 * tall,
+        a2 + ra * r1 + fa * f1, c2 + rc * r1 + fc * f1, y0 + seat + ly1 * tall, col);
+    };
+    const PANT = [0.14, 0.14, 0.17];
+    if (o.stand) {
+      B(-0.15, -0.02, -seat, 0.15, 0.20, -seat + 0.13, [0.10, 0.10, 0.12], 0);   // boots
+      for (const s of [-1, 1]) B(s * 0.155 - 0.10, -0.06, -seat + 0.13, s * 0.155 + 0.10, 0.12, 0.42, PANT, 0.08);
+      B(-0.20, -0.13, 0.42, 0.20, 0.15, 0.98, jk, 0.45);
+      B(-0.245, -0.13, 0.86, 0.245, 0.13, 0.98, jk, 0.5);                        // shoulders
+      for (const s of [-1, 1]) B(s * 0.215 - 0.062, -0.09, 0.54, s * 0.215 + 0.062, 0.09, 0.90, jk, 0.5);
+      B(-0.055, -0.04, 0.98, 0.055, 0.04, 1.04, sk, 0.85);                       // neck
+      B(-0.095, -0.085, 1.04, 0.095, 0.095, 1.24, sk, 1.0);                      // head
+      B(-0.10, -0.09, 1.19, 0.10, 0.10, 1.28, hr, 1.0);                          // hair or a beanie
+    } else {
+      // seated: thighs forward off the bench, shins down to the floor
+      for (const s of [-1, 1]) {
+        B(s * 0.10 - 0.085, 0.20, -seat, s * 0.10 + 0.085, 0.40, -seat + 0.12, [0.10, 0.10, 0.12], 0);
+        B(s * 0.10 - 0.075, 0.22, -seat + 0.12, s * 0.10 + 0.075, 0.34, 0.02, PANT, 0.05);
+        B(s * 0.10 - 0.085, -0.14, 0.00, s * 0.10 + 0.085, 0.28, 0.12, PANT, 0.10);
+      }
+      B(-0.185, -0.13, 0.12, 0.185, 0.14, 0.58, jk, 0.40);                       // torso
+      B(-0.235, -0.12, 0.44, 0.235, 0.12, 0.58, jk, 0.45);                       // shoulders
+      // forearms out onto the table (top is 0.28 above a hall bench)
+      for (const s of [-1, 1]) {
+        B(s * 0.20 - 0.058, -0.08, 0.16, s * 0.20 + 0.058, 0.10, 0.46, jk, 0.42);
+        B(s * 0.185 - 0.058, 0.10, 0.28, s * 0.185 + 0.058, 0.52, 0.36, jk, 0.16);
+      }
+      B(-0.052, -0.035, 0.58, 0.052, 0.035, 0.64, sk, 0.80);                     // neck
+      B(-0.090, -0.080, 0.64, 0.090, 0.090, 0.83, sk, 1.0);                      // head
+      B(-0.095, -0.085, 0.78, 0.095, 0.095, 0.87, hr, 1.0);                      // hair or a beanie
+      // and what they are drinking, on the table in front of them
+      if (o.drink !== false) {
+        patrons.wAt = 0;
+        const dr = o.drink === 'glass' ? 0.036 : 0.042;
+        const q = P(a2 + fa * 0.60 + ra * 0.12, c2 + fc * 0.60 + rc * 0.12, 0);
+        patrons.cyl(q.x, q.z, y0 + seat + 0.28 * tall, y0 + seat + (o.drink === 'glass' ? 0.46 : 0.38) * tall,
+          dr, o.drink === 'glass' ? [0.80, 0.50, 0.12] : C_CERAM, 8);
+      }
+    }
+  };
+  // hall tables: two or three to a table, and four tables left empty, because a
+  // room where every seat is taken reads as a set-dressing pass rather than as
+  // half past two on a Tuesday
+  person(HALL_A[0] - BENCH_A, HALL_C[0] - 0.55, 'a+', { seat: 0.51 });
+  person(HALL_A[0] + BENCH_A, HALL_C[0] + 0.30, 'a-', { seat: 0.51 });
+  person(HALL_A[1] - BENCH_A, HALL_C[1] - 0.62, 'a+', { seat: 0.51 });
+  person(HALL_A[1] - BENCH_A, HALL_C[1] + 0.48, 'a+', { seat: 0.51 });
+  person(HALL_A[1] + BENCH_A, HALL_C[1] - 0.10, 'a-', { seat: 0.51, drink: 'glass' });
+  person(HALL_A[2] + BENCH_A, HALL_C[2] - 0.40, 'a-', { seat: 0.51, drink: 'glass' });
+  person(HALL_A[2] - BENCH_A, HALL_C[2] + 0.36, 'a+', { seat: 0.51 });
+  person(HALL_A[0] + BENCH_A, HALL_C[2] - 0.20, 'a-', { seat: 0.51 });
+  // the second window-end table: its benches run across, so these two face
+  // along c and are the pair the look-around finds first
+  person(-3.4, -D + 3.6 - 1.15, 'c+', { seat: 0.48 });
+  person(-3.4, -D + 3.6 + 1.15, 'c-', { seat: 0.48, drink: 'glass' });
+  // Two at the counter and the man behind it. He is at c = 3.55 and not at 1.3:
+  // `barCam` holds on (W - 0.75, 1.65) and at 1.3 he stood 1.9 m from the lens,
+  // filling the bottom-right corner with a white apron. Along the bar he is in
+  // the shot, doing something, and not in the way of the thing the shot is of.
+  person(BA - 0.62, 2.30, 'a+', { stand: true });
+  person(BA - 0.62, 3.05, 'a+', { stand: true });
+  person(W - 0.95, 3.55, 'a-', { stand: true, jacket: [0.88, 0.88, 0.90], tall: 1.02 });
 
   // ---- lighting rig for the bake ------------------------------------------
   const lampP = P(TA, TC + 0.05, 0);
@@ -671,6 +1443,15 @@ function buildInterior(b) {
       // ...and a dim fill behind the counter, so the back shelf is not a
       // silhouette against its own bottles
       { x: P(W - 0.5, 2.6, 0).x, y: y0 + 2.1, z: P(W - 0.5, 2.6, 0).z, c: [0.46, 0.33, 0.20], range: 4.2, k: 0.8, wrap: true },
+      // one per hall table. Range 3.0 and k 0.95 puts a pool of light on each
+      // table and lets the aisles between them fall away, which is what a room
+      // lit by hanging shades looks like; a flat wash would have been cheaper to
+      // reason about and would have thrown away every bit of depth the furniture
+      // just bought.
+      ...HALL_LAMPS.map(([la, lc]) => {
+        const q = P(la, lc, 0);
+        return { x: q.x, y: y0 + 2.00, z: q.z, c: [0.76, 0.52, 0.28], range: 3.0, k: 0.95, wrap: true };
+      }),
     ],
     win: winN,
     winC: [0.30, 0.36, 0.48],
@@ -680,39 +1461,84 @@ function buildInterior(b) {
   const litGeo = bakeInterior(lit.geometry(), L);
   const glowGeo = glow.geometry();
 
-  // ---- the drink, and the steam off it ------------------------------------
-  // Built as their own little geometries so they can be swapped and animated;
-  // baked with the same rig so they sit in the same light as the table.
-  const mugB = new Bld();
-  /** Top of the coffee, in the room frame — where the steam has to start. */
-  const COFFEE_Y = TY + 0.165;
-  {
+  // ---- what arrives on the table ------------------------------------------
+  /**
+   * One little geometry per line on the card, built here and baked with the same
+   * rig so a mug sits in exactly the light the table does.
+   *
+   * Eight geometries and not two-plus-a-tint: `bakeInterior` folds the light INTO
+   * the vertex colours, so the albedo is already multiplied in and there is no
+   * material colour left to swap. Building them all up front is ~1.4k triangles
+   * total, they share `matLit` so they add no program and no state change, and
+   * exactly one of them is ever `visible`. Trying to be clever here would have
+   * cost a second material and bought nothing.
+   *
+   * `steamY` is the room-frame height of the liquid or the food, because that is
+   * where the plume has to start — a soup bowl steams 9 cm lower than a mug and
+   * the billboard is pinned to this number, not to a constant.
+   */
+  const vessels = {};
+  for (const m of MENU) {
+    const B = new Bld();
     const p = P(DRINK_A, DRINK_C, 0);
-    mugB.cyl(p.x, p.z, TY + 0.056, TY + 0.156, 0.043, C_CERAM, 10);   // saucer-ish base
-    mugB.cyl(p.x, p.z, TY + 0.156, COFFEE_Y, 0.030, [0.20, 0.11, 0.05], 10); // the coffee
-    // Handle: a real arc of ceramic, swept in the ROOM's frame and standing in
-    // the (a, y) plane so it is seen side-on from the bench. Ends land on the
-    // 4.3 cm mug wall rather than in the air beside it.
-    {
+    let steamY;
+    if (m.vessel === 'mug') {
+      B.cyl(p.x, p.z, TY + 0.056, TY + 0.156, 0.043, C_CERAM, 10);       // the body
+      steamY = TY + 0.165;
+      B.cyl(p.x, p.z, TY + 0.156, steamY, 0.030, m.liq, 10);             // what is in it
+      if (m.cream) B.cyl(p.x, p.z, steamY, steamY + 0.022, 0.029, [0.95, 0.92, 0.86], 10);
+      // Handle: a real arc of ceramic, swept in the ROOM's frame and standing in
+      // the (a, y) plane so it is seen side-on from the bench. Ends land on the
+      // 4.3 cm mug wall rather than in the air beside it.
       const pts = [];
-      const N = 7;
-      for (let i = 0; i <= N; i++) {
-        const t = lerp(-1.48, 1.48, i / N);
+      for (let i = 0; i <= 7; i++) {
+        const t = lerp(-1.48, 1.48, i / 7);
         pts.push([DRINK_A + 0.040 + Math.cos(t) * 0.034, DRINK_C, TY + 0.106 + Math.sin(t) * 0.036]);
       }
-      TUBE(mugB, pts, 0.0075, C_CERAM);
+      TUBE(B, pts, 0.0075, C_CERAM);
+    } else if (m.vessel === 'glass') {
+      B.cyl(p.x, p.z, TY + 0.056, TY + 0.075, 0.040, [0.80, 0.78, 0.74], 10);
+      B.cyl(p.x, p.z, TY + 0.075, TY + 0.245, 0.038, m.liq, 10, false);
+      B.cyl(p.x, p.z, TY + 0.245, TY + 0.285, 0.040, [0.96, 0.94, 0.88], 10);
+      B.cyl(p.x, p.z, TY + 0.285, TY + 0.295, 0.041, [0.92, 0.90, 0.86], 10);
+      steamY = TY + 0.245;                                                // unused, no steam
+    } else if (m.vessel === 'bowl') {
+      B.cyl(p.x, p.z, TY + 0.056, TY + 0.066, 0.082, C_CERAM, 12);        // underplate
+      // The soup sits ON the bowl, not inside it. These are solid cylinders, so
+      // a 0.118..0.126 soup disc inside a 0.066..0.128 bowl is a disc buried in
+      // ceramic — which is exactly what the first cut rendered: a plain white
+      // cylinder with steam coming off it and no soup anywhere.
+      B.cyl(p.x, p.z, TY + 0.066, TY + 0.120, 0.066, C_CERAM, 12);        // the bowl
+      steamY = TY + 0.129;
+      B.cyl(p.x, p.z, TY + 0.120, steamY, 0.059, m.liq, 12);              // the soup
+      B.cyl(p.x, p.z, TY + 0.120, TY + 0.132, 0.066, C_CERAM, 12, false); // ...and its rim
+      // a spoon over the rim and the slice of bread beside it
+      BX(B, DRINK_A - 0.02, DRINK_C - 0.10, TY + 0.126, DRINK_A + 0.05, DRINK_C - 0.075,
+        TY + 0.134, C_STEEL);
+      BX(B, DRINK_A + 0.10, DRINK_C - 0.05, TY + 0.056, DRINK_A + 0.19, DRINK_C + 0.05,
+        TY + 0.096, [0.66, 0.50, 0.30]);
+    } else {
+      // a plate of Kaiserschmarrn: torn pancake in a heap, dusted, with a
+      // spoonful of plum compote at the edge
+      B.cyl(p.x, p.z, TY + 0.056, TY + 0.070, 0.095, C_CERAM, 14);
+      steamY = TY + 0.112;
+      for (let i = 0; i < 9; i++) {
+        const th = (i / 9) * 6.2832 + 0.4;
+        const rr = 0.024 + 0.026 * ((i * 7) % 3) / 2;
+        const q = P(DRINK_A + Math.cos(th) * rr, DRINK_C + Math.sin(th) * rr, 0);
+        B.cyl(q.x, q.z, TY + 0.070, TY + 0.070 + 0.030 + 0.014 * ((i * 5) % 3), 0.026,
+          i % 3 === 0 ? [0.82, 0.68, 0.40] : m.liq, 6);
+      }
+      const q = P(DRINK_A + 0.062, DRINK_C - 0.048, 0);
+      B.cyl(q.x, q.z, TY + 0.070, TY + 0.086, 0.028, [0.26, 0.07, 0.14], 8);
     }
+    vessels[m.id] = {
+      geo: bakeInterior(B.geometry(), L),
+      /** World point of the liquid's surface — the steam billboard hangs off it. */
+      steamAt: P(DRINK_A, DRINK_C, steamY),
+      hot: !!m.hot,
+    };
   }
-  const glassB = new Bld();
-  {
-    const p = P(DRINK_A, DRINK_C, 0);
-    glassB.cyl(p.x, p.z, TY + 0.056, TY + 0.075, 0.040, [0.80, 0.78, 0.74], 10);
-    glassB.cyl(p.x, p.z, TY + 0.075, TY + 0.245, 0.038, [0.86, 0.52, 0.10], 10, false);
-    glassB.cyl(p.x, p.z, TY + 0.245, TY + 0.285, 0.040, [0.96, 0.94, 0.88], 10);
-    glassB.cyl(p.x, p.z, TY + 0.285, TY + 0.295, 0.041, [0.92, 0.90, 0.86], 10);
-  }
-  const mugGeo = bakeInterior(mugB.geometry(), L);
-  const glassGeo = bakeInterior(glassB.geometry(), L);
 
   /**
    * Steam, rebuilt.
@@ -801,8 +1627,17 @@ function buildInterior(b) {
    * counter you ordered from, which is also simply what you do.
    *
    * Aimed between the group heads and the taps, with the bottle shelf behind.
+   *
+   * RAISED and pulled back from where it first sat (eye y0 + 1.56 at 1.7 m off
+   * the counter front). The counter top is at y0 + 1.14, so from there the lens
+   * was 0.42 m above it at 2.5 m — a 9.5 degree grazing angle, at which the top
+   * is a two-pixel sliver and EVERYTHING standing on it reads as floating in
+   * front of the back wall. The machine in particular looked like it was hanging
+   * in the air, which was reported as a modelling bug and was a camera bug. At
+   * 0.76 m above the top and 2.9 m back it is 15 degrees and the counter is a
+   * surface again, which also brings the banner across its front into frame.
    */
-  const barAim = P(W - 0.55, 1.10, y0 + 1.34);
+  const barAim = P(W - 0.75, 1.65, y0 + 1.24);
   /**
    * ...and where it stands to look. Aiming the table camera at the counter from
    * the bench was tried first and measured: at 10.7 m down a dark room the whole
@@ -810,18 +1645,20 @@ function buildInterior(b) {
    * The beat is a MOVE — you got up and went to the bar, which is what ordering
    * a drink actually involves — ending 2.3 m off the group heads.
    */
-  const barCam = P(BA - 1.70, 1.10, y0 + 1.56);
+  const barCam = P(BA - 2.90, 0.30, y0 + 1.90);
   // where the player is standing while inside, for streaming/shadow focus
   const stand = P(0, 0, 0);
 
   return {
-    litGeo, glowGeo, mugGeo, glassGeo, steamGeo,
+    litGeo, glowGeo, steamGeo, vessels,
+    /** Print, baked with the same rig; null when branding was not supplied. */
+    signGeo: signs.empty ? null : bakeInterior(signs.geometry(), L),
+    chalkGeo: bakeInterior(chalk.geometry(), L),
+    patronGeo: bakeInterior(patrons.geometry(), L),
     camPos, camAim, barAim, barCam, stand, floorY: y0,
-    /** World point of the coffee surface — the steam billboard hangs off this. */
-    steamAt: P(DRINK_A, DRINK_C, COFFEE_Y),
     // unit vector along the room's `a` axis, for the camera drift
     driftA: new THREE.Vector3(ax, 0, az),
-    triangles: lit.triangles + glow.triangles,
+    triangles: lit.triangles + glow.triangles + patrons.triangles,
   };
 }
 
@@ -884,7 +1721,7 @@ function buildChairRig() {
 // =============================================================================
 export function createResort(opts) {
   const {
-    scene, terrain, scatter, sky, camera, chaseCam, physics, skier, audio, draglift,
+    scene, terrain, scatter, sky, camera, chaseCam, physics, skier, audio, draglift, branding,
   } = opts;
 
   // ---- line-derived constants, filled in below from the placement seam -----
@@ -1011,9 +1848,13 @@ export function createResort(opts) {
   // and a terrace, and it stands 150 m from where a run starts.
   const hutB = scatter?.buildings?.[0] || null;
   let interior = null, litMesh = null, glowMesh = null;
-  let mugMesh = null, glassMesh = null, steamMesh = null, interiorGroup = null;
+  let steamMesh = null, interiorGroup = null, patronMesh = null;
+  let chalkTex = null;
+  /** id -> the mesh that appears on the table. Exactly one is ever visible. */
+  const vesselMesh = Object.create(null);
+  const swayU = { value: 0 };
   if (hutB) {
-    interior = buildInterior(hutB);
+    interior = buildInterior(hutB, branding?.atlas || null);
     interiorGroup = new THREE.Group();
     interiorGroup.name = 'hut-interior';
     const matLit = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false });
@@ -1022,19 +1863,83 @@ export function createResort(opts) {
     matGlow.name = 'hut-glow';
     litMesh = new THREE.Mesh(interior.litGeo, matLit);
     glowMesh = new THREE.Mesh(interior.glowGeo, matGlow);
-    mugMesh = new THREE.Mesh(interior.mugGeo, matLit);
-    glassMesh = new THREE.Mesh(interior.glassGeo, matLit);
     const matSteam = new THREE.MeshBasicMaterial({
       vertexColors: true, fog: false, transparent: true, opacity: 0.0,
       depthWrite: false, side: THREE.DoubleSide,
     });
     matSteam.name = 'hut-steam';
     steamMesh = new THREE.Mesh(interior.steamGeo, matSteam);
-    for (const m of [litMesh, glowMesh, mugMesh, glassMesh, steamMesh]) {
+    const shown = [litMesh, glowMesh, steamMesh];
+
+    /**
+     * The patrons, and the only shader in this file.
+     *
+     * `vertexColors` carries the bake exactly as it does for the walls; the two
+     * extra attributes only move the vertex. Nine lines, one uniform, one draw
+     * call — see SwayBld for why a completely static room full of people is
+     * worse than a room with nobody in it.
+     */
+    const matSway = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false });
+    matSway.name = 'hut-patrons';
+    matSway.onBeforeCompile = (sh) => {
+      sh.uniforms.uSwayT = swayU;
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', /* glsl */`
+          #include <common>
+          attribute float aSway;
+          attribute float aPhase;
+          uniform float uSwayT;
+        `)
+        .replace('#include <begin_vertex>', /* glsl */`
+          vec3 transformed = vec3( position );
+          float w = aSway * ${SWAY_A.toFixed(4)};
+          transformed.x += sin( uSwayT * 0.83 + aPhase ) * w;
+          transformed.z += sin( uSwayT * 0.61 + aPhase * 1.7 ) * w * 0.8;
+          transformed.y += sin( uSwayT * 1.47 + aPhase ) * w * 0.32;
+        `);
+    };
+    matSway.customProgramCacheKey = () => 'hut-sway';
+    patronMesh = new THREE.Mesh(interior.patronGeo, matSway);
+    shown.push(patronMesh);
+
+    // the two brand plates, printed off branding.js' atlas
+    // `DoubleSide` on both printed materials. These are unlit, so the fragment
+    // never touches the normal and the two-sided draw is free — while the normal
+    // ATTRIBUTE is still what `bakeInterior` lit them by, and it is given
+    // explicitly rather than derived from the winding. That combination is what
+    // makes a sign impossible to get silently wrong: the worst a bad winding can
+    // now do is mirror the print, which is visible, instead of culling the quad,
+    // which looks like the sign was never built.
+    if (interior.signGeo && branding?.atlas) {
+      const matSign = new THREE.MeshBasicMaterial({
+        map: branding.atlas.tex, vertexColors: true, fog: false, side: THREE.DoubleSide,
+      });
+      matSign.name = 'hut-brand';
+      shown.push(new THREE.Mesh(interior.signGeo, matSign));
+    }
+    // ...and the chalk board, off its own
+    chalkTex = new THREE.CanvasTexture(paintTariffBoard());
+    chalkTex.colorSpace = THREE.SRGBColorSpace;
+    chalkTex.anisotropy = 8;
+    const matChalk = new THREE.MeshBasicMaterial({
+      map: chalkTex, vertexColors: true, fog: false, side: THREE.DoubleSide,
+    });
+    matChalk.name = 'hut-tariff';
+    shown.push(new THREE.Mesh(interior.chalkGeo, matChalk));
+
+    for (const m of MENU) {
+      const mesh = new THREE.Mesh(interior.vessels[m.id].geo, matLit);
+      mesh.name = 'hut-' + m.id;
+      mesh.visible = false;
+      vesselMesh[m.id] = mesh;
+      shown.push(mesh);
+    }
+
+    for (const m of shown) {
       m.castShadow = false; m.receiveShadow = false; m.frustumCulled = false;
       interiorGroup.add(m);
     }
-    mugMesh.visible = false; glassMesh.visible = false; steamMesh.visible = false;
+    steamMesh.visible = false;
     interiorGroup.visible = false;
     scene.add(interiorGroup);
 
@@ -1086,7 +1991,10 @@ export function createResort(opts) {
   let veil = 0, veilTarget = 0, glowFlash = 0;
   let skipHold = 0, skipping = false, skipArmed = false;
   let warmth = 1;
-  let drink = null, drinkT = 0, riseDelay = 0, hutNote = '';
+  /** The MENU entry in front of the player, or null. */
+  let order = null, drinkT = 0, riseDelay = 0, hutNote = '';
+  /** Which line the menu cursor is on, 0..MENU.length-1. */
+  let cursor = 0, navHold = 0, prevNav = 0;
   let barBeat = 0, prevPick = 0, pickCool = 0;
   let runTop = 0, runAir = 0, lastRun = null;
   let lastTowerIdx = -1;
@@ -1214,7 +2122,8 @@ export function createResort(opts) {
     if (!interior) return false;
     mode = 'hut'; phase = 'in'; modeT = 0; phaseT = 0;
     hutNote = zone?.note || 'Bergrestaurant';
-    drink = null; drinkT = 0; riseDelay = 0;
+    order = null; drinkT = 0; riseDelay = 0;
+    cursor = 0; navHold = 0; prevNav = 0;
     barBeat = 0; prevPick = 0; pickCool = 0;
     // A ride ends when a door opens. Only `backToSki` used to null this, so a
     // lift -> hut transition left "T-BAR / HOLD X TO SKIP" printed over the
@@ -1223,8 +2132,7 @@ export function createResort(opts) {
     skipping = false; skipHold = 0;
     setSkierVisible(false);
     chairRig.visible = false;
-    if (mugMesh) mugMesh.visible = false;
-    if (glassMesh) glassMesh.visible = false;
+    for (const id in vesselMesh) vesselMesh[id].visible = false;
     if (steamMesh) steamMesh.visible = false;
     lastRun = { time: state.time || 0, distance: state.distance || 0, top: runTop, air: runAir };
     veilTarget = 1;
@@ -1284,6 +2192,11 @@ export function createResort(opts) {
     const dtRaw = Math.max(0, dt || 0);
     dt = clamp(dtRaw, 0, 0.1);
     modeT += dt; phaseT += dt;
+    // The patrons' idle clock. Advanced unconditionally and not only while
+    // indoors, so the sway is wherever the wall clock says rather than restarting
+    // from a frozen pose every time a door opens — and so the warm-up frames
+    // below exercise the shader with a moving uniform.
+    swayU.value += dt;
     if (rigWarm > 0 && mode === 'ski') {
       rigWarm--;
       chairRig.visible = true;
@@ -1308,7 +2221,8 @@ export function createResort(opts) {
         interiorGroup.visible = false;
         interiorGroup.scale.setScalar(1);
         interiorGroup.position.set(0, 0, 0);
-        mugMesh.visible = false; glassMesh.visible = false; steamMesh.visible = false;
+        for (const id in vesselMesh) vesselMesh[id].visible = false;
+        steamMesh.visible = false;
       }
     }
     state.mode = mode;
@@ -1322,6 +2236,8 @@ export function createResort(opts) {
     const steer = inp.steer || 0;
     const crouch = inp.crouch || 0;
     const pick = inp.pick || 0;
+    const navY = inp.navY || 0;
+    const confirmPressed = !!inp.confirmPressed;
 
     // veil + flash decay, shared by every mode
     veil += (veilTarget - veil) * Math.min(1, dt / T_DOOR);
@@ -1344,7 +2260,7 @@ export function createResort(opts) {
       // camera read the latter and its advertised "A/D look around" therefore
       // did nothing at all.
       inp.steer = 0; inp.crouch = 0; inp.brake = 0; inp.jump = false; inp.jumpPressed = false;
-      const io = { actionPressed, brake, steer, crouch, pick, dtRaw };
+      const io = { actionPressed, brake, steer, crouch, pick, navY, confirmPressed, dtRaw };
       if (mode === 'lift') updateLift(dt, state, io);
       else if (mode === 'drag') updateDrag(dt, state, io);
       else if (mode === 'hut') updateHut(dt, state, io);
@@ -1601,35 +2517,63 @@ export function createResort(opts) {
     const panT = clamp(io.steer ?? 0, -1, 1);
     hutPan += (panT - hutPan) * Math.min(1, dt * 2.4);
 
+    // ---- the cursor --------------------------------------------------------
+    /**
+     * Up/down moves the highlight; hold to repeat. `navY` is a LEVEL, so the
+     * edge and the repeat are found here — the same reason `pick` is handled the
+     * way it is below, and the reason controls.js publishes the raw key state
+     * instead of the ramped `crouch` those keys also drive.
+     *
+     * It does NOT wrap. Eight lines in three sections is a list you read, not a
+     * wheel you spin, and a cursor that jumps from Radler back to Kaffee when you
+     * press down once too often is a cursor you stop trusting.
+     */
+    if (phase === 'sit') {
+      const nv = io.navY | 0;
+      if (nv !== prevNav) { navHold = nv ? -NAV_DELAY : 0; if (nv) cursor = clamp(cursor - nv, 0, MENU.length - 1); }
+      else if (nv) {
+        navHold += dt;
+        if (navHold >= NAV_REPEAT) { navHold -= NAV_REPEAT; cursor = clamp(cursor - nv, 0, MENU.length - 1); }
+      }
+      prevNav = nv;
+    }
+
     // ---- ordering ----------------------------------------------------------
     // `pick` is a LEVEL (see controls.js), so this has to find the edge itself.
     // Left as a level test it re-ordered every frame: 120 frames of alternating
     // 1/2 pushed 120 runs, fired 120 one-shots and moved the sun three quarters
-    // of a day. PICK_COOLDOWN then stops a fast alternation being a drink mill.
+    // of a day. PICK_COOLDOWN then stops a fast alternation being a drink mill —
+    // and it matters more now than it did with two keys, because a hand resting
+    // across the number row can hold two of them.
     pickCool = Math.max(0, pickCool - dt);
     const pickEdge = io.pick !== 0 && io.pick !== prevPick && pickCool <= 0;
     prevPick = io.pick;
     if (phase === 'sit') {
-      if (pickEdge && io.pick === 1 && drink !== 'coffee') serve(state, 'coffee');
-      else if (pickEdge && io.pick === 2 && drink !== 'beer') serve(state, 'beer');
-      else if (io.actionPressed) { phase = 'out'; phaseT = 0; veilTarget = 1; }
+      const byKey = pickEdge ? MENU[io.pick - 1] : null;
+      if (byKey) { cursor = io.pick - 1; if (byKey !== order) serve(state, byKey.id); }
+      else if (io.confirmPressed && pickCool <= 0 && MENU[cursor] !== order) {
+        serve(state, MENU[cursor].id);
+      } else if (io.actionPressed) { phase = 'out'; phaseT = 0; veilTarget = 1; }
     }
 
     drinkT += dt;
     barBeat = Math.max(0, barBeat - dt);
-    // The drink rises towards the lens once it is in front of you — which, with
+    // The order rises towards the lens once it is in front of you — which, with
     // the bar beat running, is after the camera has come back from the counter.
-    const rise = drink ? clamp((drinkT - riseDelay) / T_SIP, 0, 1) : 0;
+    const rise = order ? clamp((drinkT - riseDelay) / T_SIP, 0, 1) : 0;
     const lift = Math.sin(rise * Math.PI) * 0.13;
-    if (mugMesh) { mugMesh.position.set(0, lift, 0); glassMesh.position.set(0, lift, 0); }
+    if (order && vesselMesh[order.id]) vesselMesh[order.id].position.set(0, lift, 0);
     if (steamMesh) {
-      const on = drink === 'coffee';
+      const v = order ? interior.vessels[order.id] : null;
+      const on = !!(v && v.hot);
       steamMesh.visible = on;
       if (on) {
         // Billboard: the plume is built in its own +x/+y plane at the origin, so
-        // it is pinned to the coffee surface and yawed at the lens here rather
-        // than baked at whatever angle the room happens to sit at.
-        const sp = interior.steamAt;
+        // it is pinned to the liquid's own surface — which is 9 cm lower for a
+        // soup bowl than for a mug, hence the per-vessel `steamAt` rather than a
+        // constant — and yawed at the lens here rather than baked at whatever
+        // angle the room happens to sit at.
+        const sp = v.steamAt;
         steamMesh.position.set(sp.x, sp.y + lift, sp.z);
         steamMesh.rotation.set(0, Math.atan2(camera.position.x - sp.x, camera.position.z - sp.z), 0);
         const t = (drinkT % 2.6) / 2.6;
@@ -1640,46 +2584,71 @@ export function createResort(opts) {
       }
     }
 
+    /**
+     * The card, as the HUD sees it.
+     *
+     * `menu` and `sections` are the MENU table with nothing added and the two
+     * runtime flags (`on`, `sel`) folded in, so `ui/hud.js` never imports this
+     * file and never owns a price. Rebuilt every frame and that is fine — the
+     * HUD diffs the string it renders before it touches the DOM, which is the
+     * discipline that file is written to.
+     */
     state.hut = {
       name: hutNote,
-      choices: [
-        { key: '1', label: 'Coffee', note: 'warms you through' },
-        { key: '2', label: 'Beer', note: 'a long sit' },
-      ],
-      drink,
+      altitude: 2140,
+      sections: SECTIONS.map(([id, title]) => ({ id, title })),
+      menu: MENU.map((m, i) => ({
+        id: m.id, key: m.key, sec: m.sec, label: m.label, note: m.note, price: m.price,
+        on: order === m, sel: i === cursor,
+      })),
+      cursor,
+      order: order ? { id: order.id, label: order.label, line: order.line } : null,
+      /** Kept as the item id: `?resort=hut&drink=beer` still has to mean something. */
+      drink: order ? order.id : null,
       served: rise,
       run: lastRun,
       hint: 'A/D look around · E step back onto the snow',
     };
   }
 
-  function serve(state, kind, beat = true) {
-    drink = kind; drinkT = 0;
+  function serve(state, id, beat = true) {
+    const m = menuItem(id);
+    if (!m) return;
+    if (order && vesselMesh[order.id]) vesselMesh[order.id].visible = false;
+    order = m; drinkT = 0;
+    cursor = MENU.indexOf(m);
     pickCool = PICK_COOLDOWN;
     // Order at the bar, look at the bar. See `interior.barAim`.
     barBeat = beat ? T_BAR_BEAT : 0;
     riseDelay = beat ? T_BAR_BEAT * 0.62 : 0;
-    if (mugMesh) mugMesh.visible = kind === 'coffee';
-    if (glassMesh) glassMesh.visible = kind === 'beer';
-    warmth = kind === 'coffee' ? 1 : Math.max(warmth, 0.85);
+    if (vesselMesh[m.id]) {
+      vesselMesh[m.id].visible = true;
+      vesselMesh[m.id].position.set(0, 0, 0);
+    }
+    // A hot line fills the tank; a cold one leaves you where you were, which is
+    // the whole reason the warmth pip is worth reading before you order.
+    warmth = Math.max(warmth, m.warm);
     glowFlash = 1;
-    audio?.sip?.(kind);
+    // audio.js knows two vessels: ceramic-on-a-saucer and glass-on-timber. A
+    // bowl and a plate are ceramic, so they take the first, and only the two
+    // cold lines take the second.
+    audio?.sip?.(m.vessel === 'glass' ? 'beer' : 'coffee');
     // A stop costs time, and the light is the only honest way to show that.
     // sky.setTimeOfDay re-derives the whole lighting rig, so it happens exactly
-    // once per drink, inside a room, with the HUD holding a card over the frame.
+    // once per order, inside a room, with the HUD holding a card over the frame.
     //
     // Clamped at TOD_LAST_LIFT, and NOT wrapped: `setTimeOfDay` takes the value
     // mod 1, so the unbounded version rolled 0.302 past 1.0 and came out at 0.042
     // — the middle of the night, reachable by holding two keys. The stop still
-    // costs you the afternoon; it cannot cost you the day.
+    // costs you the afternoon; it cannot cost you the day. Sitting down to a
+    // Kaiserschmarrn costs three times what a coffee does, which is honest.
     if (sky?.setTimeOfDay && sky.getTimeOfDay) {
       const t = sky.getTimeOfDay();
-      const want = t + (kind === 'beer' ? 0.020 : 0.009);
-      const next = t <= TOD_LAST_LIFT ? Math.min(want, TOD_LAST_LIFT) : t;
+      const next = t <= TOD_LAST_LIFT ? Math.min(t + m.tod, TOD_LAST_LIFT) : t;
       if (next !== t) sky.setTimeOfDay(next);
     }
     if (lastRun) {
-      (state.runs || (state.runs = [])).push({ ...lastRun, drink: kind });
+      (state.runs || (state.runs = [])).push({ ...lastRun, drink: m.id });
     }
   }
 
@@ -1736,8 +2705,8 @@ export function createResort(opts) {
         _aim.x = camera.position.x + ex * ca2 - ez * sa2;
         _aim.z = camera.position.z + ez * ca2 + ex * sa2;
       }
-      // the drink comes up towards the lens: follow it a touch
-      const rise = drink ? clamp((drinkT - riseDelay) / T_SIP, 0, 1) : 0;
+      // the order comes up towards the lens: follow it a touch
+      const rise = order ? clamp((drinkT - riseDelay) / T_SIP, 0, 1) : 0;
       _aim.y += Math.sin(rise * Math.PI) * 0.05;
       // ...and the trip to the counter when an order goes in. A clipped sine, so
       // it leaves, HOLDS on the bar for the middle second, and comes back.
@@ -1897,7 +2866,8 @@ export function createResort(opts) {
     info() {
       return {
         mode, phase, modeT, rideS, rideTotal, rideFrom, lapse: +lapse.toFixed(2),
-        skipArmed, warmth, drink, barBeat: +barBeat.toFixed(2),
+        skipArmed, warmth, drink: order ? order.id : null, cursor,
+        barBeat: +barBeat.toFixed(2),
         zones: zones.map((z) => ({ id: z.id, x: +z.x.toFixed(1), z: +z.z.toFixed(1), r: z.r, s: z.s })),
         cable: upCable ? { total: +upCable.total.toFixed(1), unloadAt: +liftTop.toFixed(1), midS: midS && +midS.toFixed(1) } : null,
         interiorTris: interior ? interior.triangles : 0,
@@ -1910,6 +2880,9 @@ export function createResort(opts) {
         scene.remove(interiorGroup);
         interiorGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
       }
+      // ...but not branding.js' atlas: the brand plates SHARE it, and disposing
+      // a texture this module does not own takes the slope banners with it.
+      if (chalkTex) chalkTex.dispose();
       scene.remove(chairRig);
       chairRig.geometry.dispose(); chairRig.material.dispose();
     },

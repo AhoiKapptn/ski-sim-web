@@ -116,7 +116,7 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
 6. **`renderer.info.render.calls` reads `1` unless you force `autoReset = false`.**
    three resets `info` at the top of *every* `renderer.render()`, and the post
    chain makes a dozen per frame, so the naive read reports the last fullscreen
-   quad. True figure is **527 draw calls/frame**. Anyone who profiles draw calls
+   quad. True figure is **531 draw calls/frame** on the snow (527 before the slope branding went from four objects to nine) and **222 inside the hut**. Anyone who profiles draw calls
    without knowing this concludes the scene is trivially cheap.
 7. **The GPU timer's absolute value is ~2.5× reality.**
    `EXT_disjoint_timer_query_webgl2` works on this ANGLE/Metal path, but ANGLE
@@ -174,6 +174,8 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 | Trees flicker | LOD churn, ring rebuild, mip/alpha-test coverage, billboard flipping — all four eliminated by measurement | **The TAA resolve.** Freeze the sim completely (no wind, no dither, no camera) and accumulate per-pixel temporal SD over the crowns: **6.95 codes shipped, 0.013 with TAA off.** The render was exactly static; the resolve was not. Raising feedback alone fixes a third of it, because the variance box that clips the history is itself built from the jittered current frame |
 | Park kickers read as bumps and launch you late | Two separate defects | **One defect.** The takeoff ramp peaked at **+7.7°** where a park kicker is 25–35°. Too shallow to read as built *and* too shallow to unload the skis — the rider separated 5.3 m past the lip. Raising the ramp fixed both |
 | "The performance is lagging a bit" | CPU cost, the post chain, draw calls, shadow maps, or the 527-call scene being too complex | **Fragment cost at DPR 2, and almost all of it one shader.** CPU is 0.4 ms update + 1.1 ms submit out of a 34 ms frame. Ablating every scene material returns the interval to the 16.70 ms vsync lock; the terrain snow shader alone is **well over half** of scene shading cost — **≥14.4 ms (censored by the vsync floor) against 3.6–8.3 ms for the entire rest of the scene**, measured with complement arms, 2/2 pairs. No post pass, no shadow pass and no CPU subsystem is measurable against it. The lever is pixels, not passes |
+| "The hut UI experience is weak" | The card's typography, the seated framing, or the lighting | **The room.** `buildings[0]`'s `w`/`d` are HALF-extents, so the enterable hall is **16.2 x 23.2 m — 374 m of floor — and it had two tables in it.** The seated shot was always fine; the moment the player used the look-around the file's own docstring advertises, it was a hangar with a stove in it. Nothing about the card was the problem until the room behind it was a room |
+| A solid object in the hut appears to hang in mid-air | Its Y coordinate; then the camera's depression angle | **Inside-out winding.** See the interface hazard below — you were seeing the box's interior floor. Two of the three diagnoses in this row were made and acted on before anyone magnified the crop |
 
 ## Interface hazards
 
@@ -192,6 +194,43 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 - **`terrain.depthMaterial` renders nothing in an override pass** — the shadow map
   leaves it `BackSide`. A depth readback that forgets this returns an empty buffer,
   not an error.
+- **`resort.js`' hut is built in a LEFT-handed frame, and its primitives were all
+  wound inside-out.** The room's axes are `a = (cos yaw, 0, -sin yaw)` and
+  `c = (sin yaw, 0, cos yaw)`, so `a x c = (0, -1, 0)` at every yaw — a mirror of
+  the world, not a rotation of it. `Bld.box`, `Bld.cyl`'s side and bottom cap, the
+  room-frame `BX` helper and the three lamp-shade cones were all wound for a
+  right-handed frame, so every box in the hut and in the chair rig was drawn from
+  the INSIDE: front faces culled, back faces visible, and `bakeInterior` lighting
+  each surface by a normal pointing into the object.
+    It shipped for the whole life of the feature because it is nearly invisible on
+  a flat-shaded convex box — the silhouette is identical and the far interior face
+  is the colour the near exterior one would have been. What exposed it was raising
+  `barCam` by 34 cm, which put the coffee machine at 2.5 m and 15 degrees: at that
+  angle you can see the box's interior back wall and its inside floor, and the
+  machine reads as hanging in the air above the counter. The bug was reported as a
+  modelling problem and diagnosed twice as a camera problem before anybody
+  magnified it. **If a solid object in that room looks like it is floating, crop
+  and magnify it before touching its position.**
+    The shell was already working around this: `FACE()` picks whichever winding
+  puts the normal on the room's side, and its comment records three walls and the
+  floor coming out backwards. That fix never reached the primitives. Two lessons —
+  a per-call-site workaround is evidence of a bug one level down, and a shade cone
+  needs BOTH windings whatever the handedness is, because you sit under it and the
+  surface you see is its inside.
+- **The hut's light is baked PER VERTEX, so geometry size is sampling rate.** A
+  16 x 23 m room lit by fifteen point lights at its corners is lit at its corners:
+  the floor, the walls and the ceiling shipped as one quad each in the long
+  direction and the nine new hall pendants lit literally nothing. `SEG = 1.15 m`
+  in `buildInterior` is the cut, chosen at a little under half the 3.0 m lamp
+  range. Anything large added to that room needs the same treatment, and "the
+  lamp isn't working" there is a tessellation question before it is a lighting one.
+- **`branding.js`' atlas is SHARED with the hut.** `api.atlas` hands the texture
+  and two plate UV rects to `game/resort.js`, which hangs the same marks indoors.
+  Two consequences: `resort.dispose()` must not dispose that texture (it would
+  take the slope banners with it, and it doesn't), and **anything new painted into
+  that atlas must be painted LAST** — `paint()` consumes one `mulberry32` stream in
+  a fixed order and the measured tables in `AK_BASE` and `BTM_INK_LIFT` depend on
+  it. The canvas is 2048 x 1024 with the left 1024 byte-for-byte the original.
 - **three's `packDepthToRGBA` is R-major, not A-major.** Unpacking it backwards
   yields a plausible-looking answer that is ~35 m wrong.
 - **`snData.w` (`expo`) is a shared channel.** `snow-material.js` uses it for
@@ -254,8 +293,11 @@ before applying it to a `--dpr 2` capture (trap 4).
 The near-piste sd is restated from the original **12.6 to 10.6** (DPR 1; it reads
 11.7 at DPR 2). The rectangle is right — two agents independently measured 73.6
 and 74.1 L\* on it against the documented 73.1 — but the build has gained
-buildings, a T-bar and sponsor boards since the baseline, and an sd recorded
+buildings, a T-bar and nine sponsor boards since the baseline, and an sd recorded
 against different content is a phantom regression waiting for the next agent.
+Re-measured after the hut and branding work of this pass: **74.1 L\* / sd 10.6**
+on that rectangle, i.e. the sd is unmoved and the mean is the higher of the two
+independent readings already recorded.
 **If you fill in one of the unrecorded rows, restate its value from the same
 measurement rather than assuming the old number still describes this build.**
 

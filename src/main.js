@@ -42,8 +42,11 @@ const hud = createHUD();
 // corridor ever does; `resort` owns `state.mode` and every "the player is not
 // skiing right now" case — see src/game/resort.js.
 const draglift = createDragLift(scene, terrain, { towers: scatter.lift.towers });
+// `branding` is passed in for its atlas alone: the Bergrestaurant hangs the same
+// two brand plates indoors and there is exactly one place either PNG is
+// composited (see branding.js' `atlas` accessor).
 const resort = createResort({
-  scene, terrain, scatter, sky, camera, chaseCam, physics, skier, audio, draglift, state,
+  scene, terrain, scatter, sky, camera, chaseCam, physics, skier, audio, draglift, branding, state,
 });
 
 physics.reset(state, state.pos.x, state.pos.z, state.heading);

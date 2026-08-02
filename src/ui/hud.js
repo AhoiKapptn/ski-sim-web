@@ -13,9 +13,11 @@
  * `state.mode` (see game/resort.js) decides which instruments exist. Riding a
  * lift or sitting in the hut, the speedometer is meaningless and the run timer
  * is not the subject, so both fade down and their place is taken by the thing
- * that IS the subject: a contact prompt, a ride progress line, or the bar card.
- * Nothing is created or destroyed per frame — every element is built once and
- * driven by CSS custom properties, exactly like the speed block.
+ * that IS the subject: a contact prompt, a ride progress line, or the hut's
+ * menu card. Nothing is created or destroyed per frame — every element is built
+ * once and driven by CSS custom properties, exactly like the speed block. The
+ * one exception is the menu list, which is markup built from `state.hut.menu`
+ * and written only when the rendered string changes; see `updateResort`.
  *
  *   `--ui`     1 while skiing, 0 while riding or indoors (fades the instruments)
  *   `--veil`   the dip through a doorway or a skipped ride
@@ -42,6 +44,14 @@
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const smooth = (cur, tgt, dt, tau) => cur + (tgt - cur) * (1 - Math.exp(-dt / (tau > 1e-4 ? tau : 1e-4)));
+/**
+ * The hut card is the one place this file builds markup out of data rather than
+ * out of literals, and that data comes from a table in `game/resort.js`. Nothing
+ * in it is user input today, but "the menu is a fixed table" is a property of
+ * the current build and not of this function, so it is escaped.
+ */
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => (
+  c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&quot;'));
 
 /** Ladder full scale, km/h. Measured top speed (tuck) is ~92. */
 const V_FULL = 110;
@@ -290,36 +300,121 @@ const CSS = `
   color:rgba(var(--ink),.86);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.55)}
 
 /* ----------------------------------------------------------------- card --- */
-/* The bar card. Anchored bottom-left over the empty part of the interior shot
-   rather than centred, so the window and the mug stay the picture. */
-#alp-hud .card{position:absolute;left:clamp(32px,4vw,84px);bottom:clamp(40px,7.6vh,92px);
-  min-width:clamp(230px,22vw,330px);opacity:var(--card);
-  transform:translateY(calc(10px - 10px*var(--card)))}
-#alp-hud .card .hd{font-size:clamp(10px,1.3vh,14px);font-weight:700;letter-spacing:.3em;
-  text-transform:uppercase;color:rgba(var(--hot),.95);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.6)}
-#alp-hud .card .rule{margin:.7em 0 .8em;width:100%;height:1px;background:rgba(var(--ink),.22)}
-#alp-hud .card .row{display:flex;justify-content:space-between;align-items:baseline;
-  gap:1.4em;margin:.28em 0}
-#alp-hud .card .row .k{font-size:clamp(8px,1.05vh,11px);font-weight:700;letter-spacing:.22em;
-  text-transform:uppercase;color:rgba(var(--ink),.66);text-shadow:var(--halo)}
-#alp-hud .card .row .v{font-size:clamp(13px,1.7vh,19px);font-weight:400;
-  color:rgba(var(--ink),.96);text-shadow:var(--halo),0 2px 8px rgba(0,8,20,.5)}
-#alp-hud .card .row .v s{text-decoration:none;font-size:.5em;opacity:.6;margin-left:.3em;
-  letter-spacing:.09em;font-weight:600}
-#alp-hud .card .opts{margin-top:.95em;display:flex;flex-direction:column;gap:.5em}
-#alp-hud .card .opt{display:flex;align-items:center;gap:.7em}
-#alp-hud .card .opt .kb{display:inline-flex;align-items:center;justify-content:center;
-  width:1.6em;height:1.6em;border:1px solid rgba(var(--ink),.5);border-radius:4px;
-  background:rgba(4,10,20,.3);font-size:clamp(9px,1.2vh,12px);font-weight:700;
-  color:rgba(var(--ink),.95);text-shadow:var(--halo)}
-#alp-hud .card .opt .l{font-size:clamp(12px,1.55vh,17px);color:rgba(var(--ink),.95);
+/* THE CARD.
+   The rest of this overlay is instruments — hairlines and numerals floating on
+   the frame, and its own docstring is emphatic that a panel behind them is the
+   loudest "this is a web demo" tell there is. This is the one element that gets
+   to break that rule, because it is not an instrument: it is a MENU, a printed
+   thing you are holding in a room, and a menu with no card under it is the thing
+   that reads as a debug overlay. The panel is therefore warm and paper-like
+   rather than the usual cold glass — it belongs to the timber and the lamp on
+   the other side of it, not to the speedometer.
+
+   No backdrop-filter. It is the obvious way to get glass and on a page whose
+   background is a WebGL canvas it forces a readback of that canvas every frame,
+   which would put the one element that appears while nothing else is happening
+   on the critical path. Layered gradients at low alpha, like the scrim. */
+#alp-hud .card{position:absolute;left:clamp(26px,3.2vw,64px);top:50%;
+  width:clamp(300px,25vw,392px);
+  transform:translateY(-50%) translateX(calc(-14px + 14px*var(--card)));
+  opacity:var(--card);
+  padding:clamp(15px,1.9vh,23px) clamp(17px,1.5vw,26px) clamp(14px,1.7vh,21px);
+  border-radius:3px;
+  border-left:2px solid rgba(var(--hot),.55);
+  /* MEASURED against the shot it actually appears over: the card's left third
+     lands on the window, and the sunlit conifers behind it run 150-210 codes.
+     At .62/.70/.74 the trees read straight through the panel and the row labels
+     sat on a moving high-contrast texture. .84/.90/.93 is the point at which the
+     list is quiet on the trees and the panel is still obviously translucent
+     timber-lit glass rather than a grey box. */
+  background:
+    linear-gradient(146deg,rgba(36,25,17,.84) 0%,rgba(23,16,12,.90) 46%,rgba(14,10,8,.93) 100%),
+    radial-gradient(120% 78% at 0% 0%,rgba(255,186,110,.13) 0%,rgba(255,186,110,0) 62%);
+  box-shadow:0 18px 54px rgba(0,4,10,.42),inset 0 1px 0 rgba(255,226,190,.09)}
+
+/* header: the house, and how high up it is */
+#alp-hud .card .hd{display:flex;align-items:baseline;justify-content:space-between;gap:1em}
+#alp-hud .card .hd b{font-size:clamp(12px,1.55vh,17px);font-weight:700;letter-spacing:.19em;
+  text-transform:uppercase;color:rgba(var(--hot),.97);
+  text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.6)}
+#alp-hud .card .hd i{font-style:normal;font-size:clamp(8px,1.05vh,11px);font-weight:700;
+  letter-spacing:.2em;color:rgba(var(--ink),.5);text-shadow:var(--halo)}
+#alp-hud .card .rule{margin:.62em 0 .1em;width:100%;height:1px;
+  background:linear-gradient(90deg,rgba(var(--hot),.42),rgba(var(--ink),.16) 62%,rgba(var(--ink),0))}
+
+/* section headings inside the list */
+#alp-hud .card .sec{margin:.95em 0 .42em;font-size:clamp(8px,1.0vh,11px);font-weight:700;
+  letter-spacing:.26em;text-transform:uppercase;color:rgba(var(--ink),.46);
+  text-shadow:var(--halo)}
+#alp-hud .card .sec:first-child{margin-top:.75em}
+
+/* One line of the card. The whole row is the hit area for the highlight, and
+   the highlight is a background wash plus a warm bar in the left gutter — the
+   two cues that survive on both a dark timber wall and a sunlit window. */
+#alp-hud .card .opt{position:relative;display:flex;align-items:baseline;gap:.62em;
+  padding:.30em .5em .30em .52em;margin:0 -.5em;border-radius:2px;
+  transition:none}
+#alp-hud .card .opt::before{content:'';position:absolute;left:-.5em;top:6%;bottom:6%;
+  width:2px;background:rgba(var(--hot),.9);opacity:0;
+  box-shadow:0 0 8px rgba(var(--hot),.5)}
+#alp-hud .card .opt.sel{background:rgba(255,210,160,.085)}
+#alp-hud .card .opt.sel::before{opacity:1}
+#alp-hud .card .opt .kb{flex:none;display:inline-flex;align-items:center;justify-content:center;
+  width:1.55em;height:1.55em;border:1px solid rgba(var(--ink),.34);border-radius:3px;
+  background:rgba(6,10,18,.34);font-size:clamp(8px,1.05vh,11px);font-weight:700;
+  color:rgba(var(--ink),.8);text-shadow:var(--halo);align-self:center}
+#alp-hud .card .opt.sel .kb{border-color:rgba(var(--hot),.72);color:rgba(var(--hot),.98);
+  background:rgba(255,180,110,.12)}
+#alp-hud .card .opt .l{flex:1 1 auto;font-size:clamp(12px,1.5vh,16px);font-weight:400;
+  color:rgba(var(--ink),.88);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   text-shadow:var(--halo),0 2px 8px rgba(0,8,20,.5)}
-#alp-hud .card .opt .n{font-size:clamp(8px,1.0vh,11px);letter-spacing:.14em;
-  text-transform:uppercase;color:rgba(var(--ink),.55);text-shadow:var(--halo)}
+#alp-hud .card .opt.sel .l{color:rgba(var(--ink),.99)}
+#alp-hud .card .opt .p{flex:none;font-size:clamp(10px,1.25vh,13px);font-weight:600;
+  letter-spacing:.02em;color:rgba(var(--ink),.44);text-shadow:var(--halo)}
+#alp-hud .card .opt.sel .p{color:rgba(var(--ink),.72)}
+/* the line already in front of you: a tick, and it stops being a choice */
 #alp-hud .card .opt.on .l{color:rgba(var(--hot),.98)}
-#alp-hud .card .note{margin-top:.85em;font-size:clamp(10px,1.3vh,14px);font-style:italic;
+#alp-hud .card .opt.on .p{color:rgba(var(--hot),.6)}
+#alp-hud .card .opt.on .kb{border-color:rgba(var(--hot),.6);color:rgba(var(--hot),.95)}
+#alp-hud .card .opt.on .l::after{content:' ·  served';font-size:.66em;font-weight:700;
+  letter-spacing:.16em;text-transform:uppercase;opacity:.62}
+
+/* the note under the selected line — the only place the card explains itself */
+#alp-hud .card .sub{margin:.55em 0 0;min-height:1.35em;
+  font-size:clamp(9px,1.15vh,12px);letter-spacing:.06em;
+  color:rgba(var(--ink),.5);text-shadow:var(--halo)}
+#alp-hud .card .note{margin-top:.15em;font-size:clamp(10px,1.28vh,14px);font-style:italic;
   color:rgba(var(--hot),.92);text-shadow:var(--halo),0 2px 10px rgba(0,8,20,.5);
   min-height:1.3em}
+/* control strip, pinned under the rule at the foot of the card */
+#alp-hud .card .keys{display:flex;flex-wrap:wrap;gap:.35em 1.05em;margin-top:.85em;
+  padding-top:.7em;border-top:1px solid rgba(var(--ink),.13);
+  font-size:clamp(8px,1.0vh,11px);font-weight:700;letter-spacing:.17em;
+  text-transform:uppercase;color:rgba(var(--ink),.44);text-shadow:var(--halo)}
+#alp-hud .card .keys em{font-style:normal;color:rgba(var(--ink),.78)}
+
+/* ------------------------------------------------------------- last run --- */
+/* The run you just finished, top-right, where the run stats live while skiing.
+   It is a separate card because it is a separate thing: four frozen numbers
+   about what is already over, next to a list of what happens next. Stacked into
+   one block — which is how it shipped — the menu read as a footnote to a
+   scoreboard. */
+#alp-hud .runcard{position:absolute;right:clamp(30px,3.6vw,74px);top:clamp(30px,5vh,62px);
+  min-width:clamp(148px,13vw,200px);opacity:var(--card);
+  transform:translateY(calc(-10px + 10px*var(--card)));
+  text-align:right}
+#alp-hud .runcard .t{font-size:clamp(8px,1.02vh,11px);font-weight:700;letter-spacing:.3em;
+  text-transform:uppercase;color:rgba(var(--ink),.52);text-shadow:var(--halo)}
+#alp-hud .runcard .g{margin-top:.6em;display:grid;grid-template-columns:auto auto;
+  align-items:baseline;justify-content:end;column-gap:clamp(10px,.9vw,17px);
+  row-gap:clamp(5px,.75vh,9px)}
+#alp-hud .runcard .g span:nth-child(odd){font-size:clamp(8px,1.0vh,11px);font-weight:700;
+  letter-spacing:.2em;text-transform:uppercase;color:rgba(var(--ink),.5);
+  text-shadow:var(--halo);text-align:left}
+#alp-hud .runcard .g span:nth-child(even){font-size:clamp(13px,1.7vh,20px);font-weight:400;
+  color:rgba(var(--ink),.95);text-shadow:var(--halo),0 2px 8px rgba(0,8,20,.5)}
+#alp-hud .runcard .g span s{text-decoration:none;font-size:.48em;opacity:.6;
+  margin-left:.28em;letter-spacing:.09em;font-weight:600}
 
 /* ------------------------------------------------------- veil and flash --- */
 /* A door is a cut, and a cut with nothing over it reads as a bug. Pale rather
@@ -376,14 +471,23 @@ export function createHUD(opts = {}) {
       <span class="sb" id="alp-ps"></span>
     </div>
     <div class="card">
-      <div class="hd" id="alp-cn">Bergrestaurant</div>
+      <div class="hd"><b id="alp-cn">Bergrestaurant</b><i id="alp-cal">2140 m</i></div>
       <div class="rule"></div>
-      <div class="row"><span class="k">Run</span><span class="v" id="alp-cr">0:00.0</span></div>
-      <div class="row"><span class="k">Dist</span><span class="v" id="alp-cd">0<s>m</s></span></div>
-      <div class="row"><span class="k">Top</span><span class="v" id="alp-cx">0<s>km/h</s></span></div>
-      <div class="row"><span class="k">Best air</span><span class="v" id="alp-ca">0.00<s>s</s></span></div>
       <div class="opts" id="alp-co"></div>
+      <div class="sub" id="alp-cs"></div>
       <div class="note" id="alp-cm"></div>
+      <div class="keys"><span><em>W/S</em> choose</span><span><em>↵</em> order</span
+        ><span><em>1–8</em> pick</span><span><em>A/D</em> look</span
+        ><span><em>E</em> outside</span></div>
+    </div>
+    <div class="runcard">
+      <div class="t">Last run</div>
+      <div class="g">
+        <span>Time</span><span id="alp-cr">0:00.0</span>
+        <span>Dist</span><span id="alp-cd">0<s>m</s></span>
+        <span>Top</span><span id="alp-cx">0<s>km/h</s></span>
+        <span>Best air</span><span id="alp-ca">0.00<s>s</s></span>
+      </div>
     </div>
     <div class="flash"></div>
     <div class="veil"></div>`;
@@ -402,7 +506,8 @@ export function createHUD(opts = {}) {
   const elPK = $('#alp-pk'), elPT = $('#alp-pt'), elPS = $('#alp-ps');
   const elRide = $('.ride'), elRN = $('#alp-rn'), elRH = $('#alp-rh');
   const elRail2 = $('.ride .rail2');
-  const elCard = $('.card'), elCN = $('#alp-cn'), elCO = $('#alp-co'), elCM = $('#alp-cm');
+  const elCN = $('#alp-cn'), elCO = $('#alp-co'), elCM = $('#alp-cm');
+  const elCAL = $('#alp-cal'), elCS = $('#alp-cs');
   const elCR = $('#alp-cr'), elCD = $('#alp-cd'), elCX = $('#alp-cx'), elCA = $('#alp-ca');
 
   // ---- animated internals ---------------------------------------------------
@@ -411,7 +516,7 @@ export function createHUD(opts = {}) {
   let lastNum = -1, lastT = '', lastD = '', lastX = '', lastRun = -1, airShown = false;
   let dUI = 1, dPrompt = 0, dRide = 0, dCard = 0, dWarmVis = 0;
   let lastPromptTx = '', lastPromptK = '', lastPromptSb = '', lastRideN = '', lastRideH = '';
-  let lastOpts = '', lastNote = '', lastCard = '';
+  let lastOpts = '', lastNote = '', lastCard = '', lastSub = '', lastAlt = -1;
   let lastCR = '', lastCD = '', lastCX2 = '', lastCA = '';
   const w = {
     live: -1, heat: -1, edge: -9, carve: -1, p: -1, kick: -1, land: -1,
@@ -575,17 +680,33 @@ export function createHUD(opts = {}) {
       if (Math.abs(p - w.rp) > 0.002) { w.rp = p; elRail2.style.setProperty('--rp', p.toFixed(4)); }
     }
 
-    // ---- bar card ----------------------------------------------------------
+    // ---- the card ----------------------------------------------------------
+    /**
+     * Two blocks, both driven by `--card`: the menu on the left and the run you
+     * just finished on the right.
+     *
+     * The whole list is one innerHTML write, and it is written only when the
+     * STRING changes. That matters more here than anywhere else in this file:
+     * eight rows plus three headings is ~1.4 kB of markup, the player sits in
+     * front of it for thirty seconds, and the only things that ever move are one
+     * `sel` class and one `on` class. Building the string every frame and diffing
+     * it is a few hundred bytes of garbage per frame and zero DOM work; rebuilding
+     * the DOM every frame would be 11 element trees, sixty times a second, to
+     * change two class attributes.
+     */
     const ht = state.hut || null;
     dCard = smooth(dCard, ht ? 1 : 0, d, ht ? 0.24 : 0.18);
     setVar('card', dCard);
     if (ht) {
       if (ht.name !== lastCard) { lastCard = ht.name; elCN.textContent = ht.name; }
-      // Diffed like everything else in this file. The run these four report is
-      // frozen the moment the door shuts — `lastRun` in resort.js — so writing
-      // four innerHTML/textContent per frame was rewriting four constants sixty
-      // times a second for the whole time the player sat there, in the block
-      // whose own docstring says every text node is diffed before it is written.
+      if (ht.altitude !== lastAlt) {
+        lastAlt = ht.altitude;
+        elCAL.textContent = ht.altitude ? `${ht.altitude} m` : '';
+      }
+      // The run these four report is frozen the moment the door shuts —
+      // `lastRun` in resort.js — so writing four innerHTML/textContent per frame
+      // was rewriting four constants sixty times a second, in the block whose own
+      // docstring says every text node is diffed before it is written.
       const r = ht.run || { time: 0, distance: 0, top: 0, air: 0 };
       const dm = r.distance || 0;
       const cr = fmtTime(r.time || 0);
@@ -596,13 +717,25 @@ export function createHUD(opts = {}) {
       if (cd !== lastCD) { lastCD = cd; elCD.innerHTML = cd; }
       if (cx !== lastCX2) { lastCX2 = cx; elCX.innerHTML = cx; }
       if (ca !== lastCA) { lastCA = ca; elCA.innerHTML = ca; }
-      const opts = (ht.choices || []).map((c) => `<div class="opt${ht.drink && c.label.toLowerCase() === ht.drink ? ' on' : ''}">`
-        + `<span class="kb">${c.key}</span><span class="l">${c.label}</span><span class="n">${c.note || ''}</span></div>`).join('')
-        + `<div class="opt"><span class="kb">E</span><span class="l">Back outside</span></div>`;
+
+      const titles = Object.create(null);
+      for (const s of ht.sections || []) titles[s.id] = s.title;
+      let sec = null, opts = '';
+      for (const m of ht.menu || []) {
+        if (m.sec !== sec) { sec = m.sec; opts += `<div class="sec">${esc(titles[sec] || '')}</div>`; }
+        opts += `<div class="opt${m.sel ? ' sel' : ''}${m.on ? ' on' : ''}">`
+          + `<span class="kb">${esc(m.key)}</span>`
+          + `<span class="l">${esc(m.label)}</span>`
+          + `<span class="p">${esc(m.price)} €</span></div>`;
+      }
       if (opts !== lastOpts) { lastOpts = opts; elCO.innerHTML = opts; }
-      const note = ht.drink
-        ? (ht.drink === 'beer' ? 'Prost. The afternoon can wait.' : 'Hot, black, and worth the stop.')
-        : (ht.hint || '');
+
+      // The note under the list is the SELECTED line's, not the served one's:
+      // it is there to tell you what you are about to order, and it has to keep
+      // answering that after something is already on the table.
+      const selNote = (ht.menu || []).find((m) => m.sel)?.note || '';
+      if (selNote !== lastSub) { lastSub = selNote; elCS.textContent = selNote; }
+      const note = ht.order ? ht.order.line : '';
       if (note !== lastNote) { lastNote = note; elCM.textContent = note; }
     }
 
