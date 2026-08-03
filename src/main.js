@@ -32,7 +32,7 @@ const branding = createBranding(scene, terrain, scatter);
 const skier = createSkier(scene);
 const physics = new SkiPhysics(terrain);
 const controls = createControls();
-const chaseCam = createChaseCam(camera);
+const chaseCam = createChaseCam(camera, scatter);
 const spray = createSpray(scene);
 const tracks = createTracks(scene, terrain);
 const postfx = createPostFX(renderer, scene, camera);
@@ -683,9 +683,39 @@ const harness = {
     return { lost: false, mean, stddev: Math.sqrt(Math.max(0, sum2 / n - mean * mean)) };
   },
 };
-window.__harness = harness;
+/**
+ * The harness is a DEBUG SURFACE, and a public build should not carry one.
+ * `harness.debug` hands out live handles to the terrain, the renderer, the scene
+ * and every subsystem; `perf` can put `renderer.info` into manual-reset mode and
+ * `setPlayer`/`step`/`enter` can drive the simulation from the console. None of
+ * that is something a player needs, so it is not on the window by default in a
+ * production build.
+ *
+ * It is still reachable in two cases, because every measurement tool in `tools/`
+ * is built on it:
+ *   - `pnpm dev` — always, so nothing about the dev workflow changes.
+ *   - `?harness=1` — an explicit opt-in, which is what `tools/frametime.mjs
+ *     --prod` uses. That tool runs `vite build` and serves the real bundle
+ *     through `vite preview` precisely to measure what ships, so gating on DEV
+ *     alone would have deleted the only tool that can measure a prod build.
+ *
+ * The object is always CONSTRUCTED — `createPerf` is wired into the frame loop
+ * either way and the not-recording path is one boolean test — this only decides
+ * whether it is published to the window.
+ */
+const HARNESS_ON = !!import.meta.env?.DEV || (() => {
+  try { return new URLSearchParams(location.search).get('harness') === '1'; }
+  catch { return false; }
+})();
+if (HARNESS_ON) window.__harness = harness;
 
 let auto = true;
+// NOT gated with the harness, deliberately. This looks like a debug hook and is
+// not one: it is the project's only pause, the Escape settings panel drives it
+// (see `settingsUI.onOpen` above) and `engine.js` monkey-patches it so the
+// adaptive resolution controller pauses with the sim. Gating it would silently
+// leave the panel open over a running game in the production build. It also
+// exposes no state — it sets one boolean.
 window.__setAuto = (v) => { auto = v; };
 
 // --- shader warm-up ----------------------------------------------------------

@@ -63,7 +63,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  ROOT, makeArgs, startServer, launch, boot, installPath, measureWindow, sleep,
+  ROOT, makeArgs, startServer, launch, boot, installPath, measureWindow, sleep, urlWith,
 } from './frametime.mjs';
 
 // ---- presets ----------------------------------------------------------------
@@ -226,7 +226,7 @@ try {
       if (opts.reloadA) {
         // Context-attribute variants need a fresh page.
         const q = isA ? opts.reloadA : opts.reloadB;
-        await page.goto(server.url + q, { waitUntil: 'domcontentloaded', timeout: 120000 });
+        await page.goto(urlWith(server.url, q), { waitUntil: 'domcontentloaded', timeout: 120000 });
         await page.waitForFunction('window.__harness && window.__harness.ready === true', { timeout: 120000 });
         await sleep(1500);
         await installPath(page, { lead: opts.lead, amp: opts.amp, period: opts.period, straight: opts.straight });

@@ -99,10 +99,17 @@ const wrapPi = (a) => {
  */
 const CARD_POOLS = /^(tree2|clust|mass)$/;
 
-function collectOccluders(out) {
+/**
+ * `scatter` is passed in by `main.js`. It used to be read off
+ * `window.__harness.debug.scatter`, which meant this gameplay feature — the boom
+ * ducking away from trees — silently depended on the debug harness being on the
+ * window. That made it impossible to dev-gate the harness without disabling
+ * camera occlusion in the production build, with no symptom other than the boom
+ * quietly stopping to flinch. It is a real dependency, so it is a real argument.
+ */
+function collectOccluders(out, scatter) {
   out.length = 0;
-  const sc = (typeof window !== 'undefined') && window.__harness?.debug?.scatter;
-  const root = sc && sc.group;
+  const root = scatter && scatter.group;
   if (!root) return false;
   root.traverse((o) => {
     if (!o.isInstancedMesh || CARD_POOLS.test(o.name || '')) return;
@@ -136,7 +143,7 @@ function collectOccluders(out) {
   return true;
 }
 
-export function createChaseCam(camera) {
+export function createChaseCam(camera, scatter = null) {
   const FOV_BASE = camera.fov || 58;
 
   const pos = new THREE.Vector3();
@@ -331,7 +338,7 @@ export function createChaseCam(camera) {
       // the standard third-person answer and it is what turns "lost in a spruce"
       // into "the operator stepped round the tree".
       occRescan -= dt;
-      if (!occHave || occRescan <= 0) { occHave = collectOccluders(occluders); occRescan = 1.0; }
+      if (!occHave || occRescan <= 0) { occHave = collectOccluders(occluders, scatter); occRescan = 1.0; }
       // Everything below is measured from his chest, not his boots: that is the
       // point the shot is about, and testing from the snow line would have the
       // boom dodging the ground. (A predictive lead on this anchor was tried and

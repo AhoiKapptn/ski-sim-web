@@ -49,7 +49,7 @@
  * scheduled, not that the controller is broken.
  */
 import {
-  startServer, launch, boot, installPath, sleep, makeArgs,
+  startServer, launch, boot, installPath, sleep, makeArgs, urlWith,
 } from './frametime.mjs';
 import { KIT_SRC } from './ablation-kit.mjs';
 
@@ -75,7 +75,7 @@ const server = await startServer({ port: 5331 });
 async function session(dpr, query, size = {}) {
   const { browser, page, errors } = await launch({ ...size, dpr });
   // NOT frozen: the controller is the thing under test here.
-  await boot(page, server.url + (query || ''), { freezeAdaptive: false });
+  await boot(page, urlWith(server.url, query), { freezeAdaptive: false });
   await installPath(page, { lead: 1.2, amp: 0.85, period: 2.6 });
   await page.evaluate(() => { window.__setAuto?.(true); window.__path.restart(0, 700, Math.PI); });
   return {

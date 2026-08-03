@@ -114,6 +114,21 @@ export async function installPath(page, opts) {
 
 // ---- server -----------------------------------------------------------------
 /**
+ * Join a query string onto a server URL that may ALREADY carry one.
+ *
+ * `startServer({ prod: true })` returns a URL with `?harness=1` on it, because a
+ * production bundle does not publish `window.__harness` without that opt-in. Any
+ * caller doing `server.url + '?dpr=2'` would then produce `?harness=1?dpr=2`,
+ * whose second parameter is named `?dpr` and is silently ignored — i.e. a
+ * `--prod --dpr 2` run would quietly measure DPR 1. Use this instead of `+`.
+ */
+export function urlWith(base, extra = '') {
+  const q = String(extra).replace(/^[?&]+/, '');
+  if (!q) return base;
+  return base + (base.includes('?') ? '&' : '?') + q;
+}
+
+/**
  * Dev server (default) or a built bundle served by `vite preview` (`--prod`).
  *
  * This matters: the user runs `pnpm dev`, and `import.meta.env.DEV` branches are
@@ -141,7 +156,15 @@ export async function startServer({ prod = false, port = 5301 } = {}) {
     logLevel: 'error', preview: { port, strictPort: false, host: '127.0.0.1' },
   });
   const addr = server.httpServer.address();
-  return { mode: 'prod', url: `http://127.0.0.1:${addr.port}/`, close: () => server.close() };
+  // `?harness=1` is REQUIRED here. A production build does not publish
+  // `window.__harness` (see main.js) because it is a debug surface, so without
+  // the opt-in every tool built on this boot() would time out waiting for a
+  // harness that is never going to appear. The dev arm above needs nothing.
+  return {
+    mode: 'prod',
+    url: `http://127.0.0.1:${addr.port}/?harness=1`,
+    close: () => server.close(),
+  };
 }
 
 // ---- browser ----------------------------------------------------------------
