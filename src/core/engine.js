@@ -839,7 +839,17 @@ export function createEngine(container, opts = {}) {
   renderer.setPixelRatio(pixelRatio());
   renderer.setSize(innerWidth, innerHeight);
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  // PCFShadowMap, said out loud. This used to read `PCFSoftShadowMap`, which in
+  // r185 is DEPRECATED: WebGLShadowMap silently rewrites it to PCFShadowMap and
+  // logs a warning (WebGLShadowMap.js:99-102), and `shadowMapTypeDefines` only
+  // maps PCFShadowMap and VSMShadowMap — anything else falls through to
+  // SHADOWMAP_TYPE_BASIC. So PCFSoftShadowMap has no shader path at all any
+  // more, and reading back `renderer.shadowMap.type` gave 1, not 2.
+  //
+  // Nothing about the rendering changes here; what changes is that the source no
+  // longer claims a filter the engine is not using. The shipped filter is r185's
+  // PCF: 5 Vogel-disk taps of a sampler2DShadow, IGN-rotated per pixel.
+  renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
   renderer.outputColorSpace = THREE.SRGBColorSpace;

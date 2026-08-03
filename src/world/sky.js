@@ -1227,7 +1227,12 @@ export function createSky(scene, renderer) {
   // terrain.js casts out to LOD 4 (614 m), so 330 m of half-extent is inside
   // what the terrain already supports. At 4096 that is 16 cm per texel — the
   // skier's own 4 m contact shadow is still ~25 texels across.
-  const SHADOW_MAP = 4096;
+  // `let`, not `const`, so setShadowQuality() below can move it. This is safe
+  // ONLY because updateShadow() re-derives its texel snap from this variable
+  // (see the `texel` line further down) rather than caching a value — poking
+  // sun.shadow.mapSize from OUTSIDE this module would desync that snap and make
+  // shadows crawl as the skier moves. That is why the setter lives here.
+  let SHADOW_MAP = 4096;
   const SHADOW_HALF = 330;            // metres of half-extent around the skier
   sun.shadow.mapSize.set(SHADOW_MAP, SHADOW_MAP);
   sun.shadow.camera.near = 20;
@@ -1255,7 +1260,7 @@ export function createSky(scene, renderer) {
   // range is 160 m rather than the far cascade's 3380, so the same *relative*
   // bias buys 21x less depth slip: -0.00005 is 0.8 cm here, where the far
   // cascade's -0.00012 is 41 cm.
-  const NEAR_MAP = 2048;
+  let NEAR_MAP = 2048;   // see the note on SHADOW_MAP — updateShadow() reads this live
   const NEAR_HALF = 14;             // metres of half-extent around the skier
   const NEAR_DIST = 100;            // light distance; sets the depth range
   const sunNear = new THREE.DirectionalLight(0xffffff, 0);
@@ -2029,6 +2034,64 @@ export function createSky(scene, renderer) {
 
     /** Re-derive everything from the current params (probe / debug UI hook). */
     refresh() { apply(); },
+
+    /**
+     * Shadow map resolution, for the graphics settings menu.
+     *
+     * MUST live here rather than in the settings module. `updateShadow()`
+     * re-derives its texel snap from SHADOW_MAP / SHADOW_HALF (and NEAR_MAP /
+     * NEAR_HALF) every frame — that snap is what stops the shadow crawling as
+     * the skier moves — so a caller that sets `sun.shadow.mapSize` directly
+     * would leave the snap quantised to the OLD texel size and reintroduce the
+     * crawl with no other symptom.
+     *
+     * Mechanically: set mapSize, then drop the allocated depth target so three
+     * reallocates it at the new size on the next shadow pass. The map size
+     * reaches the shader as a uniform, NOT as a #define, so this costs a render
+     * target reallocation and NO shader relink — unlike toggling
+     * `renderer.shadowMap.enabled`, which relinks every material in the scene.
+     *
+     * Measured: the whole shadow pass is ~3.2 ms of a 39 ms frame at 9.44 Mpx.
+     * Halving both maps quarters the shadow rasterisation and the depth
+     * bandwidth; the far cascade at 2048 is 32 cm/texel, where the skier's own
+     * 4 m contact shadow is still ~12 texels across.
+     *
+     * @param {{far?: number, near?: number}} o  powers of two, clamped 256-8192
+     */
+    setShadowQuality(o = {}) {
+      const clamp = (v, d) => {
+        const n = Math.round(+v || d);
+        return Math.max(256, Math.min(8192, 2 ** Math.round(Math.log2(n))));
+      };
+      if (o.far !== undefined) {
+        const v = clamp(o.far, SHADOW_MAP);
+        if (v !== SHADOW_MAP) {
+          SHADOW_MAP = v;
+          sun.shadow.mapSize.set(v, v);
+          if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+        }
+      }
+      if (o.near !== undefined) {
+        const v = clamp(o.near, NEAR_MAP);
+        if (v !== NEAR_MAP) {
+          NEAR_MAP = v;
+          sunNear.shadow.mapSize.set(v, v);
+          if (sunNear.shadow.map) { sunNear.shadow.map.dispose(); sunNear.shadow.map = null; }
+        }
+      }
+      return { far: SHADOW_MAP, near: NEAR_MAP };
+    },
+
+    /** Current shadow map sizes, for a settings readout. */
+    shadowInfo() {
+      return {
+        far: SHADOW_MAP,
+        near: NEAR_MAP,
+        farTexelCm: +((2 * SHADOW_HALF) / SHADOW_MAP * 100).toFixed(1),
+        nearTexelCm: +((2 * NEAR_HALF) / NEAR_MAP * 100).toFixed(2),
+        nearCascade: cascadePatched,
+      };
+    },
 
     /** Give a custom ShaderMaterial the shared aerial-perspective uniforms. */
     registerFogMaterial(material) {

@@ -438,6 +438,20 @@ export function createTracks(scene, terrain) {
   const mat = createSnowMaterial({
     rock: false,
     side: THREE.DoubleSide,
+    // DoubleSide + transparent makes three render this mesh TWICE per frame:
+    // WebGLRenderer.renderObject does side=BackSide, needsUpdate=true, draw,
+    // side=FrontSide, needsUpdate=true, draw. Two consequences, both bad and
+    // neither visible in a draw-call count that nobody had broken down by pass:
+    // the trench ribbon rasterises twice with the FULL snow shader, transparent
+    // and therefore with no early-Z; and `needsUpdate = true` fires twice a
+    // frame, bumping material.version and forcing three's whole
+    // needsProgramChange path plus a complete uniform refresh — twice — on a
+    // material carrying ~45 custom uniforms.
+    //
+    // A ground-hugging trench ribbon has no visible back face, so one pass is
+    // all it ever needed. forceSinglePass keeps DoubleSide rasterisation and
+    // drops the second draw.
+    forceSinglePass: true,
     transparent: true,
     depthWrite: false,
     polygonOffset: true,

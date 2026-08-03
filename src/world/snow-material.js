@@ -313,6 +313,24 @@ vec3 snTriW( vec3 N, float e ) {
   vec3 w = pow( abs( N ), vec3( e ) );
   return w / ( w.x + w.y + w.z );
 }
+// Every call site in this file passes 2.0 or 4.0 — both EVEN integers, and for
+// an even integer exponent pow(abs(N), e) is exactly a product: the abs is
+// redundant because the even power discards the sign anyway. On this ANGLE/Metal
+// path pow() lowers to exp2(log2(x)*y), so pow(abs(N), vec3(e)) is three log2
+// plus three exp2; these are three and four multiplies respectively.
+//
+// BIT-EXACT for the e=2 case and exact up to one rounding step for e=4, against
+// nine transcendentals per call. There are three call sites (rock relief, the
+// grazing band, snow detail) and a rock fragment hits two of them.
+vec3 snTriW2( vec3 N ) {
+  vec3 w = N * N;
+  return w / ( w.x + w.y + w.z );
+}
+vec3 snTriW4( vec3 N ) {
+  vec3 a = N * N;
+  vec3 w = a * a;
+  return w / ( w.x + w.y + w.z );
+}
 #define SN_TRI_CUT 0.028
 
 /**
@@ -682,7 +700,7 @@ float snSpecTint = 1.0;
   // layer that was smearing the valley walls into vertical corduroy, so it gets
   // the sharpest blend in the shader: past about 68 degrees the XZ plane drops
   // under SN_TRI_CUT and stops contributing at all.
-  vec3 rw = snTriW( Ng, 4.0 );
+  vec3 rw = snTriW4( Ng );
   // --- grain orientation ------------------------------------------------------
   // snRidged's octave cascade always starts from the world axes and always turns
   // by the same 37 degrees per octave, so the coarsest — and most legible —
@@ -826,6 +844,15 @@ float snSpecTint = 1.0;
     // the two bands is pure amplitude, which is the only place in this shader a
     // varying weight is ever safe.
     #define SN_GRAZE_SQ 0.145
+    // COMPILED OUT AT THE LOW TIER ONLY. The runtime branch below already skips
+    // the work off-silhouette, but it cannot give back the registers, and this
+    // block's two fractureLayerR calls are the widest live range in the rock
+    // pipeline. It survives at medium and above because it is not decoration:
+    // it is the fix for the documented "smooth untextured strip along cliff
+    // silhouettes" defect, whose real cause was a grazing-sheen term worth ~4x
+    // the diffuse of 5%-albedo rock. At low, the strip comes back on distant
+    // silhouettes — the correct thing to trade last, and only here.
+    #if SN_TIER >= 1
     if ( snGraze > 0.03 ) {
       vec3 Pg = vec3( P.x * SN_GRAZE_SQ, P.y, P.z * SN_GRAZE_SQ );
       // Only the two *vertical* projections. The XZ plane is exactly the one a
@@ -833,7 +860,7 @@ float snSpecTint = 1.0;
       // triplanar weight drops under SN_TRI_CUT past 68 degrees, which is the
       // defect this whole block exists for — so it is not even offered here and
       // the weights renormalise over the other two.
-      vec3 gw = snTriW( vec3( Ng.x, 0.0, Ng.z ), 4.0 );
+      vec3 gw = snTriW4( vec3( Ng.x, 0.0, Ng.z ) );
       float gA = 0.0;
       vec3 gAg = vec3( 0.0 );
       fractureLayerR( Pg, gw, rF0,       a0, 2, SN_ROT( 1.31 ), gAg, gA );
@@ -844,6 +871,7 @@ float snSpecTint = 1.0;
       rGrain = mix( rGrain, gA, snGraze );
       rGrad += ( gAg - gG ) * rkg * snGraze;
     }
+    #endif
   }
 
   // Fractured facets. Rock parts along its joint sets into flat plates with hard
@@ -1318,7 +1346,7 @@ float snSpecTint = 1.0;
 
   // --------------------------------------------------------------- snow ----
   // Multi-scale relief.
-  vec3 sw = snTriW( Ng, 2.0 );
+  vec3 sw = snTriW2( Ng );
 
   // The 35 m band is a *mid-field* band: close up the piste already has the 12 m
   // drifts and the sastrugi, and stacking a third metre-scale wave on top of
@@ -1833,11 +1861,28 @@ const SNOW_SCATTER = /* glsl */`
 
   float snowness = 1.0 - snRockMask;
 
+  // EVERY term in this block is multiplied by snowness, so on a bare-rock
+  // fragment the whole snow BRDF — three scatter lobes, the anisotropic sheen
+  // with its wind tangent frame, and the sparkle — was computed and then
+  // multiplied by zero. That is 5 normalize, a cross, an anisotropic GGX, a
+  // Schlick Fresnel and (before the gate below) two snGlint evaluations, for
+  // nothing, on every rock pixel in the frame. A distant rock face was already
+  // the most expensive pixel class in the shader at ~2.4x the near piste.
+  //
+  // The gate is screen-coherent — snRockMask is a smooth spatial field, so a wave
+  // over a cliff face skips together, which is what makes a GLSL branch actually
+  // pay. 0.004 rather than 0.0 because below that the contribution is under one
+  // code value at 8-bit output and the mask itself dithers at pixel scale in the
+  // far field (a known remaining defect).
+  if ( snowness > 0.004 ) {
   // Forward scatter: light that entered the pack and came out towards the eye.
   // Peaks when the sun is roughly behind the surface from the viewer.
   float fw = max( dot( V, -L ), 0.0 );
   float thin = mix( 0.35, 1.0, snPowder ) * ( 0.35 + 0.65 * ( 1.0 - abs( ndl ) ) );
-  vec3 sss = uSSSTint * C * ( pow( fw, 4.0 ) * 0.55 + pow( fw, 12.0 ) * 1.2 ) * thin * shd * snowness;
+  // pow(x,4) and pow(x,12) with literal integer exponents: two exp2/log2 pairs
+  // replaced by four multiplies. fw4 is shared, and pow(fw,12) is (fw^4)^3.
+  float fw2 = fw * fw, fw4 = fw2 * fw2;
+  vec3 sss = uSSSTint * C * ( fw4 * 0.55 + fw4 * fw4 * fw4 * 1.2 ) * thin * shd * snowness;
 
   // Retro / opposition surge: snow is strongly backscattering.
   float bs = pow( max( dot( V, L ), 0.0 ), 2.2 );
@@ -1865,7 +1910,11 @@ const SNOW_SCATTER = /* glsl */`
   vec3 H = normalize( L + V );
   float ar = mix( 0.34, 0.13, snIce );
   float d = min( snAnisoGGX( N, T, B, H, ar * 1.38, ar * 0.72 ), 60.0 );
-  float fres = 0.028 + 0.972 * pow( 1.0 - max( dot( V, H ), 0.0 ), 5.0 );
+  // Schlick's exponent is 5: x^5 = (x^2)^2 * x, three multiplies against a
+  // log2/exp2 pair. This runs on every snow fragment in the frame.
+  float fs = 1.0 - max( dot( V, H ), 0.0 );
+  float fs2 = fs * fs;
+  float fres = 0.028 + 0.972 * ( fs2 * fs2 * fs );
   reflectedLight.directSpecular += C * shd * max( ndl, 0.0 ) * d * fres * 0.55 * snowness;
 
   // Ice crystals. Deliberately over-bright — these want to clip to white points
@@ -1884,12 +1933,32 @@ const SNOW_SCATTER = /* glsl */`
   // colour the sky module gives the sun. The magnitude cap comes down with it:
   // 17 still clips to a white point through ACES with three stops to spare, and
   // more than halves the headroom a chromatic-aberration pass has to fringe.
-  float sp = clamp( snSparkle( vSnowWPos, N, H, snViewDist ), 0.0, 1.0 );
+  // GATE BEFORE COMPUTING, not after. spFade is zero past 260 m and snowness is
+  // zero on bare rock, so the sparkle used to be evaluated in full and then
+  // multiplied by nothing across most of the frame. It is not a cheap term: two
+  // snGlint calls, each a hash33 plus — on the taken lane — a normalize, a sin
+  // and a pow(s, 380.0).
+  //
+  // And snGlint's own r.z < 0.972 early-out does NOT save the wave. At 2.8%
+  // per lane the chance that at least one of 32 lanes takes the expensive path
+  // is 1 - 0.972^32 = 60%, so the wave paid for it on most invocations, twice.
+  // This gate is different: it is a function of view distance and the rock mask,
+  // both of which are screen-coherent, so a whole wave past 260 m skips together.
+  // Compiled out entirely at low. The chroma clamp below is NOT optional at any
+  // tier that keeps the term — it is what stops a 45x-white speck becoming
+  // coloured confetti in the bloom and chromatic-aberration passes, and "no
+  // chromatic fireflies on snow" is a protected invariant.
+  #if SN_TIER >= 1
   float spFade = snFade( 260.0, 45.0, snViewDist );
-  float spLum = snLum( C );
-  vec3 spColor = spLum * clamp( C / max( spLum, 1e-4 ), vec3( 0.85 ), vec3( 1.15 ) );
-  reflectedLight.directSpecular += spColor * min( sp * uSparkle, 17.0 ) * spFade * shd
-    * snowness * ( 0.35 + 0.65 * max( ndl, 0.0 ) ) * mix( 1.0, 1.7, snIce );
+  if ( spFade * snowness > 0.002 ) {
+    float sp = clamp( snSparkle( vSnowWPos, N, H, snViewDist ), 0.0, 1.0 );
+    float spLum = snLum( C );
+    vec3 spColor = spLum * clamp( C / max( spLum, 1e-4 ), vec3( 0.85 ), vec3( 1.15 ) );
+    reflectedLight.directSpecular += spColor * min( sp * uSparkle, 17.0 ) * spFade * shd
+      * snowness * ( 0.35 + 0.65 * max( ndl, 0.0 ) ) * mix( 1.0, 1.7, snIce );
+  }
+  #endif
+  }   // end if ( snowness > 0.004 ) — the whole snow BRDF
 
   // Sky-lit snow is blue-violet, not grey. Tint the indirect term by how
   // shadowed we are, and add the multiple-scattering bounce snow is famous for.
@@ -2071,7 +2140,9 @@ const SNOW_SCATTER = /* glsl */`
     // the only smooth thing in the frame. It also has to carry texture, or it
     // fills the cracks back in as fast as the albedo digs them: modulated by
     // the fracture grain, which is the one field that still resolves there.
-    float rf = pow( 1.0 - clamp( dot( N, V ), 0.0, 1.0 ), 4.0 );
+    float rfb = 1.0 - clamp( dot( N, V ), 0.0, 1.0 );
+    float rfb2 = rfb * rfb;
+    float rf = rfb2 * rfb2;
     reflectedLight.directSpecular += C * shd * max( ndl, 0.0 ) * rf * 0.022
       * clamp( 1.0 + snRockGrain * 0.9, 0.15, 1.85 ) * snRockMask;
   }
@@ -2093,7 +2164,9 @@ const SNOW_AERIAL = /* glsl */`
   float t = abs( dy ) < 1.0 ? dist * e0 : dist * Hs / dy * ( e0 - e1 );
   float f = 1.0 - exp( -uAerialDensity * max( t, 0.0 ) );
   vec3 rd = d / max( dist, 1e-4 );
-  float sunAmt = pow( max( dot( rd, uSunDirW ), 0.0 ), 8.0 );
+  float sa = max( dot( rd, uSunDirW ), 0.0 );
+  float sa2 = sa * sa, sa4 = sa2 * sa2;
+  float sunAmt = sa4 * sa4;
   vec3 air = mix( uAerialColor, uAerialSun, sunAmt * 0.75 );
   gl_FragColor.rgb = mix( gl_FragColor.rgb, air, clamp( f, 0.0, 1.0 ) );
 }
@@ -2151,6 +2224,14 @@ vSnowData = vec4( clamp( 1.0 - vSnowWNrm.y, 0.0, 1.0 ), 0.0, 0.0, 0.0 );
 let _cacheKey = 0;
 
 /**
+ * Shader quality tiers. Ultra is the shipped look — nothing is compiled out at
+ * ultra, so the top tier is bit-identical to the build before tiers existed, and
+ * every quality-baseline measurement in CLAUDE.md still describes it.
+ */
+const TIER_NAMES = ['low', 'medium', 'high', 'ultra'];
+const TIER_INDEX = { low: 0, medium: 1, high: 2, ultra: 3 };
+
+/**
  * @param {object} opts
  * @param {object} [opts.displacement]  GLSL geometry hook (see buildVertexShader)
  * @param {boolean} [opts.rock=true]
@@ -2164,11 +2245,18 @@ export function createSnowMaterial(opts = {}) {
     rock = true,
     forest = true,
     treeLine = 662,
+    // Destructured so it cannot fall through into `matOpts`, which is spread
+    // into the MeshStandardMaterial constructor — three warns on any property it
+    // does not recognise.
+    shaderQuality = 'ultra',
     uniforms: extraUniforms = {},
     ...matOpts
   } = opts;
 
   const lattice = getLattice();
+  // Every depth material this factory hands out, so a tier switch can relink
+  // them all. They share the tier through the closure but are separate programs.
+  const depthMaterials = [];
 
   const uniforms = {
     uLattice: { value: lattice.tex },
@@ -2219,8 +2307,28 @@ export function createSnowMaterial(opts = {}) {
   const vs = buildVertexShader(displacement);
   const key = 'snow' + (_cacheKey++);
 
+  // --- shader quality tier ---------------------------------------------------
+  // 0 low, 1 medium, 2 high, 3 ultra. Ultra is the shipped look; nothing is
+  // compiled out at 3, so the top tier is bit-identical to before this existed.
+  //
+  // COMPILE-TIME, not a uniform, and that is the whole point. A runtime `if`
+  // skips the work but NOT the registers: this shader has hundreds of
+  // simultaneously live floats, Apple GPUs are occupancy-limited by register
+  // pressure, and low occupancy is exactly what makes a long chain of dependent
+  // texture fetches unhidable. Cutting the live set is worth more than cutting
+  // the instructions.
+  //
+  // THE HAZARD, which is documented in CLAUDE.md and would have made this
+  // silently do nothing: `customProgramCacheKey` below returns ONE key per
+  // material instance. three consults it to decide whether it may reuse a
+  // compiled program, and it does not look at `defines`. So a tier change with a
+  // fixed key recompiles into the SAME cache slot and the old program is served.
+  // The tier is therefore part of the key.
+  let tier = TIER_INDEX[shaderQuality] ?? 3;
+
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
+    const tierDefs = '#define SN_TIER ' + tier + '\n';
 
     // ---- vertex ----
     shader.vertexShader = shader.vertexShader
@@ -2241,7 +2349,7 @@ export function createSnowMaterial(opts = {}) {
       '/*__TERRAIN_REFINE__*/', () => (displacement && displacement.fragRefine) || '',
     );
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\n' + GLSL_LATTICE_NOISE + SNOW_FRAG_PRELUDE
+      .replace('#include <common>', '#include <common>\n' + tierDefs + GLSL_LATTICE_NOISE + SNOW_FRAG_PRELUDE
         + ((displacement && displacement.fragPrelude) || ''))
       .replace('#include <roughnessmap_fragment>', surface + '\n')
       .replace('#include <normal_fragment_begin>', SNOW_NORMAL)
@@ -2249,9 +2357,33 @@ export function createSnowMaterial(opts = {}) {
       .replace('#include <tonemapping_fragment>', SNOW_AERIAL + '\n#include <tonemapping_fragment>');
     material.userData.shader = shader;
   };
-  material.customProgramCacheKey = () => key;
+  // The tier IS part of the key — see the block above for why omitting it makes
+  // every tier switch a no-op that looks like it worked.
+  material.customProgramCacheKey = () => key + '_t' + tier;
 
   material.userData.snowUniforms = uniforms;
+
+  /**
+   * Switch the shader quality tier at runtime. Costs one shader link per
+   * material (and one per depth material), which is a visible hitch — this is a
+   * settings-menu action, not something to drive from a frame loop.
+   *
+   * Returns true if the tier actually changed, so a caller can avoid paying the
+   * link for a no-op.
+   */
+  material.userData.setShaderQuality = (name) => {
+    const t = TIER_INDEX[name];
+    if (t === undefined || t === tier) return false;
+    tier = t;
+    material.needsUpdate = true;
+    // The depth materials are separate THREE materials built by the factory
+    // below; they share `tier` through this closure but each needs its own
+    // relink, and their cache key has to move with the tier for the same reason
+    // the main one does.
+    for (const dm of depthMaterials) dm.needsUpdate = true;
+    return true;
+  };
+  material.userData.getShaderQuality = () => TIER_NAMES[tier];
 
   /**
    * Matching depth material — without it the shadow pass would sample the
@@ -2265,7 +2397,12 @@ export function createSnowMaterial(opts = {}) {
         .replace('#include <common>', '#include <common>\n' + GLSL_LATTICE_NOISE + vs.prelude)
         .replace('#include <begin_vertex>', vs.begin);
     };
-    dm.customProgramCacheKey = () => key + '_depth';
+    // Tier-tagged for the same reason as the main material. The depth program
+    // only carries the VERTEX side, so today no tier gate changes it — but the
+    // key must still move, or a future tier that touches displacement would be
+    // served a stale program with no symptom other than wrong shadows.
+    dm.customProgramCacheKey = () => key + '_depth_t' + tier;
+    depthMaterials.push(dm);
     return dm;
   };
 
