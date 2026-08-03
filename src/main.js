@@ -16,6 +16,8 @@ import { createTracks } from './fx/tracks.js';
 import { createPostFX } from './fx/postfx.js';
 import { createAudio } from './audio/audio.js';
 import { createHUD } from './ui/hud.js';
+import { createGraphicsSettings } from './core/graphics-settings.js';
+import { createSettingsUI } from './ui/settings.js';
 
 const container = document.getElementById('app');
 const { renderer, scene, camera, gfx } = createEngine(container);
@@ -50,6 +52,37 @@ const resort = createResort({
 });
 
 physics.reset(state, state.pos.x, state.pos.z, state.heading);
+
+// --- graphics settings -------------------------------------------------------
+// The model owns the knobs, the presets and localStorage; the panel owns the DOM
+// and never knows what a knob means. Neither is dev-gated — `debug-perf.js` is,
+// and that is exactly why the player-facing settings cannot reuse it.
+//
+// Constructed HERE, before `warmShaders('boot')` below, on purpose: the model
+// applies its stored document in its own constructor, so the boot warm-up links
+// the program set the player will actually run. Built after it, every one of
+// those programs would be linked twice — once for the default configuration and
+// again the moment the settings landed — and `perf.report().shaderLinks` would
+// show a link storm on the first gameplay frames.
+const settings = createGraphicsSettings({
+  gfx, renderer, scene, terrain, sky, scatter, spray, tracks, postfx,
+  draglift, branding, audio, hud, camera,
+});
+// `__setAuto(false)` is the project's only pause, and engine.js monkey-patches
+// it so the adaptive resolution controller pauses with the sim — so opening the
+// panel also stops the controller from reacting to menu frames. The input
+// override zeroes the stick so the keys used to navigate the panel cannot also
+// steer the skier.
+const settingsUI = createSettingsUI(settings, {
+  onOpen() {
+    window.__setAuto?.(false);
+    window.__inputOverride = { steer: 0, crouch: 0, brake: 0, jump: false };
+  },
+  onClose() {
+    window.__inputOverride = null;
+    window.__setAuto?.(true);
+  },
+});
 
 // The engine owns the backbuffer size (it also drives the resolution-scale knob),
 // so postfx is resized from there rather than from a second resize listener —
@@ -616,6 +649,11 @@ const harness = {
     // PNGs are in the atlas; until then its group is hidden (see below).
     branding,
   },
+  // Graphics settings model + panel. Exposed so `tools/tier-shots.mjs` can drive
+  // a preset from outside and so a probe can assert what a preset actually did,
+  // rather than inferring it from pixels.
+  settings,
+  settingsUI,
   setPlayer(x, z, heading = Math.PI) {
     // A teleport ends whatever the player was doing: capture tools expect
     // setPlayer to leave them on the snow, whichever mode the session was in.

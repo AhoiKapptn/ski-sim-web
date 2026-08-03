@@ -23,13 +23,22 @@
  *
  * LOD
  * ---
- * A geometry clipmap: 9 concentric levels, cell size 0.4 m -> 102 m, covering
- * 19.7 km. Levels are positioned by the model matrix and displaced entirely on
+ * A geometry clipmap: 8 concentric levels, cell size 0.4 m -> 51.2 m, reaching
+ * 12.3 km at the `ultra` mesh tier — just past the camera's 12 km far plane, on
+ * purpose. Levels are positioned by the model matrix and displaced entirely on
  * the GPU, so moving the camera costs zero CPU work — no re-tessellation, ever.
- * The *ring resolution* is not constant: it ramps from 96 up to 384 with the
+ * The *ring resolution* is not constant: it ramps from 96 up to 512 with the
  * level, because a uniform-resolution clipmap facets its far rings exactly as
- * badly as its near ones (see LEVEL_RES). The outer rings run the cheap vertex
- * path, so the extra triangles there are close to free.
+ * badly as its near ones (see MESH_TIERS).
+ *
+ * That ramp is a **quality tier**, not a constant: `setMeshQuality('low' |
+ * 'medium' | 'high' | 'ultra')` rebuilds the ring geometries, and the four tiers
+ * span 1.19 M -> 0.55 M triangles. There used to be a ninth level and the outer
+ * rings were assumed to be "close to free" because they take the cheap vertex
+ * path; that was measured at DPR 1, and at the resolution the game is played at
+ * the ninth level turned out to be entirely outside the far plane — 401 k
+ * triangles a frame for zero pixels. See MESH_TIERS for that story, for what each
+ * tier costs you in the skyline, and for the coupling to `camera.far`.
  *
  * Beyond the geometry, the fragment program re-runs the same bicubic
  * reconstruction per pixel past ~400 m, so shading normals and terrain data
@@ -72,7 +81,8 @@
  * Background
  * ----------
  * Outside the 8.2 km baked square the texture can only replicate its edge texel
- * — a -42 m plain running to the 19.7 km clipmap limit, which read as a hard
+ * — a -42 m plain running to the clipmap limit (19.7 km when this was written,
+ * 12.3 km since the ring trim), which read as a hard
  * bright band across the horizon. Past 3.6 km the surface is an analytic ridged
  * field instead (`terrBackdrop` / the twin block in `_sample`), blended in over
  * 3.4 km, so the skyline recedes into further ranges.
@@ -94,33 +104,260 @@ const MAP_ORIGIN = -MAP_EXT / 2;
 // case is 1/24 rad: seventy pixels of flat triangle, which is precisely the
 // sawtooth you see along a 4 km skyline.
 //
-// So the resolution ramps with the level instead. It costs almost nothing where
-// it matters: the outer rings run the *cheap* vertex path (the metre-scale
-// detail layers have already faded out there), so they are pure bandwidth, and
-// the near rings — which carry the expensive noise — stay at 96.
+// So the resolution ramps with the level instead. The outer rings run the
+// *cheap* vertex path (the metre-scale detail layers have already faded out
+// there) so they are close to pure bandwidth, and the near rings — which carry
+// the expensive noise — stay at 96. That the ramp itself is cheap does hold up
+// under measurement (rings 7-8 together are not resolvable, see below); what did
+// not hold up is the assumption that "cheap" made it free to point the ramp at
+// ground the camera cannot reach.
 //
-// The outer three rings run at 512, not 384. Those are the levels that draw
-// everything past two kilometres, i.e. the entire skyline, and at 384 their
-// cells are 25-100 m: a 4 km peak was being silhouetted by ~6 px triangles and
-// its crest came out as a run of smooth chords. 512 takes that to 19-77 m and
-// visibly serrates the ridgelines; measured cost at 1600x900 was nil (60.3 fps
-// against 60.0), because these rings take the cheap vertex path and are
-// bandwidth, not shading.
+// Level 6 runs at 512, not 384. That is the level that draws everything from
+// 2.0 km out, i.e. the entire skyline, and at 384 its cells are 25-100 m: a 4 km
+// peak was being silhouetted by ~6 px triangles and its crest came out as a run
+// of smooth chords. 512 takes that to 19-77 m and visibly serrates the
+// ridgelines. (The "measured cost at 1600x900 was nil, 60.3 fps against 60.0"
+// that once justified applying 512 to levels 7 and 8 as well is deleted: 1.44
+// Mpx at DPR 1, and an fps difference of 0.3 — CLAUDE.md traps 1 and 5 between
+// them invalidate the method, the resolution and the metric. What replaced it is
+// below.)
 //
 // Nesting constraint: hole(k) * cell(k) / 2 == extent(k-1), i.e. hole(k) must be
-// res(k-1)/2 exactly, or the rings gap.
-const LEVEL_RES = [96, 96, 128, 160, 192, 320, 512, 512, 512];
+// res(k-1)/2 exactly, or the rings gap. Derived, never written by hand — see
+// levelHoles() below, which also asserts it.
+//
+// -----------------------------------------------------------------------------
+// What LEVEL_RES actually controls, stated precisely, because the paragraph
+// above reads as if it set the cell size and it does not.
+//
+// A level's cell size is pinned by the level index alone: cell(k) = CELL0 * 2^k,
+// i.e. 0.4 m at level 0 through 51.2 m at level 7, whatever the resolution is.
+// What res(k) sets is the ring's half-extent, res(k) * cell(k) / 2 — that is,
+// **the radius at which the cell size doubles.** Raising res(6) from 384 to 512
+// did not refine level 6's cells; it pushed level 6's outer boundary from 4.9 km
+// to 6.6 km, so the ground between those two radii is now drawn at 25.6 m per
+// cell instead of 51.2 m. That is the mechanism behind the skyline note above,
+// and it is also why res is the only knob here: you cannot buy triangles back
+// from the far field without moving a doubling radius inward. It is also why
+// trimming the LAST ring costs no facet quality at all — there is no ring behind
+// it to hand the ground to, so all it can lose is reach.
+//
+// Half-extents at `ultra` (metres): 19, 38, 102, 256, 614, 2048, 6554, 12288.
+//
+// -----------------------------------------------------------------------------
+// There were nine levels. There are eight, and CAM_FAR is why.
+//
+// Level 8 (cell 102.4 m, res 512) had its NEAREST geometry at a Chebyshev
+// distance of hole/2 * cell = 128 * 102.4 = 13,107 m from the player, and the
+// camera's far plane is 12,000 m (engine.js:859). The entire ring was outside the
+// frustum by a kilometre and could not produce a pixel — a coverage probe over
+// all five shoot.mjs framings measured 0 visible pixels in four of them and 2 px
+// in the fifth. `frustumCulled = false` (deliberate: displacement happens in the
+// vertex program, so three's bounds cannot decide anything) meant nothing stopped
+// it being submitted: 401,408 triangles and 202,240 invocations of the expensive
+// displacement vertex program every frame for guaranteed zero output.
+//
+// So the ring count is now COUPLED TO camera.far. cell(k) = 0.4 * 2^k and a
+// ring's near edge is hole(k)/2 * cell(k), so a ring is dead when that exceeds
+// CAM_FAR. Add a level back only together with a bigger far plane, and check
+// meshReach() below against it.
+//
+// Level 7 nearly went the same way. Measured visible pixels across the five
+// framings: 7194 / 0 / 315 / 49 / 189 out of 1.44 Mpx — at most 0.5% of the
+// frame, usually under 0.02%, against 401,408 triangles. That is 0.018 pixels per
+// triangle: every one of them sub-pixel, and a sub-pixel triangle still costs a
+// full 2x2 fragment quad. At `ultra` it is trimmed 512 -> 480, which is the
+// smallest multiple of 32 whose half-extent (12,288 m) still contains the
+// far-plane disc of 12,000 m — a square of half-extent E contains the disc of
+// radius E, so this is exact frustum coverage with 288 m of slack for the chase
+// camera sitting behind the clipmap centre. Its cell size is unchanged at 51.2 m,
+// so nothing that was visible changes its facet size; only ground that was
+// already unrenderable goes. 401,408 -> 337,408 triangles for provably no
+// visual difference.
+//
+// Not 320 (8.2 km), which was the other candidate: 8.2-12 km is INSIDE the far
+// plane, and ring 7 does measurably paint up to 7,194 px, so cutting there is a
+// visible-terrain decision rather than a dead-geometry one. That belongs in a
+// tier, and it is `high` below.
+//
+// -----------------------------------------------------------------------------
+// Why the rest of it is a tier and not a constant.
+//
+// Measured at the resolution the game is actually played at (2560x1440 DPR 2 =
+// 14.75 Mpx, native frame p50 48.8 ms), and read carefully, because the first
+// reading of it was wrong:
+//
+//     hiding rings 6,7,8    8.90 ms @ 5.31 Mpx   10.40 ms @ 9.44 Mpx
+//     hiding rings 5..8     9.70 ms              12.90 ms
+//     hiding rings 7,8 ONLY  not resolvable: median 0.6 ms, sign 6/10
+//
+// The first two barely scale with pixel count, which looks like vertex cost —
+// but the third arm says otherwise: rings 7 and 8 together are not measurable.
+// Nearly all of that 9-10 ms is ring 6, and ring 6 is the ring that actually
+// paints pixels, so it is a FRAGMENT problem and it belongs to the shader, not
+// to this table. Do not justify a tier here with "7 ms of vertex cost in the
+// outer rings"; that number does not exist. Rings 7-8 were a waste-and-
+// correctness problem — geometry submitted for pixels that cannot happen — and
+// the fix for those is above, unconditional, at every tier.
+//
+// What is left for the tiers is the honest tradeoff: triangles against where the
+// cell size doubles, and therefore how finely a ridgeline is silhouetted.
+//
+//   ultra   1.185 M tris, reach 12.3 km. Doubling radii 2.0/6.6 km. The only
+//           change from the nine-level build is the removal of geometry that
+//           could not be rendered, so this IS the old top of the ladder: nothing
+//           can regress here.
+//   high    0.927 M (78% of ultra). Level 6 stays at 512, so the whole
+//           2.0-6.6 km band — where the reviewed skyline lives, and where the
+//           bake's background wall and the first backdrop range silhouette —
+//           keeps its 25.6 m cells and serrates exactly as ultra does. The only
+//           loss is reach, 12.3 -> 8.2 km: ground that measured a few hundred
+//           pixels a frame and that the aerial perspective term has already
+//           taken to 1-3% of its own contrast.
+//   medium  0.753 M (64%). Now the skyline band itself is trimmed: level 6 goes
+//           512 -> 384, moving the 51.2 m doubling radius in from 6.6 km to
+//           4.9 km. A 5-6 km crest is silhouetted by 51.2 m cells instead of
+//           25.6 m, i.e. this is the tier where the smooth-chord failure the 512
+//           bump was made to fix could start to come back — at 5-6 km rather
+//           than at 4 km, so it is the far ranges rather than the massif. Shot
+//           and magnified 3x on `hero`: the crest is still serrated at several
+//           scales with no straight chords, and there is no horizon gap. It is
+//           still the interesting arm; re-check it after any bake change.
+//   low     0.553 M (33%). Trims level 5 as well (320 -> 256), the first cut that
+//           touches ground inside 2 km, and reach falls to 6.6 km. For a machine
+//           that has to choose between the skyline and a playable frame.
+//
+// One coupling to know about before adding a tier below `low`. The vertex
+// program's detail fades (fadeA/fadeB/fadeM in GLSL_DISPLACE_BODY) were placed
+// where "the ring cell size stops being able to carry the band", i.e. against
+// the doubling radii of `ultra`. Moving a radius inward moves a band onto
+// coarser cells while it is still partly faded in. It does not fold — the soft
+// clip in GLSL_DISPLACE_BODY and its CPU twin limit |dg| relative to the surface
+// gradient, not to the cell size — and `height()` is unaffected either way,
+// since it never asks what tier is loaded. It can only alias. The one place that
+// gets close is `low`, which moves the 12.8 -> 25.6 m radius in from 2048 m to
+// 1638 m where fadeA is still ~0.4. That is the reason `low` stops there instead
+// of trimming level 5 harder.
+//
+// Levels 0-4 are identical in every tier and always will be: they are the ground
+// under the skier, they carry the metre-scale detail bands, and they are 175 k
+// triangles — 15% of ultra. There is nothing to win there and a physics-visual
+// mismatch to lose.
+//
+// Where triangles per pixel stops being worth anything: a ring's angular cell
+// size is 2/res rad at its outer edge and 4/res(k-1) at its inner edge, so at
+// 2560 px across a ~60 deg horizontal FOV (~2450 px/rad) a 512-ring spans
+// 9.6 px at its outer edge and 30 px at its inner one. That sounds generous
+// until you remember the far field is seen at grazing incidence: the cell is
+// foreshortened to well under a pixel *vertically* while staying tens of pixels
+// wide. Ring 7's measured 0.018 px per triangle is that end state, and it is why
+// the ladder is a tier and not a smooth dial: past the point where a triangle
+// covers a fragment quad the extra ones can only buy silhouette, never surface,
+// so the only thing that changes visibly is which doubling radius the skyline
+// happens to fall on.
+const MESH_TIERS = {
+  ultra:  [96, 96, 128, 160, 192, 320, 512, 480],
+  high:   [96, 96, 128, 160, 192, 320, 512, 320],
+  medium: [96, 96, 128, 160, 192, 320, 384, 320],
+  low:    [96, 96, 128, 160, 192, 256, 320, 256],
+};
+const MESH_TIER_NAMES = ['low', 'medium', 'high', 'ultra'];
+const DEFAULT_MESH_TIER = 'ultra';
+
 const CELL0 = 0.4;             // finest cell size, metres
+const LEVEL_RES = MESH_TIERS[DEFAULT_MESH_TIER];
 const LEVELS = LEVEL_RES.length;
-const LEVEL_HOLE = LEVEL_RES.map((_, k) => (k === 0 ? 0 : LEVEL_RES[k - 1] / 2));
+// The camera's far plane, engine.js:859. Mirrored here rather than imported —
+// terrain.js has no dependency on the engine and should not gain one — so it is
+// asserted below instead of trusted. If the two ever disagree the top tier stops
+// covering the frustum, which reads as a wedge of sky where the far ranges were.
+const CAM_FAR = 12000;
+
+// The nesting constraint, derived and enforced in one place. hole(k) must be
+// exactly res(k-1)/2 or the rings gap and the terrain tears along a ring
+// boundary; the lattice indices also have to come out integral, or
+// buildLevelGeometry's `lo`/`hi` land between vertices and the hole is cut in
+// the wrong place. Both are checked here rather than trusted, because a tier
+// table is exactly the kind of thing a future edit adds a row to.
+function levelHoles(res) {
+  const hole = res.map((_, k) => (k === 0 ? 0 : res[k - 1] / 2));
+  for (let k = 1; k < res.length; k++) {
+    const r = res[k], h = hole[k];
+    if (!Number.isInteger(h)) {
+      throw new Error(`terrain: res[${k - 1}] = ${res[k - 1]} is odd, so hole[${k}] is not integral`);
+    }
+    if (h >= r) {
+      throw new Error(`terrain: hole[${k}] = ${h} >= res[${k}] = ${r}; ring ${k} would be empty or inverted`);
+    }
+    if ((r - h) % 2 !== 0) {
+      throw new Error(`terrain: res[${k}] - hole[${k}] = ${r - h} is odd; the hole would not be centred on the lattice`);
+    }
+  }
+  return hole;
+}
+
+function normalizeMeshTier(tier) {
+  if (typeof tier === 'string') {
+    const t = tier.toLowerCase();
+    if (MESH_TIERS[t]) return t;
+  }
+  return DEFAULT_MESH_TIER;
+}
+
+/** Half-extent of each ring, metres. Element k is the radius at which the cell
+ *  size doubles; the last element is the clipmap's reach. */
+function levelExtents(res) {
+  return res.map((r, k) => r * (CELL0 * Math.pow(2, k)) / 2);
+}
+
+/** Chebyshev distance from the clipmap centre to a ring's nearest geometry: the
+ *  inner edge of its hole. A ring whose near edge is past the far plane cannot
+ *  produce a pixel — that is how level 8 was found. */
+function levelNearEdges(res) {
+  const hole = levelHoles(res);
+  return res.map((_, k) => hole[k] * (CELL0 * Math.pow(2, k)) / 2);
+}
+
+// Fail at module load, not at the first settings change, if a tier row is bad.
+// A tier table is exactly the kind of thing a future edit adds a row to, and
+// three of the four checks below are for mistakes that render as a tear or a
+// wedge of sky rather than as an error.
+for (const name of MESH_TIER_NAMES) {
+  if (MESH_TIERS[name].length !== LEVELS) {
+    throw new Error(`terrain: mesh tier '${name}' has ${MESH_TIERS[name].length} levels, expected ${LEVELS}`);
+  }
+  const res = MESH_TIERS[name];
+  levelHoles(res);
+  // No dead rings, at any tier: a ring entirely outside the far plane is pure
+  // submitted-and-discarded vertex work. This is the check that level 8 failed.
+  const near = levelNearEdges(res);
+  for (let k = 0; k < near.length; k++) {
+    if (near[k] >= CAM_FAR) {
+      throw new Error(`terrain: mesh tier '${name}' ring ${k} starts at ${near[k]} m, past camera.far = ${CAM_FAR} m; it cannot render a pixel`);
+    }
+  }
+}
+// ...and the TOP tier must cover the whole frustum. A square of half-extent E
+// contains the disc of radius E, so reach >= CAM_FAR is exact coverage. Only
+// asserted for the top tier: the lower ones trade reach away on purpose.
+{
+  const top = MESH_TIER_NAMES[MESH_TIER_NAMES.length - 1];
+  const reach = levelExtents(MESH_TIERS[top]).pop();
+  if (reach < CAM_FAR) {
+    throw new Error(`terrain: top mesh tier '${top}' reaches ${reach} m, inside camera.far = ${CAM_FAR} m; the far ranges would end in mid-air`);
+  }
+}
 
 // Prevailing wind, world XZ. Must match `uWindDir` in snow-material.js: the
 // cornice displacement and the shader's wind-loading masks have to agree.
 const WIND_X = 0.82, WIND_Z = 0.57;
 
 // --- background ranges -------------------------------------------------------
-// The baked field covers 8.2 km and clamps to a -42 m plain outside it, but the
-// clipmap reaches 19.7 km. Everything between the two was a dead-flat white
+// The baked field covers 8.2 km (i.e. +-4.1 km) and clamps to a -42 m plain
+// outside it, while the clipmap reaches 12.3 km — 19.7 km when this was written,
+// and the argument is unchanged by the ring trim: what matters is that the
+// clipmap outruns the bake, not by how much. Everything between the two was a
+// dead-flat white
 // table: the hard, perfectly horizontal bright band that showed through every
 // gap in the skyline. Past BD_IN the surface is an analytic ridged field
 // instead, blended in over 3.4 km, carrying the skyline out into successive
@@ -1313,11 +1550,20 @@ export class Terrain {
 
     this.group = new THREE.Group();
     this.group.name = 'terrain';
+
+    // Ring resolution tier and shadow-ring counts. Set before _buildClipmap:
+    // it reads all three. `_center` is NaN until update() first snaps it, which
+    // _buildClipmap tests for, so the order here is the only ordering
+    // constraint — build the clipmap after the material and before update().
+    this._meshTier = normalizeMeshTier(opts.meshQuality ?? DEFAULT_MESH_TIER);
+    this._shadowRings = 5;      // levels 0..4, i.e. out to 614 m
+    this._receiveRings = 7;     // levels 0..6
+    this._center = new THREE.Vector2(NaN, NaN);
+    this.levels = [];
     this._buildClipmap();
 
     this._scratch = new THREE.Vector3();
     this._grad = { x: 0, y: 0 };
-    this._center = new THREE.Vector2(NaN, NaN);
     this._time = 0;
     this._sun = null;
 
@@ -2640,31 +2886,177 @@ void terrJumps( vec2 P, inout float h, inout vec2 g, out float amt, out float ro
 
   // --------------------------------------------------------------- clipmap --
   _buildClipmap() {
+    const res = MESH_TIERS[this._meshTier];
+    const hole = levelHoles(res);
     this.levels = [];
     const cache = new Map();
     for (let k = 0; k < LEVELS; k++) {
       const cell = CELL0 * Math.pow(2, k);
-      const res = LEVEL_RES[k], hole = LEVEL_HOLE[k];
-      const key = res + ':' + hole;
+      const key = res[k] + ':' + hole[k];
       let geo = cache.get(key);
-      if (!geo) { geo = buildLevelGeometry(res, hole); cache.set(key, geo); }
+      if (!geo) { geo = buildLevelGeometry(res[k], hole[k]); cache.set(key, geo); }
       const mesh = new THREE.Mesh(geo, this.material);
       mesh.customDepthMaterial = this.depthMaterial;
       mesh.scale.set(cell, 1, cell);
+      // Displacement happens in the vertex program, so three's bounds describe
+      // the flat lattice and cannot decide visibility. Culling stays off; see
+      // buildLevelGeometry for what the bounding sphere is and is not good for.
       mesh.frustumCulled = false;
-      // Only the rings that actually fall inside the sun-shadow frustum take
-      // part in shadowing. That box is ±95 m around the skier (see sky.js), so
-      // level 4 — whose outer edge is 614 m out — is already generous margin.
-      // Every ring past it would just be a few hundred thousand triangles
-      // rasterised into a depth map they cannot possibly intersect.
-      const inShadowRange = k <= 4;
-      mesh.receiveShadow = k <= 6;
-      mesh.castShadow = inShadowRange;
+      // LOAD-BEARING, and it does not look it. This draws the rings NEAR TO FAR,
+      // which is what lets early-Z reject the occluded far rings before the snow
+      // fragment program runs on them. That program is over half of the scene's
+      // shading cost (CLAUDE.md), and rings 6-7 cover the whole screen from the
+      // inside — reverse this line, or drop it, and the far field gets shaded
+      // first and then overdrawn by everything nearer, for a multi-millisecond
+      // regression with no obvious cause anywhere near the change.
       mesh.renderOrder = -10 + k;
       mesh.name = 'terrain-lod' + k;
       this.group.add(mesh);
-      this.levels.push({ mesh, cell });
+      this.levels.push({ mesh, cell, res: res[k], hole: hole[k], extent: res[k] * cell / 2 });
     }
+    this._applyShadowRings();
+    // update() only writes positions when the snapped centre CHANGES, so a
+    // rebuild at runtime has to place the new meshes itself or the whole clipmap
+    // sits at the origin until the skier crosses the next 0.8 m snap boundary.
+    const c = this._center;
+    if (c && Number.isFinite(c.x)) {
+      for (const l of this.levels) l.mesh.position.set(c.x, 0, c.y);
+    }
+  }
+
+  /**
+   * Push `_shadowRings` / `_receiveRings` onto the meshes. Split out of
+   * _buildClipmap so setShadowRings() and a tier rebuild share one definition.
+   *
+   * Only the rings that actually fall inside the sun-shadow frustum take part in
+   * shadow *casting*. That box is ±95 m around the skier (see sky.js), so the
+   * default of 5 rings — level 4's outer edge is 614 m out — is already generous
+   * margin. Every ring past it would just be a few hundred thousand triangles
+   * rasterised into a depth map they cannot possibly intersect.
+   *
+   * `receiveShadow` is a different animal: in three r185 it is a per-object
+   * *uniform* (`lights_pars_begin` declares `uniform bool receiveShadow`, and
+   * WebGLRenderer.js:2687 pushes `object.receiveShadow` into it), NOT a program
+   * define. So it is safe to vary it across the nine meshes that share this
+   * file's single snow material instance, and safe to change at runtime — no
+   * second program, no recompile. What it does NOT do is remove any shader cost:
+   * USE_SHADOWMAP is decided per material and per renderer, so the shadow code
+   * is compiled in either way and switching a ring off only skips its shadow-map
+   * fetches under a dynamic branch. Do not expect it to behave like castShadow.
+   */
+  _applyShadowRings() {
+    for (let k = 0; k < this.levels.length; k++) {
+      const mesh = this.levels[k].mesh;
+      mesh.castShadow = k < this._shadowRings;
+      mesh.receiveShadow = k < this._receiveRings;
+    }
+  }
+
+  _disposeClipmap() {
+    const seen = new Set();
+    for (const l of this.levels || []) {
+      this.group.remove(l.mesh);
+      if (seen.has(l.mesh.geometry)) continue;   // rings can share a geometry
+      seen.add(l.mesh.geometry);
+      l.mesh.geometry.dispose();
+    }
+    this.levels = [];
+  }
+
+  // ------------------------------------------------------------ mesh tiers --
+  /**
+   * Rebuild the clipmap rings at a different resolution tier. Safe at runtime
+   * and repeatable — the old ring geometries are disposed, so a settings menu
+   * can hammer this without leaking. Returns the tier actually in force
+   * (unknown names fall back to the default rather than throwing, so a stale
+   * saved setting cannot brick the boot).
+   *
+   * Cheap: no bake, no texture, no material, no shader recompile. The rings are
+   * a unit lattice in XZ; all the shape lives in the vertex program. Rebuild
+   * cost is the lattice generation, a handful of ms.
+   *
+   * ---------------------------------------------------------------------------
+   * Note the pair of PASSTHROUGHS immediately below this comment
+   * (`setShaderQuality` / `getShaderQuality`). The snow SHADER tier has to be
+   * implemented in `snow-material.js` — it is a set of #defines folded into
+   * `customProgramCacheKey`, and only the factory owning that key can move it —
+   * but `terrain.material.userData.setShaderQuality` is not an API anybody
+   * guesses. A settings layer that feature-detects `terrain.setShaderQuality`
+   * and does not find it degrades to a knob that looks live and does nothing,
+   * which is precisely what happened before these existed. Unlike the mesh
+   * tier, the shader tier costs a shader link per material and per depth
+   * material: a menu action, never a per-frame call.
+   * ---------------------------------------------------------------------------
+   */
+  setShaderQuality(tier) {
+    const f = this.material?.userData?.setShaderQuality;
+    if (typeof f === 'function') f(tier);
+    return this.getShaderQuality();
+  }
+
+  /** Current snow-shader tier, or null if the material does not report one. */
+  getShaderQuality() {
+    const f = this.material?.userData?.getShaderQuality;
+    return typeof f === 'function' ? f() : null;
+  }
+
+  setMeshQuality(tier) {
+    const t = normalizeMeshTier(tier);
+    if (t === this._meshTier && this.levels && this.levels.length) return t;
+    this._meshTier = t;
+    this._disposeClipmap();
+    this._buildClipmap();
+    return t;
+  }
+
+  getMeshQuality() { return this._meshTier; }
+
+  /**
+   * How many of the inner rings cast into the sun-shadow map. 0 disables
+   * terrain self-shadowing entirely; LEVELS enables every ring (pointless — see
+   * _applyShadowRings). Second argument optionally sets the receive count; it
+   * genuinely works per-ring at runtime, but read the note there before
+   * expecting it to save anything.
+   */
+  setShadowRings(n, receiveRings) {
+    // Number.isFinite first: clamp() passes NaN straight through, and a NaN here
+    // reads as "no ring casts" — a settings slider that silently deletes the
+    // terrain's shadows is a bad way to find out about a parse bug.
+    const cast = Math.round(Number(n)), recv = Math.round(Number(receiveRings));
+    if (Number.isFinite(cast)) this._shadowRings = clamp(cast, 0, LEVELS);
+    if (Number.isFinite(recv)) this._receiveRings = clamp(recv, 0, LEVELS);
+    this._applyShadowRings();
+    return this._shadowRings;
+  }
+
+  /** Live triangle/ring census. `triangles` counts what is submitted per frame,
+   *  so rings sharing one geometry are counted once each — which is what they
+   *  cost. Extents are half-extents in metres, i.e. the doubling radii. */
+  meshInfo() {
+    const levelRes = [], levelTris = [], levelHole = [], extent = [];
+    let triangles = 0;
+    for (const l of this.levels) {
+      const idx = l.mesh.geometry.getIndex();
+      const tris = idx ? idx.count / 3 : 0;
+      triangles += tris;
+      levelTris.push(tris);
+      levelRes.push(l.res);
+      levelHole.push(l.hole);
+      extent.push(l.extent);
+    }
+    return {
+      triangles,
+      levelRes,
+      levels: this.levels.length,
+      tier: this._meshTier,
+      tiers: MESH_TIER_NAMES.slice(),
+      levelTris,
+      levelHole,
+      extent,
+      reach: extent.length ? extent[extent.length - 1] : 0,
+      shadowRings: this._shadowRings,
+      receiveRings: this._receiveRings,
+    };
   }
 
   /** Recentre the clipmap. Cheap: only model matrices change. */
@@ -2737,12 +3129,9 @@ void terrJumps( vec2 P, inout float h, inout vec2 g, out float amt, out float ro
     this.heightTex.dispose();
     this.material.dispose();
     this.depthMaterial.dispose();
-    const seen = new Set();
-    for (const l of this.levels) {
-      if (seen.has(l.mesh.geometry)) continue;
-      seen.add(l.mesh.geometry);
-      l.mesh.geometry.dispose();
-    }
+    // Ring geometries — including any allocated by a later setMeshQuality(); it
+    // disposes what it replaces, so this only ever has one generation to free.
+    this._disposeClipmap();
   }
 }
 
@@ -2799,7 +3188,22 @@ function buildLevelGeometry(res, hole) {
   geo.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(pos.length), 3));
   geo.setAttribute('aSkirt', new THREE.Float32BufferAttribute(skirt, 1));
   geo.setIndex(index);
-  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), res * 4);
+  // Exact bound on the UNDISPLACED lattice. Positions span [-res/2, +res/2] in
+  // both x and z, so the corner is at res/2 * sqrt(2) = res / sqrt(2); the skirt
+  // adds at most 3.2 cells of drop (see dspSkirt in GLSL_DISPLACE_BODY), and
+  // three scales a bounding sphere by the largest axis scale, which for a ring is
+  // exactly `cell`, so 3.2 cells is 3.2 in these units.
+  //
+  // This used to read `res * 4` — 5.66x too large, e.g. a 4915 m world radius on
+  // level 4 for an 868 m true half-diagonal. Harmless while frustumCulled is
+  // false, which is why it survived, but a bogus bound silently defeats any
+  // future culling work, so it is now correct.
+  //
+  // What it still cannot describe is the displacement: the vertex program moves y
+  // by up to ~1.5 km in WORLD units, and none of that is in this sphere. Anyone
+  // turning frustum culling on has to inflate the bound by the displacement range
+  // (or cull against a conservative height interval) — not trust this number.
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), res * Math.SQRT1_2 + 3.2);
   return geo;
 }
 

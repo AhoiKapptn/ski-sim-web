@@ -2056,13 +2056,20 @@ export function createSky(scene, renderer) {
      * bandwidth; the far cascade at 2048 is 32 cm/texel, where the skier's own
      * 4 m contact shadow is still ~12 texels across.
      *
-     * @param {{far?: number, near?: number}} o  powers of two, clamped 256-8192
+     * Accepts `far`/`near` or `farMap`/`nearMap` — the two names this grew in
+     * parallel, and a settings module calling the other pair would otherwise
+     * no-op in total silence, which is the worst possible failure for a knob.
+     *
+     * @param {{far?: number, near?: number, farMap?: number, nearMap?: number}} o
+     *        powers of two, clamped 256-8192
      */
     setShadowQuality(o = {}) {
       const clamp = (v, d) => {
         const n = Math.round(+v || d);
         return Math.max(256, Math.min(8192, 2 ** Math.round(Math.log2(n))));
       };
+      if (o.farMap !== undefined && o.far === undefined) o = { ...o, far: o.farMap };
+      if (o.nearMap !== undefined && o.near === undefined) o = { ...o, near: o.nearMap };
       if (o.far !== undefined) {
         const v = clamp(o.far, SHADOW_MAP);
         if (v !== SHADOW_MAP) {

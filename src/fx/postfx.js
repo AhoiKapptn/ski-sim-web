@@ -23,11 +23,22 @@
  *          ──► UnrealBloom   threshold 2.6 exposed-linear, with a firefly clamp
  *                            and a soft knee on the high pass and an explicitly
  *                            authored (narrow) pyramid: only specular glints and
- *                            the sun disc, never the snow, and never an orb
+ *                            the sun disc, never the snow, and never an orb.
+ *                            STOPS AT THE COMPOSITE — the half-res result is
+ *                            handed to the grade as a texture instead of being
+ *                            additively blended over the full-res frame (see
+ *                            BloomToTexturePass), which deletes a full-res
+ *                            read-modify-write pass
  *          ──► DOF           depth CoC, golden-angle gather bokeh. Deep focus:
  *                            the far field is essentially sharp (no CoC at all
  *                            inside 1 km, ~1 px at the horizon), the near field
  *                            gets what defocus there is, like a 35 mm at f/8.
+ *                            Three early-outs, in order: the far plane (the sky
+ *                            dome is pinned there and blurring a smooth gradient
+ *                            returns the same colour), a radius under
+ *                            PARAMS.dof.minPx, and a radius under
+ *                            PARAMS.dof.cheapPx which takes a 9-fetch ring
+ *                            instead of the 42-fetch weighted gather
  *          ──► motion blur   true per-pixel velocity: the frame is reprojected
  *                            against a virtual camera placed one *shutter* back
  *                            along the real camera path (translation from
@@ -46,6 +57,28 @@
  *
  * Design rule: every effect is tuned so a viewer could not name it. If you can
  * point at the bloom, the bloom is wrong.
+ *
+ * COST. Every render target here is sized from `getDrawingBufferSize()`, so the
+ * whole chain scales with the pixel count and nothing else. On the owner's 5K
+ * panel that is 2560x1440 at DPR 2 = 14.75 Mpx, where the measured cost model is
+ * a fixed floor plus ~2.9 ms per megapixel — i.e. a single full-res fullscreen
+ * pass is not free, it is ~40 Mpx of fill. Two rules follow and both are load
+ * bearing:
+ *
+ *   * count the FULL-RES passes, not the effects. There are five: the TAA
+ *     resolve, the TAA output step, DOF, grade and film (plus motion blur above
+ *     ~55 km/h). Anything that can live at half res must, and anything that can
+ *     be folded into a pass that already exists should be.
+ *   * a full-res pass that early-outs to a single texture fetch over most of the
+ *     frame costs almost nothing, so the cheapest optimisation available here is
+ *     always a better early-out, not a cheaper effect.
+ *
+ * `setQuality(tier)` / `getQuality()` expose four presets over PARAMS — see
+ * QUALITY near the bottom of the file. PARAMS stays live-writable after a preset
+ * (every value is pushed to its uniform every frame), so a custom-settings layer
+ * can override individual knobs on top of a tier. The AUTHORED DEFAULTS IN
+ * PARAMS ARE THE 'high' TIER; `setQuality('ultra')` is the look as it shipped
+ * before tiering existed.
  */
 
 import * as THREE from 'three';
@@ -148,6 +181,17 @@ export const PARAMS = {
     knee: 1.1,          // width of the soft knee, in exposed-linear units
     // half, 1/4, 1/8, 1/16, 1/32 resolution mips
     mipWeights: [1.0, 0.42, 0.16, 0.06, 0.03],
+    // How many of those five mips are actually built. Each one costs two blur
+    // passes, and the widest two run the widest kernels (35 and 43 taps) for a
+    // 0.06 and 0.03 contribution — at strength 0.10 that is 3*0.10*0.03 = 0.009
+    // of a bloom input already clamped to 8 units, i.e. under a third of a
+    // display code, smeared over a disc the size of a fist. Be honest about the
+    // size of this win: those mips run at 1/16 and 1/32 resolution, so the
+    // arithmetic they save is ~0.3% of a full-res pass. What it actually buys is
+    // four fewer submissions and four fewer clears per frame. The mips above
+    // this count are forced to weight zero AND unbound from the composite (see
+    // applyBloomMips) so nothing samples a render target that was never drawn.
+    mips: 4,
   },
 
   // Deep focus. A chase camera on a 35 mm-equivalent lens stopped down to f/8
@@ -155,16 +199,54 @@ export const PARAMS = {
   // in this frame is a whisper on the very near foreground and a barely-there
   // softening on peaks kilometres away. The distant ridgeline is the most
   // detailed thing on screen and must survive intact.
+  //
+  // THIS PASS IS WHERE DOF COST LIVES, AND IT IS ALL IN THE GATHER. `cocScale`
+  // (see setSize) is H/900, so the CoC radius scales with resolution — right for
+  // a resolution-invariant *look*, but it means the "not worth blurring" early
+  // out is measured in device pixels while the look is authored in logical ones.
+  // At 900p the far ceiling is farStrength 0.34 * maxCoC 3.0 = 1.02 px, barely
+  // over the 0.75 px early-out, so at the resolution this look was reviewed at
+  // the far field hardly gathered at all. At 1440p DPR 2 the same ceiling is
+  // 3.26 px, the early-out never fires past ~520 m, and EVERY pixel out there —
+  // including the sky, which `sky.js` pins to the far plane and which is 30-50%
+  // of the frame — ran the full 20-tap path: 20 colour fetches plus 20 depth
+  // fetches for the per-tap spill test, to blur a smooth gradient by 1.6 logical
+  // pixels. Modelled at 2-3 ms of a 48.8 ms frame.
+  //
+  // Hence the three knobs below. They do not change the shape of the effect;
+  // they bound what it is allowed to cost.
   dof: {
     enabled: true,
     focus: 9.0,        // metres, driven by update()
     focusSpeed: 3.0,   // focus-pull rate (1/s)
     nearStrength: 1.0, // full CoC only for things basically touching the lens
     nearRange: 0.62,   // fraction of the focus distance the near ramp spans
-    farStrength: 0.34, // ceiling on the far CoC (× maxCoC px)
+    farStrength: 0.34, // ceiling on the far CoC (× maxCoC px). 0 = far field off
     farStart: 260,     // metres — nothing before this softens at all
     farEnd: 2600,      // metres — far CoC ceiling reached here
     maxCoC: 3.0,       // px at 900p; scaled with resolution
+    // Ceiling on the FAR CoC in *device* pixels, applied after cocScale. The far
+    // blur exists to read as aerial haze, and it was authored and reviewed at
+    // ~1 device px; letting it grow to 3.26 px on a 5K panel is not the same
+    // look at higher fidelity, it is a bigger blur over the most detailed thing
+    // in the frame (the header above: the distant ridgeline must survive
+    // intact), and it costs 4x the cache traffic per tap. Capping at 2.0 keeps
+    // it under `cheapPx` at every resolution, which is what puts the whole far
+    // field on the 9-fetch path. Set to a huge number to uncap ('ultra').
+    farMaxPx: 2.0,
+    // Radius under which the gather is skipped entirely — one fetch, exact copy.
+    minPx: 0.75,
+    // Radius at or under which the CHEAP ring is used: CHEAP_TAPS unweighted
+    // colour fetches and no per-tap depth fetch at all. The per-tap spill test
+    // exists to stop a sharp foreground haloing the far peaks, which is a
+    // question about large and *differing* radii; at 2 px the halo it prevents
+    // is 2 px wide. 9 fetches instead of 42, and at this radius the disc is
+    // ~16 px of area so 9 taps is a denser sampling than the 20-tap path gives
+    // its own 33 px disc.
+    cheapPx: 2.25,
+    // Tap counts, compiled in as #defines (see setQuality → dofDefines).
+    taps: 20,
+    cheapTaps: 8,
   },
 
   motion: {
@@ -740,14 +822,30 @@ uniform float uNearRange;
 uniform float uFarStrength;
 uniform vec2  uFarBand;     // x = start metres, y = end metres
 uniform float uMaxCoC;      // pixels
+uniform float uFarMaxPx;    // ceiling on the far CoC, device px
+uniform float uMinPx;       // under this radius: no gather at all
+uniform float uCheapPx;     // at or under this radius: the cheap ring
 ${COMMON}
 ${DEPTH_GLSL}
 
-const int TAPS = 20;
+// Tap counts are #defines, not GLSL literals, so setQuality can tier them.
+// These passes are plain ShaderPass materials with no customProgramCacheKey, so
+// three's program cache key includes material.defines and a needsUpdate after
+// changing one recompiles correctly. (The snow material pins its cache key and
+// CANNOT be tiered this way — do not copy that pattern here or vice versa.)
+#ifndef TAPS
+  #define TAPS 20
+#endif
+#ifndef CHEAP_TAPS
+  #define CHEAP_TAPS 8
+#endif
 const float GOLDEN = 2.39996323;
 
-float cocAt(vec2 uv) {
-  float z = linearDepth(texture2D(tDepth, uv).x, uNearFar.x, uNearFar.y);
+// Signed blur radius in device pixels: positive behind the focus plane,
+// negative in front of it. (This used to return CoC in 0..1 units which main()
+// then multiplied by uMaxCoC; folding uMaxCoC in is what lets uFarMaxPx cap the
+// far field in pixels, consistently for the centre pixel and for every tap.)
+float rPixFromZ(float z) {
   if (z >= uFocus) {
     // DEEP FOCUS. A thin-lens far CoC saturates within ~3x the focus distance,
     // which turns an entire mountain range into brushed metal — the single most
@@ -759,26 +857,72 @@ float cocAt(vec2 uv) {
     float a = log2(max(z, uFarBand.x) / uFarBand.x);
     float b = log2(uFarBand.y / uFarBand.x);
     float t = smoothstep(0.0, 1.0, a / max(b, 1e-3));
-    return t * uFarStrength;
+    return min(t * uFarStrength * uMaxCoC, uFarMaxPx);
   }
   // Near field carries what little defocus there is: only geometry inside
-  // uNearRange of the focus plane — spray, a ski tip, a passing gate.
+  // uNearRange of the focus plane — spray, a ski tip, a passing gate. It is
+  // deliberately NOT capped: this is the defocus a viewer can actually see, it
+  // covers a small wedge at the bottom of the frame, and it is the part of the
+  // effect worth paying for.
   float t = clamp((uFocus - z) / max(uFocus * uNearRange, 1e-3), 0.0, 1.0);
-  return -t * t * uNearStrength;
+  return -t * t * uNearStrength * uMaxCoC;
+}
+
+float rPixAt(vec2 uv) {
+  return rPixFromZ(linearDepth(texture2D(tDepth, uv).x, uNearFar.x, uNearFar.y));
 }
 
 void main() {
-  float cocC = cocAt(vUv);
-  float rPix = abs(cocC) * uMaxCoC;
+  vec3 base = texture2D(tDiffuse, vUv).rgb;
+  float d = texture2D(tDepth, vUv).x;
+  float zC = linearDepth(d, uNearFar.x, uNearFar.y);
 
-  if (rPix < 0.75) {
-    gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb, 1.0);
+  // FAR-PLANE EARLY-OUT. sky.js pins the sky dome to the far plane with
+  // gl_Position.z = gl_Position.w, so every sky pixel sits at exactly depth 1.0
+  // — and on these framings the sky is 30-50% of the frame. A gather cannot
+  // change a pixel whose whole neighbourhood is the same smooth gradient, so
+  // those pixels were paying 42 texture fetches for a guaranteed no-op. Tested
+  // in METRES rather than against a depth code so the test does not have to be
+  // re-derived if camera.near/far change: at 0.15/12000 the nearest depth code
+  // below 1.0 already unprojects to ~11.5 km, terrain never gets past ~4 km,
+  // and the sky is the only thing in the scene at the far plane itself.
+  if (zC >= uNearFar.y * 0.98) { gl_FragColor = vec4(base, 1.0); return; }
+
+  float rPix = abs(rPixFromZ(zC));
+  if (rPix < uMinPx) { gl_FragColor = vec4(base, 1.0); return; }
+
+  // Rotate the kernel per pixel so the taps never read as a ring pattern.
+  float ang0 = hash12(gl_FragCoord.xy) * 6.2831853;
+
+  // CHEAP RING — see PARAMS.dof.cheapPx. Fewer taps, flat weights, and NO
+  // per-tap depth fetch, which is what takes this from 42 fetches to 9.
+  //
+  // Dropping the spill test here is not an approximation wherever the depth
+  // field is locally smooth, and the algebra says so: the weight below is
+  // clamp(coc2 - distPx + 1, 0, 1), and where a tap's own CoC matches this
+  // pixel's, coc2 = rPix >= distPx for every tap in the disc, so the weight is
+  // clamp(>= 1) = 1 identically. The test only ever bites at a CoC
+  // DISCONTINUITY — a sharp foreground against a blurred background — where its
+  // job is to stop the halo. Below cheapPx that halo would be a couple of pixels
+  // wide. So this path is exact over the far field and over any smooth near-field
+  // gradient, and the two paths differ in sampling NOISE rather than in blur
+  // amount, which is why the seam between them at cheapPx does not read as a ring.
+  //
+  // This is the path the entire far field takes at every resolution once
+  // uFarMaxPx caps it, which is the whole point.
+  if (rPix <= uCheapPx) {
+    vec3 acc = base;
+    for (int i = 0; i < CHEAP_TAPS; i++) {
+      float fi = float(i) + 0.5;
+      float r = sqrt(fi / float(CHEAP_TAPS));
+      float a = fi * GOLDEN + ang0;
+      acc += texture2D(tDiffuse, vUv + vec2(cos(a), sin(a)) * r * rPix * uTexel).rgb;
+    }
+    gl_FragColor = vec4(acc / float(CHEAP_TAPS + 1), 1.0);
     return;
   }
 
-  // Rotate the kernel per pixel so the 22 taps never read as a ring pattern.
-  float ang0 = hash12(gl_FragCoord.xy) * 6.2831853;
-  vec3 acc = texture2D(tDiffuse, vUv).rgb;
+  vec3 acc = base;
   float wsum = 1.0;
 
   for (int i = 0; i < TAPS; i++) {
@@ -789,7 +933,7 @@ void main() {
     vec2 uv2 = vUv + off * rPix * uTexel;
 
     vec3 c = texture2D(tDiffuse, uv2).rgb;
-    float coc2 = abs(cocAt(uv2)) * uMaxCoC;
+    float coc2 = abs(rPixAt(uv2));
     // A sample only spills onto this pixel if its own circle of confusion
     // reaches it — this is what stops sharp foreground haloing the far peaks.
     float w = clamp(coc2 - r * rPix + 1.0, 0.0, 1.0);
@@ -889,6 +1033,7 @@ const GRADE_FRAG = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
 uniform sampler2D tDiffuse;
+uniform sampler2D tBloom;  // half-res bloom composite, added here — see below
 uniform float uExposure;
 uniform vec4  uGT1;        // P, a, m, l
 uniform vec2  uGT2;        // c, b
@@ -943,12 +1088,33 @@ void main() {
   float r2 = dot(d, d) * 4.0;
 
   // Lateral chromatic aberration: zero in the centre, r^2 to the corners, and
-  // never more than a fraction of a pixel of separation.
-  vec2 ca = d * r2 * uChromatic * uTexel.x * 2.0;
+  // never more than a fraction of a pixel of separation. Branched on the
+  // uniform rather than a #define so PARAMS.grade.chromatic stays live-writable
+  // on top of a quality tier; the branch is coherent across the whole draw, and
+  // with CA off (the 'low' tier) it saves two of this pass's three fetches.
   vec3 col;
-  col.r = texture2D(tDiffuse, vUv + ca).r;
-  col.g = texture2D(tDiffuse, vUv).g;
-  col.b = texture2D(tDiffuse, vUv - ca).b;
+  if (uChromatic > 0.0005) {
+    vec2 ca = d * r2 * uChromatic * uTexel.x * 2.0;
+    col.r = texture2D(tDiffuse, vUv + ca).r;
+    col.g = texture2D(tDiffuse, vUv).g;
+    col.b = texture2D(tDiffuse, vUv - ca).b;
+  } else {
+    col = texture2D(tDiffuse, vUv).rgb;
+  }
+
+  // BLOOM IS ADDED HERE, not by a pass of its own. UnrealBloomPass ends with a
+  // full-res additive read-modify-write over the whole frame to add a half-res,
+  // strength-0.10 texture — at 14.75 Mpx that is a ~276 MB/frame pass to do one
+  // add. BloomToTexturePass stops after the composite step and hands the
+  // half-res result over as tBloom; sampling it here is the same bilinear
+  // upsample the blend pass was doing, so the arithmetic is identical.
+  // It must land BEFORE the uExposure trim below, because that is where it used
+  // to sit in the chain. The one real difference: bloom is no longer blurred by
+  // DOF or motion blur, since those passes now run ahead of it. At strength 0.10
+  // over a pyramid this narrow that is not a visible quantity.
+  // When bloom is off, tBloom is a 1x1 black texture (never an unrendered
+  // target — sampling one of those binds nothing and Chrome complains).
+  col = max(col, vec3(0.0)) + max(texture2D(tBloom, vUv).rgb, vec3(0.0));
 
   // Exposure was already applied ahead of the bloom (see TAAPass) so that the
   // bloom threshold is sensor-referred rather than scene-referred. uExposure
@@ -1060,6 +1226,17 @@ void main() {
 
 // -----------------------------------------------------------------------------
 // Film — sharpen, grain, vignette. Display space, after SMAA.
+//
+// WHY THIS IS NOT MERGED INTO THE GRADE, which would save a full-res pass and is
+// the obvious next idea: the CAS sharpen below reads the four neighbours of
+// *graded* output. Merged, the grade would have to run five times per fragment —
+// five log2/exp2 round trips, five ASC-CDL + split-tone + sky-secondary
+// evaluations and fifteen calls to gt() — to save one pass that costs five cheap
+// texture fetches and some adds. That is far more arithmetic than the pass is
+// worth, and it would also couple the two protected passes into one, which is
+// worse for a chain where the grade owns four rows of the quality table.
+// The merge that IS worth having is the bloom fold above: it deleted a full-res
+// pass that did a single add, with no duplicated work at all.
 // -----------------------------------------------------------------------------
 const FILM_FRAG = /* glsl */ `
 precision highp float;
@@ -1130,6 +1307,109 @@ void main() {
 `;
 
 // -----------------------------------------------------------------------------
+// Bloom that stops at the composite.
+//
+// UnrealBloomPass' last step is `blendMaterial` — a FULL-RES additively blended
+// fullscreen quad over the pass' input, whose entire job is `dst += bloom`. At
+// 14.75 Mpx that is a read-modify-write of the whole frame (~276 MB of traffic)
+// to add a half-res texture scaled by 0.10. The grade pass already reads every
+// pixel of that same buffer one pass later, so the add belongs there (see
+// GRADE_FRAG, tBloom) and this subclass simply stops one step early.
+//
+// It reimplements render() rather than wrapping it because there is no seam in
+// the upstream method to interpose on. That means it can drift from three on an
+// upgrade, so `_foldable()` checks for every internal it touches and falls back
+// to the stock render() with a warning if any of them moved — the same
+// warn-and-fall-back contract `sky.js` uses for its ShaderChunk patches. In the
+// fallback the grade's tBloom is left pointing at black, so bloom still lands
+// exactly once and the image stays correct; only the saving is lost.
+// -----------------------------------------------------------------------------
+class BloomToTexturePass extends UnrealBloomPass {
+  /** The half-res texture the composite writes, for the grade to sample. */
+  get outputTexture() { return this.renderTargetsHorizontal[0].texture; }
+
+  _foldable() {
+    if (this._foldOK !== undefined) return this._foldOK;
+    const ok = !!(this.highPassUniforms && this.materialHighPassFilter
+      && this.separableBlurMaterials && this.separableBlurMaterials.length >= this.nMips
+      && this.compositeMaterial && this.renderTargetBright && this._fsQuad
+      && this.renderTargetsHorizontal.length && this.renderTargetsVertical.length
+      && UnrealBloomPass.BlurDirectionX && UnrealBloomPass.BlurDirectionY);
+    if (!ok) {
+      console.warn('[postfx] UnrealBloomPass internals changed; falling back to its '
+        + 'own render(), which costs one extra full-res pass. Bloom is still correct.');
+    }
+    this._foldOK = ok;
+    return ok;
+  }
+
+  render(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
+    // renderToScreen would need the blend step this class removes.
+    if (this.renderToScreen || !this._foldable()) {
+      super.render(renderer, writeBuffer, readBuffer, deltaTime, maskActive);
+      this.folded = false;
+      return;
+    }
+    this.folded = true;
+
+    renderer.getClearColor(this._oldClearColor);
+    this._oldClearAlpha = renderer.getClearAlpha();
+    const oldAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    renderer.setClearColor(this.clearColor, 0);
+    if (maskActive) renderer.state.buffers.stencil.setTest(false);
+
+    // Every target here has depthBuffer/stencilBuffer off (see createPostFX), so
+    // clear colour only — upstream's bare `renderer.clear()` asks for all three.
+    const clr = () => renderer.clear(true, false, false);
+
+    // 1. extract bright areas (half res)
+    this.highPassUniforms.tDiffuse.value = readBuffer.texture;
+    this.highPassUniforms.luminosityThreshold.value = this.threshold;
+    this._fsQuad.material = this.materialHighPassFilter;
+    renderer.setRenderTarget(this.renderTargetBright);
+    clr();
+    this._fsQuad.render(renderer);
+
+    // 2. blur the mips progressively. `nMips` is driven from PARAMS.bloom.mips,
+    //    so this loop is how a lower tier stops building the widest mips.
+    let input = this.renderTargetBright;
+    for (let i = 0; i < this.nMips; i++) {
+      const m = this.separableBlurMaterials[i];
+      this._fsQuad.material = m;
+      m.uniforms.colorTexture.value = input.texture;
+      m.uniforms.direction.value = UnrealBloomPass.BlurDirectionX;
+      renderer.setRenderTarget(this.renderTargetsHorizontal[i]);
+      clr();
+      this._fsQuad.render(renderer);
+
+      m.uniforms.colorTexture.value = this.renderTargetsHorizontal[i].texture;
+      m.uniforms.direction.value = UnrealBloomPass.BlurDirectionY;
+      renderer.setRenderTarget(this.renderTargetsVertical[i]);
+      clr();
+      this._fsQuad.render(renderer);
+
+      input = this.renderTargetsVertical[i];
+    }
+
+    // 3. composite them into renderTargetsHorizontal[0] (half res) and STOP.
+    //    The grade pass picks that up as tBloom. readBuffer is untouched, and
+    //    needsSwap is false, so the chain flows past this pass unchanged.
+    this._fsQuad.material = this.compositeMaterial;
+    this.compositeMaterial.uniforms.bloomStrength.value = this.strength;
+    this.compositeMaterial.uniforms.bloomRadius.value = this.radius;
+    this.compositeMaterial.uniforms.bloomTintColors.value = this.bloomTintColors;
+    renderer.setRenderTarget(this.renderTargetsHorizontal[0]);
+    clr();
+    this._fsQuad.render(renderer);
+
+    if (maskActive) renderer.state.buffers.stencil.setTest(true);
+    renderer.setClearColor(this._oldClearColor, this._oldClearAlpha);
+    renderer.autoClear = oldAutoClear;
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Halton for the TAA jitter.
 // -----------------------------------------------------------------------------
 function halton(index, base) {
@@ -1179,9 +1459,19 @@ export function createPostFX(renderer, scene, camera) {
   blitPass.enabled = !PARAMS.taa.enabled;
   taaPass.enabled = PARAMS.taa.enabled;
 
-  const bloomPass = new UnrealBloomPass(
+  // 1x1 black, for every sampler that must be *bound and silent* rather than
+  // null: an unrendered WebGLRenderTarget has no GL texture object yet, so
+  // binding one samples an incomplete texture and Chrome logs about it.
+  const blackTex = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
+  blackTex.needsUpdate = true;
+
+  const bloomPass = new BloomToTexturePass(
     new THREE.Vector2(W, H), PARAMS.bloom.strength, PARAMS.bloom.radius, PARAMS.bloom.threshold);
   bloomPass.enabled = PARAMS.bloom.enabled;
+  const BLOOM_MIPS_MAX = bloomPass.nMips;      // 5, as three builds it
+  // Resolved here rather than lazily on the first render, so that the grade
+  // already knows on frame ONE whether it owns the bloom add or the pass does.
+  bloomPass.folded = bloomPass._foldable();
 
   // UnrealBloomPass builds its 11 render targets with `{ type: HalfFloatType }`
   // and nothing else, and `RenderTarget`'s option default is `depthBuffer: true`
@@ -1211,13 +1501,24 @@ export function createPostFX(renderer, scene, camera) {
   // lerpBloomFactor() is the identity and these weights are what actually ships.
   // The array is only assigned in UnrealBloomPass's constructor, never in
   // render(), so overwriting it here sticks.
+  //
+  // PARAMS.bloom.mips decides how many of the five are actually built. The
+  // composite shader's NUM_MIPS is baked at 5 and always samples all five
+  // blurTextureN, so the ones above the count need BOTH a zero weight and a
+  // texture that exists: renderTargetsVertical[i] for an i this frame's loop
+  // never reached is either stale or, from boot, never allocated at all.
   const bloomFactors = bloomPass.compositeMaterial.uniforms.bloomFactors.value;
-  const applyMipWeights = () => {
-    for (let i = 0; i < bloomFactors.length; i++) {
-      bloomFactors[i] = PARAMS.bloom.mipWeights[i] ?? 0;
+  const applyBloomMips = () => {
+    const n = Math.max(1, Math.min(BLOOM_MIPS_MAX, PARAMS.bloom.mips | 0));
+    bloomPass.nMips = n;
+    const cu = bloomPass.compositeMaterial.uniforms;
+    for (let i = 0; i < BLOOM_MIPS_MAX; i++) {
+      bloomFactors[i] = i < n ? (PARAMS.bloom.mipWeights[i] ?? 0) : 0;
+      const u = cu['blurTexture' + (i + 1)];
+      if (u) u.value = i < n ? bloomPass.renderTargetsVertical[i].texture : blackTex;
     }
   };
-  applyMipWeights();
+  applyBloomMips();
 
   const dofPass = new ShaderPass(new THREE.ShaderMaterial({
     uniforms: {
@@ -1231,6 +1532,13 @@ export function createPostFX(renderer, scene, camera) {
       uFarStrength: { value: PARAMS.dof.farStrength },
       uFarBand: { value: new THREE.Vector2(PARAMS.dof.farStart, PARAMS.dof.farEnd) },
       uMaxCoC: { value: PARAMS.dof.maxCoC },
+      uFarMaxPx: { value: PARAMS.dof.farMaxPx },
+      uMinPx: { value: PARAMS.dof.minPx },
+      uCheapPx: { value: PARAMS.dof.cheapPx },
+    },
+    defines: {
+      TAPS: PARAMS.dof.taps | 0,
+      CHEAP_TAPS: PARAMS.dof.cheapTaps | 0,
     },
     vertexShader: VERT,
     fragmentShader: DOF_FRAG,
@@ -1259,6 +1567,7 @@ export function createPostFX(renderer, scene, camera) {
   const gradePass = new ShaderPass(new THREE.ShaderMaterial({
     uniforms: {
       tDiffuse: { value: null },
+      tBloom: { value: blackTex },       // swapped for the bloom composite below
       uExposure: { value: g.trim },
       uGT1: { value: new THREE.Vector4(g.P, g.a, g.m, g.l) },
       uGT2: { value: new THREE.Vector2(g.c, g.b) },
@@ -1346,6 +1655,96 @@ export function createPostFX(renderer, scene, camera) {
   let mbAmount = 0;
   let speedVig = 0;
 
+  // ---------------------------------------------------------------------------
+  // Quality tiers.
+  //
+  // What a tier may and may not touch, because three of these are protected:
+  //   * TAA STAYS ON AT EVERY TIER, and for once the cheap-looking option is the
+  //     expensive one. `engine.js` asks for `antialias: false` precisely BECAUSE
+  //     the TAA jitter is the anti-aliaser, so switching TAA off force-enables
+  //     SMAA (`smaaPass.enabled = PARAMS.smaa.enabled || !PARAMS.taa.enabled`) —
+  //     three full-res passes and 236 MB in place of one resolve. It is also
+  //     where every image-stability number in this file was measured
+  //     (feedbackStill / stillPx / stillClip against per-pixel temporal SD over
+  //     the conifer crowns), so dropping it does not lower quality by a notch, it
+  //     changes which artefacts exist. Not a tier knob.
+  //   * THE FILM PASS STAYS ON. It is the cheapest full-res pass in the chain,
+  //     its CAS sharpen is what carries perceived resolution when the adaptive
+  //     resolution controller cuts pixels — i.e. it matters MOST at the low tier
+  //     — and its output dither is the only thing standing between the sky
+  //     gradient and visible banding on an 8-bit framebuffer.
+  //   * THE GRADE PASS IS NEVER BYPASSED. It owns four rows of the measured
+  //     quality table (near-piste snow L*, sky bluest-decile B/R, cast-shadow
+  //     B−R, shadowed-rock B/R). A tier may make it cheaper — CA off drops two
+  //     of its three fetches — but it always runs.
+  //
+  // So the levers a tier actually has are: bloom (and its mip count), DOF (and
+  // where its early-outs bite), motion blur, tap counts and CA. Every value here
+  // is a PARAMS write, so a custom-settings layer can override any single one
+  // afterwards and it will be honoured — PARAMS is pushed to uniforms every
+  // frame. The 'high' row is exactly the authored defaults at the top of the
+  // file; 'ultra' is the look as it shipped before tiering.
+  const QUALITY = {
+    // Everything optional off. DOF off removes a full-res pass outright; bloom
+    // off removes the high pass, every blur and the composite (8 to 12
+    // sub-full-res passes, depending on the mip count); CA off drops the grade
+    // to a single fetch. What is left is the two TAA passes, grade and film.
+    low: {
+      bloom: { enabled: false, mips: 3 },
+      // Every row sets every key it touches, so the tiers are total and going
+      // low -> high -> low is exactly idempotent. DOF's values here only matter
+      // if a custom layer switches the pass back on over this tier.
+      dof: { enabled: false, farStrength: 0.0, taps: 8, cheapTaps: 6, farMaxPx: 1.0 },
+      motion: { enabled: false },
+      grade: { chromatic: 0.0 },
+    },
+    // Bloom back, on a three-mip pyramid. DOF back but NEAR FIELD ONLY:
+    // farStrength 0 makes rPixFromZ return 0 for everything past the focus
+    // plane, so the minPx early-out reclaims the whole distance and the pass
+    // becomes an exact copy everywhere except the few metres of foreground under
+    // the camera — which is the only defocus a viewer can actually see. This is
+    // the cheapest DOF that is still DOF.
+    medium: {
+      bloom: { enabled: true, mips: 3 },
+      dof: { enabled: true, farStrength: 0.0, taps: 12, cheapTaps: 8, farMaxPx: 1.0 },
+      motion: { enabled: true },
+      grade: { chromatic: 0.16 },
+    },
+    // Default. The authored look, with the far CoC capped at 2.0 device px so
+    // the far field takes the 9-fetch ring instead of the 42-fetch gather. At
+    // DPR 1 (1600x900, which is what shoot.mjs captures and what the quality
+    // table is measured on) the far ceiling is 1.02 px, already under the cap
+    // and under cheapPx, so this tier and 'ultra' are the same image there.
+    high: {
+      bloom: { enabled: true, mips: 4 },
+      dof: { enabled: true, farStrength: 0.34, taps: 20, cheapTaps: 8, farMaxPx: 2.0 },
+      motion: { enabled: true },
+      grade: { chromatic: 0.16 },
+    },
+    // Uncapped far CoC and the full five-mip pyramid: the chain as it shipped
+    // before any of this. Keep this row honest — it is the reference arm for any
+    // A/B of the tiering itself.
+    ultra: {
+      bloom: { enabled: true, mips: 5 },
+      dof: { enabled: true, farStrength: 0.34, taps: 20, cheapTaps: 8, farMaxPx: 1e9 },
+      motion: { enabled: true },
+      grade: { chromatic: 0.16 },
+    },
+  };
+  let quality = 'high';
+
+  // Recompiling costs a frame, so only touch `defines` when a value moved. This
+  // is what makes setQuality safe to call every frame if someone wants to.
+  const applyDofDefines = () => {
+    const d = dofPass.material.defines;
+    const taps = Math.max(2, PARAMS.dof.taps | 0);
+    const cheap = Math.max(2, PARAMS.dof.cheapTaps | 0);
+    if (d.TAPS === taps && d.CHEAP_TAPS === cheap) return;
+    d.TAPS = taps;
+    d.CHEAP_TAPS = cheap;
+    dofPass.material.needsUpdate = true;
+  };
+
   const api = {
     enabled: true,
     params: PARAMS,
@@ -1363,10 +1762,49 @@ export function createPostFX(renderer, scene, camera) {
       filmPass.uniforms.uTexel.value.set(1 / W, 1 / H);
       cocScale = H / 900;
       dofPass.uniforms.uMaxCoC.value = PARAMS.dof.maxCoC * cocScale;
+      // Size ALL five bloom mips, not just the ones this tier builds:
+      // UnrealBloomPass.setSize() only walks `nMips`, and a mip that is later
+      // switched back on by setQuality would otherwise still be at whatever
+      // resolution it was created with.
+      const mips = bloomPass.nMips;
+      bloomPass.nMips = BLOOM_MIPS_MAX;
       bloomPass.setSize(W, H);
+      bloomPass.nMips = mips;
       taaPass.setSize(W, H);
       havePrev = false;
     },
+
+    /**
+     * Apply a quality preset: 'low' | 'medium' | 'high' | 'ultra'.
+     *
+     * Safe to call at runtime, repeatedly, and idempotent — it writes a fixed set
+     * of PARAMS values and only recompiles when a #define actually moved. An
+     * unknown tier is ignored (with a warning) rather than throwing, because the
+     * caller is a settings UI. PARAMS stays writable afterwards: call this first,
+     * then apply any per-knob custom overrides on top.
+     */
+    setQuality(tier) {
+      const preset = QUALITY[tier];
+      if (!preset) {
+        console.warn(`[postfx] setQuality: unknown tier "${tier}" — `
+          + `expected one of ${Object.keys(QUALITY).join(', ')}`);
+        return quality;
+      }
+      quality = tier;
+      for (const group of Object.keys(preset)) {
+        Object.assign(PARAMS[group], preset[group]);
+      }
+      // Everything else is pushed from PARAMS every frame by render(); these two
+      // are not, because one is a shader recompile and the other rebinds
+      // samplers, so neither belongs in the per-frame path.
+      applyDofDefines();
+      applyBloomMips();
+      dofPass.enabled = PARAMS.dof.enabled;
+      return quality;
+    },
+
+    /** The tier last applied by setQuality (PARAMS may have been edited since). */
+    getQuality() { return quality; },
 
     /** Drives focus pull, motion blur and the speed vignette from the sim. */
     update(dt, state) {
@@ -1502,6 +1940,14 @@ export function createPostFX(renderer, scene, camera) {
       dofPass.uniforms.uFarStrength.value = PARAMS.dof.farStrength;
       dofPass.uniforms.uFarBand.value.set(PARAMS.dof.farStart, PARAMS.dof.farEnd);
       dofPass.uniforms.uNearFar.value.set(camera.near, camera.far);
+      dofPass.uniforms.uFarMaxPx.value = PARAMS.dof.farMaxPx;
+      dofPass.uniforms.uMinPx.value = PARAMS.dof.minPx;
+      dofPass.uniforms.uCheapPx.value = PARAMS.dof.cheapPx;
+      // The tap counts are #defines, but they are still PARAMS values, so they
+      // are honoured from here like everything else — which also means a
+      // perf-ab arm can sweep them (`d.postfx.params.dof.taps=8`) without an
+      // edit. The equality guard inside is what keeps this from recompiling.
+      applyDofDefines();
       mbPass.uniforms.uNearFar.value.set(camera.near, camera.far);
 
       // TAA is the anti-aliaser; SMAA only comes back if TAA is switched off.
@@ -1514,7 +1960,7 @@ export function createPostFX(renderer, scene, camera) {
       bloomPass.threshold = PARAMS.bloom.threshold;
       bloomPass.highPassUniforms.smoothWidth.value = PARAMS.bloom.knee;
       bloomPass.highPassUniforms.uClamp.value = PARAMS.bloom.clamp;
-      applyMipWeights();
+      applyBloomMips();
 
       // Push the whole grade every frame so PARAMS stays live-tuneable.
       const gp = PARAMS.grade, gu = gradePass.uniforms;
@@ -1566,6 +2012,16 @@ export function createPostFX(renderer, scene, camera) {
         filmPass.enabled = false;
       }
 
+      // Hand the bloom composite to the grade, which adds it (see GRADE_FRAG,
+      // tBloom). Set after the ablation block above, so that when bloom is off —
+      // a tier, or `api.enabled = false` — this goes to black rather than to a
+      // stale composite left in the target by the last enabled frame. If the
+      // fold ever falls back to UnrealBloomPass' own render(), the blend step has
+      // already added the bloom into the frame, so tBloom must stay black there
+      // as well or it would land twice.
+      gradePass.uniforms.tBloom.value =
+        (bloomPass.enabled && bloomPass.folded) ? bloomPass.outputTexture : blackTex;
+
       composer.render(dt);
 
       prevVP.copy(currVP);
@@ -1578,6 +2034,7 @@ export function createPostFX(renderer, scene, camera) {
       composer.dispose();
       taaPass.dispose();
       blitPass.dispose();
+      blackTex.dispose();
     },
   };
 
