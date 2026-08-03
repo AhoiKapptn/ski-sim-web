@@ -255,7 +255,8 @@ export function createSettingsUI(settings, { onOpen, onClose } = {}) {
       <div class="body"></div>
       <div class="hint"></div>
       <div class="keys"><span><em>↑↓</em> move</span><span><em>←→</em> adjust</span
-        ><span><em>↵</em> toggle</span><span><em>Esc</em> close</span></div>
+        ><span><em>↵</em> toggle</span><span><em>Esc</em> / <em>O</em> close</span
+        ><span><em>?gfx=default</em> ignore saved</span></div>
     </div>`;
   doc.body.appendChild(root);
 

@@ -85,9 +85,11 @@
  * ---------------------------------------------------------------------------
  * REJECTED KNOBS — do not add these back without re-reading the code
  * ---------------------------------------------------------------------------
- * All four were on the list of "verified working" knobs handed to this file.
- * Three of them are look-only and one CRASHES. Written down so the next person
- * does not have to find out the same way.
+ * Every one of these was on the list of "verified working" knobs handed to this
+ * file. One CRASHES, two would trade a documented quality baseline for an
+ * unmeasured saving, one saves nothing and breaks the chairlift, and one is
+ * gameplay geometry. Written down so the next person does not have to find out
+ * the same way.
  *
  *  - **`scatter.riders.length = N`. This crashes.** `seedRiders()`
  *    (scatter.js:5973) iterates `for (let i = 0; i < RIDERS; i++)` against the
@@ -472,7 +474,12 @@ const REGISTRY = [
     // against 3.6-8.3 ms for the ENTIRE rest of the scene. No post pass, no
     // shadow pass and no CPU subsystem is measurable against it.
     id: 'terrainShader', group: 'world', label: 'Snow shader', type: 'enum',
-    cost: 'gpu',
+    // The tier is part of `customProgramCacheKey`, so switching it costs one
+    // shader link for the main material and one for each depth material — a
+    // visible hitch. `snow-material.js` says so in as many words: "this is a
+    // settings-menu action, not something to drive from a frame loop". Marking it
+    // is what puts the warning in front of the player before they drag it.
+    cost: 'gpu', hitch: true,
     // FOUR tiers, matching the names `postfx.setQuality` and
     // `terrain.setMeshQuality` already use. This list and the PRESETS table have
     // to agree: `coerce` validates an enum against these options and silently
@@ -1318,6 +1325,7 @@ export function createGraphicsSettings(subsystems = {}) {
       adaptiveEvents: g ? g.adaptiveEvents : null,
       rscalePinned: g ? g.rscalePinned : false,
       frozen: g ? g.frozen : false,
+      simPaused: g ? !!g.simPaused : false,
       // pacing — RUNGS, never fps. See CLAUDE.md trap 8.
       displayTick: tick || null,
       displayHz: g ? g.displayHz : null,
@@ -1392,11 +1400,16 @@ export function createGraphicsSettings(subsystems = {}) {
     }
     if (i.frame) {
       const r = i.frame.rung;
-      push('Last window', i.frame.p70.toFixed(1) + ' ms',
-        !r ? ''
-          : i.frame.between
-            ? 'BETWEEN RUNGS — ' + Math.round(i.frame.lateFrac * 100) + '% of frames a whole tick late'
-            : 'locked on rung ' + r.k + ' (' + r.at.toFixed(1) + ' ms)');
+      let note = !r ? ''
+        : i.frame.between
+          ? 'BETWEEN RUNGS — ' + Math.round(i.frame.lateFrac * 100) + '% of frames a whole tick late'
+          : 'locked on rung ' + r.k + ' (' + r.at.toFixed(1) + ' ms)';
+      // Opening this panel pauses the simulation, and a paused frame is not a
+      // gameplay frame — engine.js' controller stops sampling, so this is the
+      // last window measured BEFORE the panel went up. Saying so is the whole
+      // difference between a stale number and a lie.
+      if (i.simPaused || i.frozen) note += (note ? ' · ' : '') + 'measured before the sim was paused';
+      push('Last window', i.frame.p70.toFixed(1) + ' ms', note);
     } else {
       push('Last window', 'not sampled',
         'the resolution controller is the only frame-time source here, and it is not running');
@@ -1489,12 +1502,144 @@ export function createGraphicsSettings(subsystems = {}) {
     return set(id, snap(v + dir * (d.step || 0.01), d));
   }
 
+  // --- the auto-tuner ------------------------------------------------------
+  /**
+   * WHY THIS EXISTS. `engine.js`' resolution controller is the only adaptive
+   * thing in the build, and it has exactly one lever: pixels. Measured on the
+   * owner's 5K panel (2560x1440 at DPR 2 = 14.75 Mpx), that lever ran out — the
+   * ladder reached its floor and the frame STILL missed the rung. A controller at
+   * its floor with `meeting: false` is a controller telling you it has nothing
+   * left to spend, and before this it just sat there.
+   *
+   * The measured shape of the fix, per-preset at 14.75 Mpx, p50 / % of frames
+   * sitting on the rung / frames over 33 ms:
+   *
+   *     auto (shipped defaults)  2.36 Mpx  16.90  63%   31/587
+   *     high                     2.36 Mpx  16.70  71%   20/613
+   *     medium                   2.98 Mpx  16.70  94%    1/697
+   *     low                      3.69 Mpx  16.70  100%   0/719
+   *
+   * Read the resolution column: the LOWER quality tiers end up rendering MORE
+   * pixels, because cheaper pixels are pixels the resolution controller can
+   * afford to keep. Quality tier and resolution are not two ways to spend the
+   * same budget — spending on the tier BUYS resolution. That is the whole reason
+   * a quality ladder belongs underneath the resolution ladder rather than beside
+   * it.
+   *
+   * So: while the preset is `auto`, if the resolution controller reports itself
+   * pinned at its floor and still not meeting the rung, step the quality ladder
+   * down one rung and let the controller climb back. One-way and hysteretic.
+   *
+   * WHY IT CANNOT DISTURB A MEASUREMENT OR A CAPTURE:
+   *   - it only runs while the preset is `auto`;
+   *   - it refuses while `perf.recording`, while `gfx.frozen`, and while the sim
+   *     is paused — and `__setAuto(false)` is how every capture tool in tools/
+   *     starts, within ~1.2 s of boot;
+   *   - it needs CONSECUTIVE_DISTRESS windows of sustained distress spread over
+   *     several seconds before it acts, which no capture session lasts in an
+   *     unpaused state.
+   *   Net effect: it is inert in every tool, and `auto` stays the empty patch
+   *   until a real player is really missing frames.
+   *
+   * ONE-WAY, deliberately. Stepping back up needs a cost signal this build does
+   * not have: the presented interval is quantised, so "comfortable" at a locked
+   * 16.67 ms is indistinguishable from "3 ms of headroom" (trap 5's whole
+   * argument). Guessing upward would hunt, and every hop costs a shader relink
+   * plus a clipmap rebuild — far more visible than the resolution controller's
+   * render-target churn. A player who wants the quality back picks a preset.
+   */
+  const AUTO_LADDER = ['high', 'medium', 'low'];   // steps taken, in order
+  const AUTO_CHECK_MS = 2500;
+  const CONSECUTIVE_DISTRESS = 3;                  // ~7.5 s before acting
+  let autoStep = -1;                               // index into AUTO_LADDER
+  let distress = 0;
+  let autoTimer = null;
+
+  /** Is the resolution controller out of road? Its own report, not our guess. */
+  function controllerStuck() {
+    if (!isFn(S.gfx, 'info')) return false;
+    const g = S.gfx.info();
+    if (!g.adaptive || g.frozen || g.simPaused) return false;
+    const d = g.lastDecision;
+    if (!d) return false;
+    // `atFloor` means the ladder has no deeper rung it is allowed to take.
+    // `meeting` false means the frame is over the rung it aims at. `lateFrac`
+    // catches the judder case the percentile test cannot see: a rung whose true
+    // cost sits between two ticks presents as an alternating mix, so p30 reads
+    // under and p70 reads over and the controller parks there.
+    return !!d.atFloor && (d.meeting === false || d.lateFrac > 0.25);
+  }
+
+  function autoTick() {
+    if (preset !== 'auto' || recording()) { distress = 0; return; }
+    if (autoStep >= AUTO_LADDER.length - 1) return;      // already at the bottom
+    if (!controllerStuck()) { distress = 0; return; }
+    if (++distress < CONSECUTIVE_DISTRESS) return;
+    distress = 0;
+    const next = AUTO_LADDER[++autoStep];
+    // Apply the preset's knobs but KEEP the preset named `auto`, so the panel
+    // still reads "Auto" and a later `setPreset('auto')` is a real reset. The
+    // player asked the game to look after itself; this is it doing that.
+    const pv = presetValues(next);
+    for (const d of REGISTRY) {
+      if (d.presetInvariant || overriddenBy(d)) continue;
+      // NEVER take the preset's RESOLUTION knobs. This is the whole correctness
+      // condition of the tuner and it is not obvious: `resolution` is a FLOOR
+      // (`gfx.setMinResolutionScale`), so applying `high`'s 0.8 forces the
+      // controller UP to 9.44 Mpx on a machine that just told us it could not
+      // afford 2.36. Measured, when this filter was missing: stepping to `high`
+      // took the backbuffer 2.36 -> 7.22 Mpx and the frame to p50 33.20 ms with
+      // 155 of 305 frames over 33 — far worse than the distress it was reacting
+      // to, for the ~10 s the controller needed to climb back down. Each step
+      // did it again.
+      //
+      // The division of labour is the point: the resolution controller owns HOW
+      // MANY pixels, and it is already at its floor. The tuner's only job is to
+      // make each pixel CHEAPER so that floor becomes affordable — and, as the
+      // per-preset table above shows, so the controller can then climb.
+      if (d.group === 'res') continue;
+      if (pv[d.id] !== undefined) values[d.id] = pv[d.id];
+    }
+    const frozen = isFn(S.gfx, 'freeze');
+    if (frozen) S.gfx.freeze();
+    try {
+      for (const pass of [0, 1, 2]) {
+        for (const d of REGISTRY) {
+          if (phaseOf(d) !== pass) continue;
+          const v = valueOf(d.id);
+          if (applied[d.id] === v) continue;
+          applyOne(d, v);
+        }
+      }
+    } finally { if (frozen && isFn(S.gfx, 'unfreeze')) S.gfx.unfreeze(); }
+    persist();
+    // Loud on purpose: a silent quality drop is indistinguishable from a bug,
+    // and this is exactly the kind of thing that gets reported as one.
+    console.info(`[gfx] auto: the resolution controller is pinned at its floor and still `
+      + `missing the rung — stepping quality down to "${next}". Pick a preset in the `
+      + `graphics panel (Escape) to override.`);
+  }
+
+  /** The tier `auto` has descended to, or null if it has not had to. */
+  function autoState() {
+    return { stepped: autoStep >= 0 ? AUTO_LADDER[autoStep] : null, distress };
+  }
+
   // --- boot ---------------------------------------------------------------
   load();
   // Applying at construction is safe and is what the lead wires: with no stored
   // document this writes NOTHING (see `applied`), so a capture tool's page is
   // the shipped build.
   applyAll();
+  try {
+    if (typeof setInterval === 'function') {
+      autoTimer = setInterval(autoTick, AUTO_CHECK_MS);
+      // Node keeps its event loop alive for a pending timer, so an unref'd
+      // handle is the difference between "a probe imports this module" and "a
+      // probe imports this module and never exits". Browsers have no unref.
+      if (autoTimer && typeof autoTimer.unref === 'function') autoTimer.unref();
+    }
+  } catch (e) { /* non-browser host; the tuner is optional */ }
 
   const api = {
     // --- the contract ------------------------------------------------------
@@ -1520,6 +1665,14 @@ export function createGraphicsSettings(subsystems = {}) {
     storageBypassed: bypassStore,
     /** Which query parameters are currently overriding a knob, for the footer. */
     overrides: () => REGISTRY.map((d) => ({ id: d.id, by: overriddenBy(d) })).filter((x) => x.by),
+
+    // --- the auto-tuner ----------------------------------------------------
+    /** What `auto` has had to do, for a readout and for tests. */
+    autoState,
+    /** Run one tuner check immediately. Tests only — normally on a timer. */
+    autoTick,
+    /** Stop the tuner. Call from a tool that wants a guaranteed-static config. */
+    stopAutoTune() { if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } },
   };
   return api;
 }

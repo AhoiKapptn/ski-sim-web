@@ -191,6 +191,21 @@ Dispatch on `typeof third === 'number'`.
 | `fx/postfx.js` | `createPostFX(renderer, scene, camera)` | bloom, DOF, motion blur, grade, grain, vignette |
 | `audio/audio.js` | `createAudio()` | procedural WebAudio: carve, wind, impacts. No audio files |
 | `ui/hud.js` | `createHUD()` | speed, air time, run stats. Diegetic, restrained |
+| `core/graphics-settings.js` | `createGraphicsSettings(subsystems)` | the quality MODEL: knob registry, presets, localStorage. No DOM |
+| `ui/settings.js` | `createSettingsUI(settings, {onOpen, onClose})` | the quality PANEL (Escape). No knowledge of what a knob means |
+
+The settings split is deliberate: the model must be usable from a probe with no
+DOM, and the panel must not accumulate subsystem knowledge. Every subsystem and
+every method on it is **feature-detected** — the model was written against APIs
+that did not exist yet and must keep working when one is missing, reporting the
+knob as unavailable-with-a-reason rather than hiding it. A knob that silently
+disappears is indistinguishable from one that never existed.
+
+The quality entry points a subsystem is expected to offer, all optional:
+`postfx.setQuality()`, `terrain.setMeshQuality()`, `terrain.setShaderQuality()`,
+`terrain.setShadowRings()`, `sky.setShadowQuality()`. See CLAUDE.md's graphics
+settings section for the program-cache-key hazard that makes a shader tier
+silently no-op if you add one carelessly.
 
 ### The placement seam
 

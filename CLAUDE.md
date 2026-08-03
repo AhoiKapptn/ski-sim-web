@@ -10,7 +10,11 @@ Third-person ski simulator in Three.js r185. **`three` is the only dependency an
 almost nothing is a binary asset** — every mesh, texture, shader and sound is
 generated in code. That constraint is deliberate; do not add a dependency or
 download an asset to solve a problem. Anything under `three/addons/` is fair game.
-Runs at 1600×900, ~60 fps.
+Runs at whatever the window is; `1600×900` is only the capture tools' default and
+**is not the resolution the game is played at** — see trap 5 and trap 8. On the
+owner's 5K panel a maximised window is a 14.75 Mpx backbuffer. There is an
+adaptive resolution controller (`engine.js`) and a graphics settings panel
+(Escape) between that and a playable frame.
 
 The **one** exception, granted by the owner for those files alone, is
 `public/brand/*.png`: two real sponsor logos loaded by `world/branding.js`. A
@@ -49,7 +53,7 @@ ffmpeg -y -i shots/x/hero.png -vf "crop=340:360:1180:110,scale=1020:1080:flags=n
 ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=lavfi.signalstats.YAVG" -f null -
 ```
 
-## Measurement traps — all eight produced confident, wrong answers
+## Measurement traps — all eleven produced confident, wrong answers
 
 1. **`--perf` absolute numbers are meaningless.** Headless Chrome mode-locks to
    divisions of the refresh rate by machine load. The *same unmodified build* has
@@ -124,8 +128,16 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
 6. **`renderer.info.render.calls` reads `1` unless you force `autoReset = false`.**
    three resets `info` at the top of *every* `renderer.render()`, and the post
    chain makes a dozen per frame, so the naive read reports the last fullscreen
-   quad. True figure is **531 draw calls/frame** on the snow (527 before the slope branding went from four objects to nine) and **222 inside the hut**. Anyone who profiles draw calls
-   without knowing this concludes the scene is trivially cheap.
+   quad. True figure is **532 draw calls/frame** on the snow and **222 inside the hut**.
+   Anyone who profiles draw calls without knowing this concludes the scene is
+   trivially cheap.
+
+   **And the 531/532 figure is the WHOLE FRAME, not the main pass: 321 of the 532
+   (60%) are shadow-pass calls, and 351 of them (66%) are the SKIER**, whose rig
+   is 117 draw units for 61,700 triangles — 1.4% of the frame's geometry — set to
+   `castShadow` on all 105 meshes, so it pays 117 x 2 again in the two cascades. A
+   merged low-poly shadow proxy would delete ~230 calls at 16 cm and 1.4 cm texels
+   where nothing can resolve the difference. Not done; measured and available.
 7. **The GPU timer's absolute value is ~2.5× reality.**
    `EXT_disjoint_timer_query_webgl2` works on this ANGLE/Metal path, but ANGLE
    derives it from command-buffer timestamps that include queue and scheduling
@@ -152,6 +164,16 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
    is quantised to multiples of the refresh period, so the only frame times that
    exist there are 6.9 / 13.9 / 20.8 / 27.8 ms. **16.67 ms is not one of them.**
 
+   **THE MACHINE, since every threshold here depends on it (recorded 2026-08-03):**
+   Apple **M5 Pro**, 20-core GPU. Two panels — the built-in Liquid Retina XDR
+   (3456x2234, 120 Hz ProMotion) and a **DELL U3223QE 5K running 2560x1440
+   logical at 60 Hz**. On the Dell, maximised at DPR 2, the backbuffer is
+   **14.75 Mpx** and the ONLY presentable frame times are 16.67 and 33.33 ms.
+   That is the target to measure against, not 1600x900 and not 5.76 Mpx.
+   Headless Chrome reports a 120 Hz tick (8.33 ms), so its rungs are not the
+   Dell's — a frame that headless shows as a clean 24.96 ms lock is a 33.33 ms
+   frame on the display the game is played on.
+
    Two consequences, both of which produced wrong answers in one session:
 
    - A frame at 23.5 ms is not "42 fps". It is the 20.8 and 27.8 rungs
@@ -172,6 +194,68 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
    observed levels. And on a high-refresh panel the fps target is a real choice:
    60 forces the 13.9 ms rung and a low resolution, `?fpstarget=48` takes the
    20.8 ms rung and buys the pixels back for a lock that is just as smooth.
+
+9. **Two vite-based tools running at once corrupt each other, and the symptom
+   names an innocent file.** They share `node_modules/.vite`, and when they
+   clobber each other's dep cache the page throws
+   `SyntaxError: Unexpected identifier '<some export name>'` pointing at a module
+   nobody edited. It wrecked three measurement runs in one session and sent two
+   of us chasing a phantom bug in our own work. **Serialise every tool that
+   spawns vite** — `shoot.mjs`, `frametime.mjs`, `perf-ab.mjs`, all of them.
+
+   The corollary bit harder: **a vite dev server watches the source tree, so
+   anything editing a file mid-run triggers a full page reload** and the harness
+   dies with `Cannot read properties of undefined` on whatever the tool had
+   installed on `window`. Adding a NEW module to the import graph also costs a
+   one-time dep re-optimisation reload. If a measurement dies that way, wait for
+   the tree to go quiet and re-run; do not average the corpse in.
+
+   And do not let this trap absorb real errors. A genuine syntax error looks
+   almost identical from the page's point of view — check with
+   `npx esbuild <file> --outfile=/dev/null` before blaming the cache.
+
+11. **A stale graphics preset in `localStorage` silently changes every
+    screenshot.** The settings panel persists to `alpine.gfx.v1`, and every
+    capture tool boots the real page. A profile left on `low` would quietly
+    change the mesh tier, the post chain and the shader tier under a quality
+    measurement, with no indication in the output. Two defences, both already in
+    place: `auto` is the empty patch and writes nothing, and **`?gfx=default`
+    ignores the stored document entirely.** Use `?gfx=default` in any tool whose
+    result must be independent of the profile. `settings.storageBypassed` reports
+    whether it is in force.
+
+10. **A backtick inside a GLSL string silently terminates the JS template
+    literal.** Every shader in this project lives in a `` /* glsl */ `...` ``
+    template literal, so writing `` `sky.js` `` in a GLSL *comment* ends the
+    string and produces a syntax error pointing at the next identifier — far from
+    the real site, and utterly baffling. This cost four separate cycles in one
+    session across two people. **Write GLSL comments with no backticks**, and run
+    `npx esbuild <file> --outfile=/dev/null` after every shader edit: it is
+    instant and it names the line.
+
+## The tools, and which question each answers
+
+```bash
+node tools/perf-baseline.mjs --w 2560 --h 1440 --dpr 2   # the cost CURVE on a real display
+node tools/floor-probe.mjs   --w 2560 --h 1440 --dpr 2   # is this cost fragment, or fixed?
+node tools/tier-shots.mjs --out shots/t --only ridge     # every quality tier, ONE session
+```
+
+- **`perf-baseline.mjs`** answers the question nobody had asked at the right pixel
+  count: what does the frame cost across the ladder on THIS display, and where
+  does the shipped controller actually land? Phase A watches the controller LIVE
+  (sampling rAF directly, because `perf.start()` freezes it and freezing it
+  measures something no player sees); phase B pins each rung.
+- **`floor-probe.mjs`** classifies a cost. It runs the same ablation at two
+  resolutions: a fragment cost scales with the pixel count, a vertex/submit/CPU
+  cost does not, so the RATIO of the two deltas tells you which you have without
+  either absolute reading having to be trusted. **Pick two UNCENSORED
+  resolutions** — the first run of this used 2.36 Mpx, which is pinned to a vsync
+  rung, and every ablation read exactly 0.00 ms because the frame could not go
+  faster. A censored arm cannot measure anything.
+- **`tier-shots.mjs`** captures every tier inside one session with the sim frozen
+  and TAA off, because cross-session captures here are not comparable (up to
+  17.8 dB PSNR between two runs of the same build).
 
 `--perf` is a **stationary player at DPR 1**. It is structurally blind to
 motion-dependent cost and to fragment cost. Use `tools/frametime.mjs` (what is
@@ -207,10 +291,61 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 | Conifers as bare poles with floating cards | Foliage generation | LOD1 band starts at 34 m but carried only ~9% of LOD0's foliage |
 | Trees flicker | LOD churn, ring rebuild, mip/alpha-test coverage, billboard flipping — all four eliminated by measurement | **The TAA resolve.** Freeze the sim completely (no wind, no dither, no camera) and accumulate per-pixel temporal SD over the crowns: **6.95 codes shipped, 0.013 with TAA off.** The render was exactly static; the resolve was not. Raising feedback alone fixes a third of it, because the variance box that clips the history is itself built from the jittered current frame |
 | Park kickers read as bumps and launch you late | Two separate defects | **One defect.** The takeoff ramp peaked at **+7.7°** where a park kicker is 25–35°. Too shallow to read as built *and* too shallow to unload the skis — the rider separated 5.3 m past the lip. Raising the ramp fixed both |
-| "The performance is lagging a bit" | CPU cost, the post chain, draw calls, shadow maps, or the 527-call scene being too complex | **Fragment cost at DPR 2, and almost all of it one shader.** CPU is 0.4 ms update + 1.1 ms submit out of a 34 ms frame. Ablating every scene material returns the interval to the 16.70 ms vsync lock; the terrain snow shader alone is **well over half** of scene shading cost — **≥14.4 ms (censored by the vsync floor) against 3.6–8.3 ms for the entire rest of the scene**, measured with complement arms, 2/2 pairs. No post pass, no shadow pass and no CPU subsystem is measurable against it. The lever is pixels, not passes |
+| "The performance is lagging a bit" | CPU cost, the post chain, draw calls, shadow maps, or the 527-call scene being too complex | **Fragment cost at DPR 2, and almost all of it one shader.** CPU is 0.4 ms update + 1.1 ms submit out of a 34 ms frame. Ablating every scene material returns the interval to the 16.70 ms vsync lock; the terrain snow shader alone is **well over half** of scene shading cost — **≥14.4 ms (censored by the vsync floor) against 3.6–8.3 ms for the entire rest of the scene**, measured with complement arms, 2/2 pairs. No post pass, no shadow pass and no CPU subsystem is measurable against it. The lever is pixels, not passes — **but see the row below: that is the lever for the SLOPE, and it cannot reach the intercept** |
+| "The performance is not good" — at a REAL fullscreen backbuffer, with the resolution ladder already at its floor | The subsystems; or resolution, again | **Pixels had already been spent, and there was nothing left to spend.** At 2560x1440 DPR 2 = 14.75 Mpx the ladder bottomed out at scale 0.4 (2.36 Mpx, 16% of native) and still missed: settled p50 24.9 ms, 268/519 frames over 20 ms, 36 over 33. The frame is `~2.5 ms/Mpx on a ~8.7 ms floor`, and the floor is what a resolution controller structurally cannot touch. What fixed it was making the per-pixel cost cheaper (one lattice fetch instead of four; terms that were multiplied by zero; DOF gathering 42 fetches over the whole sky) and deleting a clipmap ring that could never draw a pixel. Result: settled p50 **16.70 ms locked, 0/459 frames over 33** |
 | "The hut UI experience is weak" | The card's typography, the seated framing, or the lighting | **The room.** `buildings[0]`'s `w`/`d` are HALF-extents, so the enterable hall is **16.2 x 23.2 m — 374 m of floor — and it had two tables in it.** The seated shot was always fine; the moment the player used the look-around the file's own docstring advertises, it was a hangar with a stove in it. Nothing about the card was the problem until the room behind it was a room |
 | "Performance is an issue" and **no subsystem ablation changes anything** | Some subsystem is heavy; or the renderer is not the pacer at all | **The panel is 144 Hz and the frame sat BETWEEN vsync rungs.** The scene really was the cost (15.3 ms of a 23.5 ms frame, floor 8.2), so the ablations were aimed correctly — but no single one of them moved the frame across a rung, and only crossing a rung is visible. Underneath it, the controller was aiming at 16.67 ms, which is not a frame time a 144 Hz display can present. Found by measuring the FLOOR (empty scene, no sim, 25% resolution) against the shipped frame; `pnpm dev` → `` ` `` → `D` |
 | A solid object in the hut appears to hang in mid-air | Its Y coordinate; then the camera's depression angle | **Inside-out winding.** See the interface hazard below — you were seeing the box's interior floor. Two of the three diagnoses in this row were made and acted on before anyone magnified the crop |
+
+## Graphics settings — and what they mean for measurement
+
+`src/core/graphics-settings.js` (model: knob registry, presets, localStorage) and
+`src/ui/settings.js` (panel: DOM + CSS + input, **Escape** to open). Wired in
+`main.js`, exposed as `__harness.settings` / `__harness.settingsUI`.
+
+Four things about it that matter to anyone measuring or capturing:
+
+1. **`auto` is the EMPTY patch.** Not "pick a tier for this machine" — literally
+   `{}`. Every knob sits at its shipped default and `applyAll()` writes nothing to
+   any subsystem. That is deliberate and load-bearing: it is what keeps a fresh
+   profile, and every capture tool in `tools/`, **bit-identical to a build without
+   this feature**, so the quality-baseline table stays reproducible. If `auto` ever
+   grows real behaviour, every row of that table becomes machine-dependent.
+2. **`?gfx=default` bypasses persisted settings entirely.** Use it in any tool that
+   must be immune to whatever is in the profile. A stale `low` preset in
+   localStorage would silently change screenshots, and the failure is invisible.
+3. **The panel never shows an fps counter, on purpose** (trap 8). It reports the
+   vsync rung, the ladder, and whether the frame is locked or sitting between
+   rungs. Do not add one.
+4. **`ultra` is the only preset that turns the adaptive controller OFF**, and it
+   selects the top tier of every subsystem — i.e. `ultra` is the look exactly as
+   it shipped before any of this was tiered. Measure against `ultra` when you want
+   "did I change the image", and against `auto` when you want "what does a player
+   get".
+
+The tiers themselves: `postfx.setQuality()`, `terrain.setMeshQuality()`,
+`terrain.setShaderQuality()`, `terrain.setShadowRings()`, `sky.setShadowQuality()`.
+
+**The trap that makes a shader tier silently do nothing:**
+`customProgramCacheKey` pins ONE key per material instance and three does not
+consult `material.defines` when deciding to reuse a compiled program. A tier
+change under a fixed key recompiles into the same cache slot and the OLD program
+is served, with no symptom. The tier must be part of the key — it is, for the
+depth materials too. (For plain `ShaderPass` materials with no cache key override,
+`defines` + `needsUpdate` works normally; the asymmetry is the thing to remember.)
+
+Two corrections to earlier beliefs, both verified in r185 source:
+- **`receiveShadow` is NOT in the program cache key.** `lights_pars_begin` declares
+  it as a `uniform bool` and the renderer pushes `object.receiveShadow` per
+  object, so one shared material across all clipmap rings is fine and runtime
+  changes work with no recompile. It also saves almost nothing, because
+  `USE_SHADOWMAP` is compiled in regardless — unlike `castShadow`, which removes
+  real draw calls from the depth pass.
+- **`PCFSoftShadowMap` is deprecated and has no shader path.** `WebGLShadowMap`
+  rewrites it to `PCFShadowMap` and warns; `shadowMapTypeDefines` has no entry for
+  it. `engine.js` claimed it for the whole life of the project while reading back
+  type 1. The shipped filter is r185 PCF: 5 Vogel-disk taps of a `sampler2DShadow`,
+  IGN-rotated per pixel.
 
 ## Interface hazards
 
@@ -287,12 +422,29 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
   "Swap the material for a cheap one" measures fragment *and* an unknown amount of
   vertex cost, because the varyings the vertex shader wrote are now unreferenced.
   It therefore cannot **in principle** answer a tessellation question. So
-  `LEVEL_RES = 512` on the outer three clipmap rings (1.28 M of 2.63 M triangles,
-  originally justified with a DPR-1 fps number, which traps 1 and 5 both
-  invalidate) is **unanswerable by material ablation** and needs a geometry A/B:
+  `LEVEL_RES` on the outer clipmap rings was **unanswerable by material ablation**
+  and needed a geometry A/B:
   two builds with different `LEVEL_RES`. Separate fragment from vertex cost by
   sweeping resolution with the subsystem gutted — fragment cost scales with
   pixels, vertex cost does not.
+
+  **ANSWERED, 2026-08-03, and the answer was "no".** An interleaved A/B of rings
+  7+8 at DPR 2 — 802,816 triangles, 404,480 vertices — came out **not resolvable**
+  (median 0.6 ms, sign consistency 6/10). The outer rings were a *waste* problem,
+  not the fixed-cost lever they were suspected to be. What they actually were:
+  **ring 8 could never draw a pixel at all** (near edge 13,107 m against
+  `camera.far` 12,000, `frustumCulled = false`), which is 401,408 triangles of
+  guaranteed nothing, now deleted with a module-load assertion tying the ring
+  count to the far plane. `LEVEL_RES` is a quality tier (`MESH_TIERS`,
+  `terrain.setMeshQuality()`); the clipmap is **1.19 M triangles at ultra**, down
+  from 1.65 M.
+
+  Two numbers in the old text were wrong and are worth flagging because they were
+  quoted repeatedly: **2.63 M was the whole MAIN PASS, not the clipmap** (the
+  clipmap was 1.65 M), and hiding rings *6*,7,8 is not the same experiment as
+  hiding 7,8 — ring 6 paints 180–330 k pixels and its saving is fragment cost. I
+  conflated those two and briefly believed there were 7 ms of outer-ring vertex
+  cost. There were not.
 - **`engine.js`' adaptive resolution controller must be frozen during any
   measurement.** `gfx.freeze()`/`unfreeze()` bracket a window; `perf.recording`
   freezes it too, but a tool's *settle* window runs before `perf.start()`, and a
@@ -322,7 +474,7 @@ before applying it to a `--dpr 2` capture (trap 4).
 | Distant conifer band RGB | (43,58,68) | `trees` — **unrecorded** | real Megève (40,55,72) |
 | Cast-shadow snow B−R | +21 to +26 | `hero` — **unrecorded** | real photos +24 to +26 |
 | Shadowed rock B/R | ≥ 1.58 | `ridge` — **unrecorded** | trades against a blue cast — see below |
-| Sky bluest-decile B/R | 2.63–3.50 | `hero`, bluest decile by B/R — **unrecorded** | photos 2.07–3.68, Steep 2.17 |
+| Sky bluest-decile B/R | 2.63–3.50 **— DISPUTED, see below** | `hero`, bluest decile by B/R — **unrecorded** | photos 2.07–3.68, Steep 2.17 |
 | Carve edge ÷ inclination | 1.23, angulation 25–33° | `closeup` — **unrecorded** | reviewed as better than either game reference |
 
 The near-piste sd is restated from the original **12.6 to 10.6** (DPR 1; it reads
@@ -335,6 +487,30 @@ on that rectangle, i.e. the sd is unmoved and the mean is the higher of the two
 independent readings already recorded.
 **If you fill in one of the unrecorded rows, restate its value from the same
 measurement rather than assuming the old number still describes this build.**
+
+**The near-piste row now has a reproducible method, and it holds.** CIE L\* (not
+ffmpeg's `signalstats` luma, which is a different quantity and will not match this
+table), over `hero crop=300:120:400:600` at DPR 1, asserting the PNG is 1600 wide
+first. Measured 2026-08-03 across the performance pass: **74.04 L\* / sd 10.54**,
+against **74.11 / 10.50** on a worktree at the commit before it. Unmoved.
+
+**The sky bluest-decile row is DISPUTED and the number is probably the method.**
+Read as "bluest decile of B/R over the whole frame, pixels with R > 8", `hero` at
+DPR 1 measures **2.19** — outside the documented 2.63–3.50 band but inside the
+photo range. Crucially it measures **2.191 before a change set and 2.195 after**,
+i.e. the shortfall is pre-existing and no change caused it. Either the row was
+recorded from a different selection (a sky-only crop rather than the whole frame
+would exclude blue-ish shadowed snow and read higher) or it has drifted
+unnoticed. **Do not "fix" the sky to chase 2.63 until the method is pinned down**
+— and this is the second time an unrecorded row has nearly been reported as a
+regression by someone measuring it a reasonable way. That is what the unrecorded
+rows cost.
+
+The general lesson, stated once: **to claim a metric did not regress, measure the
+SAME metric the SAME way on a worktree at the previous commit.** `git worktree add
+<dir> <ref>` plus a symlinked `node_modules` takes about a minute, and it is the
+only thing that distinguishes "my change broke this" from "this metric never read
+what the table says".
 
 Also protected: no ring/annulus artifacts and no chromatic fireflies on snow
 (verify at 8× nearest-neighbour); grooming corduroy stays fine parallel ridging at
@@ -352,7 +528,38 @@ Also protected: no ring/annulus artifacts and no chromatic fireflies on snow
 3. `ridge` is the weakest framing — rock still bluer and busier than reference.
    The knob is `bounceHue`'s mix factor in `snow-material.js`; it trades directly
    against the shadowed-rock B/R floor.
-4. Snow-on-rock mask still dithers at pixel scale in the far field.
+4. Snow-on-rock mask still dithers at pixel scale in the far field. The far-field
+   DOF blur was partly masking this and is now capped at 2 device px, so it may
+   read slightly stronger than it used to at DPR 2.
+7. **Known-and-measured performance work left on the table**, in value order.
+   None of it is speculative — each was measured or derived during the
+   2026-08-03 pass and then not taken:
+   - **`latNoiseV` exists and is unused.** A value-only noise variant (no
+     Jacobian, ~45% cheaper per octave) is defined in `snow-material.js` but no
+     call site uses it yet. Roughly a third of the ~42 octaves a near-piste
+     fragment runs discard the gradient entirely — wind fields, gate predicates,
+     colour variation. Worth an estimated −1.0 to −1.8 ms. **Do not convert
+     `mw1`/`mw2`: they look value-only but the next line uses `.y` as a warp
+     vector.**
+   - **Per-ring shader program variants.** Rings 0–2 can never satisfy
+     `mMix = smoothstep(240, 620, dist)`, so the whole fragment refine block —
+     16 RGBA32F fetches, ~27 noise octaves, `terrCliff`, an `atan` — is dead code
+     the register allocator still budgets for. Rings 6+ can never satisfy
+     `pisteAmt`, so the entire corduroy and traffic block is dead there.
+     Compiling those out per ring band is **bit-exact**. Blocked on the shared
+     material instance (one instance across all rings) — needs a variant per band,
+     which collides with the shared-instance ablation hazard above.
+   - **The skier's shadow proxy**: 351 of 532 draw calls, see trap 6.
+   - **`terrMacro` past the baked square is provably constant.** Outside
+     ±4096 m every one of its 16 `texelFetch`es clamps to the same edge texels of
+     the −42 m taper plain, so the bicubic returns a constant with zero gradient
+     and `terrBackdrop` supplies the real surface. A radius test that skips the
+     whole reconstruction out there is **exact**, and it covers most of the outer
+     rings' vertices.
+   - **Spray submits 34,000 instances with ~433 alive** (136,000 wasted vertex
+     invocations/frame). Note the trap: instancing renders 0..n-1, so a ring
+     buffer can only ever trim the top, which averages ~50% and not 99%. Doing
+     this properly means a free list that keeps live particles compacted near 0.
 5. Spray has no lit rim or crystalline core; on some carve frames it reads as dark
    exhaust rather than snow.
 6. No displaced snow at the ski edge — corduroy runs undisturbed right up to it.
