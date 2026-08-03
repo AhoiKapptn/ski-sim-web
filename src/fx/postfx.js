@@ -1183,6 +1183,22 @@ export function createPostFX(renderer, scene, camera) {
     new THREE.Vector2(W, H), PARAMS.bloom.strength, PARAMS.bloom.radius, PARAMS.bloom.threshold);
   bloomPass.enabled = PARAMS.bloom.enabled;
 
+  // UnrealBloomPass builds its 11 render targets with `{ type: HalfFloatType }`
+  // and nothing else, and `RenderTarget`'s option default is `depthBuffer: true`
+  // — so every one of them allocates a DEPTH_COMPONENT24 renderbuffer that no
+  // bloom pass ever reads, writes or tests against. At a 5120x2880 backbuffer
+  // that is 54 MB of dead VRAM, and UnrealBloomPass's bare `renderer.clear()`
+  // (no args = colour + depth + stencil) clears them 12 times a frame.
+  //
+  // The flag lives on the render target, not on the texture, so setting it once
+  // here survives `setSize()` — which disposes and lazily recreates the
+  // attachments but keeps the RT object and its options.
+  for (const rt of [bloomPass.renderTargetBright,
+    ...bloomPass.renderTargetsHorizontal, ...bloomPass.renderTargetsVertical]) {
+    rt.depthBuffer = false;
+    rt.stencilBuffer = false;
+  }
+
   // Swap in the clamped soft-knee high pass (see BLOOM_HIGHPASS_FRAG).
   bloomPass.highPassUniforms.uClamp = { value: PARAMS.bloom.clamp };
   bloomPass.materialHighPassFilter.uniforms = bloomPass.highPassUniforms;

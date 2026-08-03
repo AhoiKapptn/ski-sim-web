@@ -55,14 +55,54 @@ export function getLattice() {
   const data = new Uint8Array(n * n);
   const rnd = mulberry32(0x5eed1);
   for (let i = 0; i < n * n; i++) data[i] = (rnd() * 256) | 0;
-  const tex = new THREE.DataTexture(data, n, n, THREE.RedFormat, THREE.UnsignedByteType);
+
+  // ---------------------------------------------------------------------------
+  // PRE-GATHERED 2x2 NEIGHBOURHOOD. Measured: the biggest single cost in this
+  // shader was not arithmetic, it was texture traffic, and it was structural.
+  // `latNoise` needs the four lattice corners around `p`, and it used to read
+  // them as four separate `texelFetch`es. Every noise octave in the game —
+  // fragment surface detail, vertex displacement, AND the shadow-pass depth
+  // material — paid 4x. A near-piste fragment runs ~42 octaves, so it issued
+  // ~168 dependent fetches to sample 42 values.
+  //
+  // So the four corners are baked into ONE RGBA texel: texel (x,y) carries
+  // (v[x,y], v[x+1,y], v[x,y+1], v[x+1,y+1]) with the same &255 wrap the shader
+  // applied itself. `latNoise` becomes a single fetch and a swizzle.
+  //
+  // This is BIT-EXACT, which is the whole reason to prefer it to any quality
+  // tier: the same bytes, read through the same UNSIGNED_BYTE normalisation
+  // (so `t.g` is byte/255 exactly as `latFetch` returned), fed to the same
+  // quintic. Nothing about the interpolant changes — which matters, because the
+  // bedding block's freedom from ring artifacts is derived from the quintic's
+  // derivative bound (see `snBedProfile` and CLAUDE.md's protected list).
+  //
+  // Cost: 64 KB -> 256 KB. Still trivially cache-resident, and the four values
+  // a fragment needs now arrive in one cache line instead of four.
+  //
+  // `data` STAYS BYTE-IDENTICAL and stays the exported plane: terrain.js:214
+  // reads it on the CPU for `Terrain.height()`, and if that diverges from the
+  // GPU displacement by even a rounding step the skier floats.
+  const packed = new Uint8Array(n * n * 4);
+  const at = (x, y) => data[((y & (n - 1)) * n) + (x & (n - 1))];
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const o = ((y * n) + x) * 4;
+      packed[o] = at(x, y);
+      packed[o + 1] = at(x + 1, y);
+      packed[o + 2] = at(x, y + 1);
+      packed[o + 3] = at(x + 1, y + 1);
+    }
+  }
+  const tex = new THREE.DataTexture(packed, n, n, THREE.RGBAFormat, THREE.UnsignedByteType);
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestFilter;
+  // The wrap is already baked into the packing, and `latNoise` masks the
+  // coordinate anyway, but keep Repeat so a stray sampler read cannot clamp.
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
   tex.generateMipmaps = false;
   tex.needsUpdate = true;
-  _lattice = { data, tex, size: n };
+  _lattice = { data, packed, tex, size: n };
   return _lattice;
 }
 
@@ -80,27 +120,38 @@ export function latticeValue(ix, iy) {
 export const GLSL_LATTICE_NOISE = /* glsl */`
 uniform sampler2D uLattice;
 
-float latFetch( ivec2 c ) {
-  return texelFetch( uLattice, c & ivec2( 255 ), 0 ).r;
-}
-
+// ONE fetch, not four. The texture carries the 2x2 neighbourhood pre-gathered
+// per texel — see getLattice() for why, and for why this is bit-exact rather
+// than an approximation. r/g/b/a are the old latFetch results for
+// (0,0), (1,0), (0,1), (1,1) in that order.
+//
 // returns ( value in 0..1, d/dx, d/dy )
 vec3 latNoise( vec2 p ) {
   vec2 i = floor( p );
   vec2 f = p - i;
   vec2 u  = f * f * f * ( f * ( f * 6.0 - 15.0 ) + 10.0 );
   vec2 du = 30.0 * f * f * ( f * ( f - 2.0 ) + 1.0 );
-  ivec2 ii = ivec2( i );
-  float a = latFetch( ii );
-  float b = latFetch( ii + ivec2( 1, 0 ) );
-  float c = latFetch( ii + ivec2( 0, 1 ) );
-  float d = latFetch( ii + ivec2( 1, 1 ) );
+  vec4 t = texelFetch( uLattice, ivec2( i ) & ivec2( 255 ), 0 );
+  float a = t.r, b = t.g, c = t.b, d = t.a;
   float k1 = b - a, k2 = c - a, k3 = a - b - c + d;
   return vec3(
     a + k1 * u.x + k2 * u.y + k3 * u.x * u.y,
     ( k1 + k3 * u.y ) * du.x,
     ( k2 + k3 * u.x ) * du.y
   );
+}
+
+// Value only — no Jacobian. Roughly a third of the octaves in this shader throw
+// the gradient away (wind fields, gate predicates, colour variation), and the
+// gradient is not free: it costs the du quintic and two multiply-adds here,
+// plus the whole 2x2 Jacobian rotation cascade in the fbm that consumes it.
+float latNoiseV( vec2 p ) {
+  vec2 i = floor( p );
+  vec2 f = p - i;
+  vec2 u  = f * f * f * ( f * ( f * 6.0 - 15.0 ) + 10.0 );
+  vec4 t = texelFetch( uLattice, ivec2( i ) & ivec2( 255 ), 0 );
+  float a = t.r, b = t.g, c = t.b, d = t.a;
+  return a + ( b - a ) * u.x + ( c - a ) * u.y + ( a - b - c + d ) * u.x * u.y;
 }
 `;
 
