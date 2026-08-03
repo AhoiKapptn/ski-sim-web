@@ -33,13 +33,25 @@ ALPINE_BASE="$BASE_PATH" npx vite build
 test -f dist/index.html || { echo "no dist/index.html — build failed" >&2; exit 1; }
 
 WT="$(mktemp -d)"
-cleanup() { cd "$ROOT"; git worktree remove --force "$WT" 2>/dev/null || true; rm -rf "$WT"; }
+# A UNIQUE local branch, pushed to $BRANCH by refspec, rather than checking out
+# $BRANCH itself. `git checkout --orphan gh-pages` fails with exit 128 once a
+# local `gh-pages` exists, and the first deploy is what creates it — so reusing
+# the name makes the script work exactly once and then fail forever after. Git
+# branches are shared across worktrees, which is what makes the collision
+# outlive the worktree that caused it.
+TMPB="deploy-pages-$$"
+cleanup() {
+  cd "$ROOT"
+  git worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
+  git worktree prune 2>/dev/null || true
+  git branch -D "$TMPB" 2>/dev/null || true
+}
 trap cleanup EXIT
 
-git worktree add --detach "$WT" >/dev/null 2>&1
+git worktree add --detach "$WT" >/dev/null
 (
   cd "$WT"
-  git checkout --orphan "$BRANCH" >/dev/null 2>&1
+  git checkout --orphan "$TMPB" >/dev/null 2>&1
   git rm -rf . --quiet >/dev/null 2>&1 || true
   cp -R "$ROOT/dist/." .
   # Jekyll is on by default on Pages and would skip any path starting with an
@@ -48,6 +60,6 @@ git worktree add --detach "$WT" >/dev/null 2>&1
   touch .nojekyll
   git add -A -f >/dev/null
   git commit -q -m "Deploy $SHA (base $BASE_PATH)"
-  git push -f -q origin "$BRANCH"
+  git push -f -q origin "HEAD:refs/heads/$BRANCH"
 )
 echo "pushed $BRANCH from $SHA"
