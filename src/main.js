@@ -694,19 +694,24 @@ const harness = {
  * It is still reachable in two cases, because every measurement tool in `tools/`
  * is built on it:
  *   - `pnpm dev` — always, so nothing about the dev workflow changes.
- *   - `?harness=1` — an explicit opt-in, which is what `tools/frametime.mjs
- *     --prod` uses. That tool runs `vite build` and serves the real bundle
- *     through `vite preview` precisely to measure what ships, so gating on DEV
- *     alone would have deleted the only tool that can measure a prod build.
+ *   - `VITE_HARNESS=1 vite build` — what `tools/frametime.mjs --prod` sets. That
+ *     tool builds and previews the real bundle precisely to measure what ships,
+ *     so gating on DEV alone would have deleted the only tool that can measure a
+ *     production build.
+ *
+ * Deliberately a BUILD-TIME flag and not a `?harness=1` URL parameter, which is
+ * what this was first written as. A URL opt-in leaves the whole surface sitting
+ * in the shipped bundle behind a string that anybody reading the source can find
+ * — and the source of this one is public. Vite substitutes `import.meta.env`
+ * statically, so with the flag unset the condition folds to `false` and the
+ * assignment is dead-code eliminated: the deployed bundle contains no path that
+ * publishes the harness at all, rather than one that merely declines to.
  *
  * The object is always CONSTRUCTED — `createPerf` is wired into the frame loop
  * either way and the not-recording path is one boolean test — this only decides
  * whether it is published to the window.
  */
-const HARNESS_ON = !!import.meta.env?.DEV || (() => {
-  try { return new URLSearchParams(location.search).get('harness') === '1'; }
-  catch { return false; }
-})();
+const HARNESS_ON = !!import.meta.env?.DEV || import.meta.env?.VITE_HARNESS === '1';
 if (HARNESS_ON) window.__harness = harness;
 
 let auto = true;

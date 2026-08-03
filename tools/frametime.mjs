@@ -114,13 +114,15 @@ export async function installPath(page, opts) {
 
 // ---- server -----------------------------------------------------------------
 /**
- * Join a query string onto a server URL that may ALREADY carry one.
+ * Join a query string onto a server URL, whether or not it already has one.
  *
- * `startServer({ prod: true })` returns a URL with `?harness=1` on it, because a
- * production bundle does not publish `window.__harness` without that opt-in. Any
- * caller doing `server.url + '?dpr=2'` would then produce `?harness=1?dpr=2`,
- * whose second parameter is named `?dpr` and is silently ignored — i.e. a
- * `--prod --dpr 2` run would quietly measure DPR 1. Use this instead of `+`.
+ * Defensive, not currently load-bearing: `startServer()` returns a bare origin
+ * today, so `server.url + '?dpr=2'` happens to work. It is here because that is
+ * a one-line change away from breaking silently in the worst way this repo has —
+ * `?a=1` + `?dpr=2` gives a second parameter named `?dpr`, which the page
+ * ignores, so a `--dpr 2` run would report itself as DPR 2 while rendering DPR 1
+ * and every number in the pair would be wrong with nothing to show it. Use this
+ * instead of `+` when appending to a server URL.
  */
 export function urlWith(base, extra = '') {
   const q = String(extra).replace(/^[?&]+/, '');
@@ -150,21 +152,24 @@ export async function startServer({ prod = false, port = 5301 } = {}) {
       close: () => server.close(),
     };
   }
+  // A production bundle does not publish `window.__harness` (see main.js): it is
+  // a debug surface and the deployed site is public. The flag is what puts it
+  // back, and it is required here — without it every tool built on this boot()
+  // would sit and time out waiting for a harness that is never coming.
+  //
+  // This does mean the `--prod` arm measures a bundle that is not byte-identical
+  // to the deployed one. The difference is the harness publication and nothing
+  // else; the DEV branches this mode exists to exclude (spray.js' every-20th-frame
+  // scan of all 34k particle slots, tracks.js') are still compiled out, because
+  // `import.meta.env.DEV` is still false in a build.
+  process.env.VITE_HARNESS = '1';
   await build({ root: ROOT, configFile: path.join(ROOT, 'vite.config.js'), logLevel: 'error' });
   const server = await preview({
     root: ROOT, configFile: path.join(ROOT, 'vite.config.js'),
     logLevel: 'error', preview: { port, strictPort: false, host: '127.0.0.1' },
   });
   const addr = server.httpServer.address();
-  // `?harness=1` is REQUIRED here. A production build does not publish
-  // `window.__harness` (see main.js) because it is a debug surface, so without
-  // the opt-in every tool built on this boot() would time out waiting for a
-  // harness that is never going to appear. The dev arm above needs nothing.
-  return {
-    mode: 'prod',
-    url: `http://127.0.0.1:${addr.port}/?harness=1`,
-    close: () => server.close(),
-  };
+  return { mode: 'prod', url: `http://127.0.0.1:${addr.port}/`, close: () => server.close() };
 }
 
 // ---- browser ----------------------------------------------------------------
