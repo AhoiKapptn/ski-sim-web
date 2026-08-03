@@ -34,6 +34,14 @@ the Read tool and actually look.** Exit 0 is not "it looks right".
 tracks, postfx, chaseCam, camera, scene, renderer }`. Write a probe against it and
 measure the scene rather than squinting at pixels.
 
+For anything performance-shaped, start in `pnpm dev`: press `` ` `` for the
+ablation panel (`src/core/debug-perf.js`, dev-only), then **`D`**. It measures
+the shipped frame against a floor with the scene emptied and says which of four
+things you are looking at — software rendering, the display pacing, something
+outside the renderer, or the scene. `F` walks the resolution ladder and reports
+which rungs LOCK. Do this before ablating subsystems: trap 8 is what happens if
+you don't.
+
 Magnify before judging detail — most defects here are invisible at 1:1:
 
 ```bash
@@ -41,7 +49,7 @@ ffmpeg -y -i shots/x/hero.png -vf "crop=340:360:1180:110,scale=1020:1080:flags=n
 ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=lavfi.signalstats.YAVG" -f null -
 ```
 
-## Measurement traps — all seven produced confident, wrong answers
+## Measurement traps — all eight produced confident, wrong answers
 
 1. **`--perf` absolute numbers are meaningless.** Headless Chrome mode-locks to
    divisions of the refresh rate by machine load. The *same unmodified build* has
@@ -139,6 +147,32 @@ ffmpeg -hide_banner -i img.png -vf "crop=W:H:X:Y,signalstats,metadata=print:key=
    measures. The `--sync-gpu` fallback advertised in `perf-ab.mjs`' header is not
    usable on this machine; the presented interval at DPR 2 is.
 
+8. **The display is not 60 Hz, and every threshold in this repo assumed it was.**
+   The owner's panel measures a **6.94 ms tick — 144 Hz**. The presented interval
+   is quantised to multiples of the refresh period, so the only frame times that
+   exist there are 6.9 / 13.9 / 20.8 / 27.8 ms. **16.67 ms is not one of them.**
+
+   Two consequences, both of which produced wrong answers in one session:
+
+   - A frame at 23.5 ms is not "42 fps". It is the 20.8 and 27.8 rungs
+     alternating, and that is what "the performance is bad" actually described:
+     163 of 171 frames over 20 ms but only 4 over 33. Shaving 2 ms off such a
+     frame changes nothing anybody can see, because it does not cross a rung.
+     **A win is only felt when it moves the frame onto a different rung**, so
+     quote the rung, not the millisecond delta.
+   - `engine.js`' controller aimed at `budget()` = 16.67 ms. On 60 and 120 Hz
+     panels that IS a rung, so aiming at the budget and aiming at a rung were
+     indistinguishable and nothing in the controller's history could tell them
+     apart. On 144 Hz they differ, and the controller settled between rungs and
+     then hunted. It now measures the tick and aims at the fastest rung that
+     still meets the target (`gfx.info().displayTick / vsyncLadder / lockMs`).
+
+   The tick cannot be read from the fastest frame observed — a struggling scene
+   at 144 Hz never once presents 6.9 ms. It is inferred from the SPACING of the
+   observed levels. And on a high-refresh panel the fps target is a real choice:
+   60 forces the 13.9 ms rung and a low resolution, `?fpstarget=48` takes the
+   20.8 ms rung and buys the pixels back for a lock that is just as smooth.
+
 `--perf` is a **stationary player at DPR 1**. It is structurally blind to
 motion-dependent cost and to fragment cost. Use `tools/frametime.mjs` (what is
 spiking — p50/p95/p99/max with per-frame attribution) and `tools/perf-ab.mjs`
@@ -175,6 +209,7 @@ Do not re-propose these. Each was asserted confidently and disproved by measurem
 | Park kickers read as bumps and launch you late | Two separate defects | **One defect.** The takeoff ramp peaked at **+7.7°** where a park kicker is 25–35°. Too shallow to read as built *and* too shallow to unload the skis — the rider separated 5.3 m past the lip. Raising the ramp fixed both |
 | "The performance is lagging a bit" | CPU cost, the post chain, draw calls, shadow maps, or the 527-call scene being too complex | **Fragment cost at DPR 2, and almost all of it one shader.** CPU is 0.4 ms update + 1.1 ms submit out of a 34 ms frame. Ablating every scene material returns the interval to the 16.70 ms vsync lock; the terrain snow shader alone is **well over half** of scene shading cost — **≥14.4 ms (censored by the vsync floor) against 3.6–8.3 ms for the entire rest of the scene**, measured with complement arms, 2/2 pairs. No post pass, no shadow pass and no CPU subsystem is measurable against it. The lever is pixels, not passes |
 | "The hut UI experience is weak" | The card's typography, the seated framing, or the lighting | **The room.** `buildings[0]`'s `w`/`d` are HALF-extents, so the enterable hall is **16.2 x 23.2 m — 374 m of floor — and it had two tables in it.** The seated shot was always fine; the moment the player used the look-around the file's own docstring advertises, it was a hangar with a stove in it. Nothing about the card was the problem until the room behind it was a room |
+| "Performance is an issue" and **no subsystem ablation changes anything** | Some subsystem is heavy; or the renderer is not the pacer at all | **The panel is 144 Hz and the frame sat BETWEEN vsync rungs.** The scene really was the cost (15.3 ms of a 23.5 ms frame, floor 8.2), so the ablations were aimed correctly — but no single one of them moved the frame across a rung, and only crossing a rung is visible. Underneath it, the controller was aiming at 16.67 ms, which is not a frame time a 144 Hz display can present. Found by measuring the FLOOR (empty scene, no sim, 25% resolution) against the shipped frame; `pnpm dev` → `` ` `` → `D` |
 | A solid object in the hut appears to hang in mid-air | Its Y coordinate; then the camera's depression angle | **Inside-out winding.** See the interface hazard below — you were seeing the box's interior floor. Two of the three diagnoses in this row were made and acted on before anyone magnified the crop |
 
 ## Interface hazards

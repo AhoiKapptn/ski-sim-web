@@ -365,6 +365,127 @@ export function createEngine(container, opts = {}) {
   let targetFps = num('fpstarget', opts.targetFps ?? 60);
   const budget = () => 1000 / Math.max(15, targetFps);
 
+  // --- the vsync ladder ------------------------------------------------------
+  /**
+   * MEASURED, on a 144 Hz display, and the reason this exists.
+   *
+   * Every threshold below used to be a fraction of `budget()` — 16.67 ms at the
+   * shipped target of 60 fps. That is not a frame time a display can present.
+   * The presented interval is quantised to multiples of the refresh period, so
+   * on a given panel the only frame times that exist are:
+   *
+   *      60 Hz    16.7  33.3  50.0        (budget IS a rung)
+   *     120 Hz     8.3  16.7  25.0  33.3  (budget IS a rung)
+   *     144 Hz     6.9  13.9  20.8  27.8  (budget is NOT a rung)
+   *
+   * On 60 and 120 Hz panels 16.67 ms is itself a rung, so aiming at the budget
+   * and aiming at a rung are the same instruction and nothing in this
+   * controller's history could tell them apart. On 144 Hz they are different,
+   * and the difference is a permanent judder:
+   *
+   *   - `meeting` accepted anything at or under 17.0 ms, so the controller would
+   *     happily settle on a rung whose true cost was ~16 ms. There is no 16 ms
+   *     rung at 144 Hz: it presents as an alternating 13.9 / 20.8 mix.
+   *   - the judder test then saw those 20.8 ms samples, stepped down, met budget
+   *     comfortably at 13.9, and after the 20 s backoff climbed straight back
+   *     into the same rung. A 20-second hunting cycle, each hop reallocating
+   *     ~12 render targets.
+   *
+   * Measured on the reporter's machine: 5.16 Mpx at scale 0.9, p50 23.5 ms —
+   * between the 20.8 and 27.8 rungs — with 163 of 171 frames over 20 ms but
+   * only 4 over 33. That distribution is not "37 fps", it is two rungs
+   * alternating, which is what the complaint actually was.
+   *
+   * So the controller now measures the tick and aims at the fastest RUNG that
+   * still meets the target, rather than at the target itself. At 60 and 120 Hz
+   * that is 16.67 ms exactly as before — the change is a no-op on every display
+   * this project has ever been measured on. At 144 Hz it is 13.89 ms, which is
+   * a frame time that can actually be presented, and the hunting stops.
+   *
+   * NOTE the target itself is still a choice, and on a high-refresh panel it is
+   * a real one: 60 fps forces the 13.89 ms rung and therefore a lower
+   * resolution, where `?fpstarget=48` picks the 20.83 ms rung and buys back a
+   * lot of pixels for a lock that is still perfectly smooth. `gfx.info()`
+   * reports the ladder so the choice can be made on numbers.
+   */
+  let displayTick = 0;               // ms; 0 = not yet known
+
+  /**
+   * Estimate the refresh period from the sample window.
+   *
+   * It cannot be read from the fastest frame observed: on a machine that is
+   * missing every frame, the fundamental is never presented — at 144 Hz a
+   * struggling scene shows 20.8 and 27.8 and never once 6.9. So the tick is
+   * inferred from the SPACING of the observed levels instead, which survives
+   * that: 20.8 and 27.8 are 3 and 4 multiples of 6.94, and no larger period
+   * explains both.
+   *
+   * Derived from the data rather than snapped to a list of standard refresh
+   * rates, because snapping mis-assigns — 13.89 ms sits within 4% of 75 Hz's
+   * 13.33 ms, which is well inside any tolerance loose enough to absorb
+   * Chrome's begin-frame jitter.
+   */
+  function estimateTick(n) {
+    if (n < 20) return;
+    const lo = pct(n, 0.05);         // robust fastest interval
+    if (!(lo > 1)) return;
+    // Largest candidate first: the fundamental is the LARGEST period that
+    // explains every level. Smaller ones always fit better and always would.
+    for (let k = 1; k <= 5; k++) {
+      const T = lo / k;
+      if (T < 3.5) break;            // faster than ~285 Hz is not a display
+      const tol = T * 0.12;
+      let fit = 0;
+      for (let i = 0; i < n; i++) {
+        const m = samples[i] / T;
+        if (Math.abs(m - Math.round(m)) * T <= tol) fit++;
+      }
+      if (fit / n < 0.85) continue;
+      // REFINE, and this step is load-bearing rather than cosmetic. `lo` is a
+      // low percentile, so it sits at the bottom of the jitter and T starts
+      // BELOW the true period: measured, a clean 60 Hz lock seeded T = 16.2
+      // against a real 16.70. Everything downstream is a threshold the frame
+      // has to satisfy, so a tick that is 3% low makes `meeting`
+      // (p70 <= lock * 1.02 = 16.52) unsatisfiable BY A PERFECT LOCK — the
+      // one-way ratchet of rule 5, arriving by a fifth route.
+      //
+      // So solve for the period that best explains the levels, rather than
+      // trusting the seed: with each sample assigned to its multiple, the
+      // least-squares T is sum(m*s) / sum(m*m). Recovers 16.70 from a 16.2
+      // seed, and 6.944 from the 13.89/20.83 pair a 144 Hz panel presents.
+      let sm = 0, smm = 0;
+      for (let i = 0; i < n; i++) {
+        const m = Math.round(samples[i] / T);
+        if (m >= 1 && Math.abs(samples[i] - m * T) <= tol) { sm += m * samples[i]; smm += m * m; }
+      }
+      displayTick = smm > 0 ? sm / smm : T;
+      return;
+    }
+    // Nothing fits: the frame is free-running, or the compositor is not pacing
+    // us. Leave the previous estimate rather than inventing one.
+  }
+
+  /**
+   * The frame time to actually aim at: the fastest rung that still meets the
+   * target. Falls back to the raw budget when the tick is unknown, and also
+   * when no rung at all fits under the budget — that second case matters,
+   * because a window in which every frame is (say) a clean 20.8 ms estimates
+   * the tick AS 20.8, and treating that as the aim would stop the descent that
+   * is about to reveal the real fundamental.
+   */
+  function lockMs() {
+    const b = budget();
+    if (!displayTick) return b;
+    // +2% of a tick so an exact multiple (60 Hz: 16.667 / 16.667) cannot land
+    // on 0.99999 and floor to the rung below.
+    const k = Math.floor((b + displayTick * 0.02) / displayTick);
+    return k >= 1 ? k * displayTick : b;
+  }
+
+  /** The first few rungs, for diagnostics and for choosing a target. */
+  const ladder = () => (displayTick
+    ? [1, 2, 3, 4].map((k) => +(k * displayTick).toFixed(2)) : null);
+
   // Preallocated: this ran `Array.prototype.slice` + `sort` twice per frame,
   // ~5400 allocations/s, to decide mostly NOT to act. Adding GC churn to the
   // frame tail in a project that quotes p99 is the wrong trade.
@@ -544,6 +665,19 @@ export function createEngine(container, opts = {}) {
     // distribution regardless of which mode the compositor is holding.
     const p70 = pct(nSamples, 0.70);
     const p30 = pct(nSamples, 0.30);
+    // Every threshold below is measured against the RUNG, not the budget. On a
+    // 60 or 120 Hz panel these are the same number; on 144 Hz they are not, and
+    // aiming at a frame time the display cannot present is what made the
+    // controller hunt. See the `displayTick` block above.
+    estimateTick(nSamples);
+    const lock = lockMs();
+    // A rung is judder when the window straddles it. The old constant was
+    // `b * 1.2` = 20 ms, justified as "between the ticks of both a 60 Hz and a
+    // 120 Hz panel" — true for those two, false at 144 Hz where 20.83 IS a
+    // rung. Half a tick above the aim is the same idea expressed in the unit
+    // that actually governs it, and it reproduces the old value closely on the
+    // panels the old value was measured on (120 Hz: 20.83 against 20.0).
+    const lateAbove = displayTick ? lock + displayTick * 0.5 : b * 1.2;
     // Record what this step actually costs, for predictMs(), WITH a timestamp.
     obsMs[idx] = p70;
     obsMpx[idx] = mpxNow();
@@ -553,7 +687,7 @@ export function createEngine(container, opts = {}) {
     // `b * 0.95` = 15.83 ms at 60 fps, which is below the 16.67 ms refresh
     // period — the identical error to the `b * 0.80` it replaced, one level
     // down. It matches the `meeting` test now.
-    const upLimit = b * 1.02;
+    const upLimit = lock * 1.02;
     const predUp = idx > 0 ? predictMs(idx - 1, p70, now) : null;
 
     // Every decision is recorded, not just the ones that move, so "why did it not
@@ -561,15 +695,21 @@ export function createEngine(container, opts = {}) {
     lastDecision = {
       t: Math.round(now), idx, scale: resolutionScale, mpx: +mpxNow().toFixed(3),
       budget: +b.toFixed(2), p70: +p70.toFixed(2), p30: +p30.toFixed(2),
+      // What the thresholds are really measured against, and the ladder it came
+      // from. `lock` differing from `budget` means this is a panel whose refresh
+      // does not divide the target — read the ladder before trusting any fps.
+      tick: displayTick ? +displayTick.toFixed(2) : null,
+      lock: +lock.toFixed(2),
       // Reported so the tick structure is visible in a log: every clean value
-      // here is an integer multiple of the ~8.33 ms begin-frame tick.
-      tickMultiple: +(p70 / 8.3333).toFixed(2),
-      downTest: p70 > b * 1.12 && p30 > b * 1.05,
+      // here is an integer multiple of the measured tick (8.33 ms in headless
+      // Chrome, whatever the panel says elsewhere).
+      tickMultiple: +(p70 / (displayTick || 8.3333)).toFixed(2),
+      downTest: p70 > lock * 1.12 && p30 > lock * 1.05,
       // fraction of the window landing a whole tick late — the judder signal
       lateFrac: +(Array.prototype.reduce.call(samples.subarray(0, nSamples),
-        (a, v) => a + (v > b * 1.2 ? 1 : 0), 0) / nSamples).toFixed(2),
+        (a, v) => a + (v > lateAbove ? 1 : 0), 0) / nSamples).toFixed(2),
       atFloor: idx >= maxStep(),
-      meeting: p70 <= b * 1.02,
+      meeting: p70 <= lock * 1.02,
       predictUp: predUp === null ? 'censored' : +predUp.toFixed(2),
       predictLimit: +upLimit.toFixed(2),
       upBlockedMs: idx > 0 ? Math.max(0, Math.round(upBlockUntil[idx - 1] - now)) : 0,
@@ -607,9 +747,9 @@ export function createEngine(container, opts = {}) {
     // A clean 60 lock reads 0% late, so the risk of lowering the gate is only
     // spurious down-steps on compositor flutter, which the up-path undoes.
     let late = 0;
-    for (let k = 0; k < nSamples; k++) if (samples[k] > b * 1.2) late++;
+    for (let k = 0; k < nSamples; k++) if (samples[k] > lateAbove) late++;
     const judder = late / nSamples > 0.25;
-    if ((p70 > b * 1.12 && p30 > b * 1.05) || judder) {
+    if ((p70 > lock * 1.12 && p30 > lock * 1.05) || judder) {
       if (idx < maxStep()) {
         // BOOT CALIBRATION: during the first seconds after the grace period the
         // start rung (capped at INIT_MPX, not measured) can be several rungs
@@ -621,7 +761,7 @@ export function createEngine(container, opts = {}) {
         // trap-5 sense: it is deliberately conservative in the safe direction,
         // and the next window corrects it — downward overshoot is exactly the
         // error the reliable up-path exists to undo.
-        const extra = bootPhase ? Math.floor(Math.max(0, p70 - b) / 5) : 0;
+        const extra = bootPhase ? Math.floor(Math.max(0, p70 - lock) / 5) : 0;
         next = Math.min(maxStep(), idx + 1 + extra);
         // This index was too expensive a moment ago. Don't come straight back.
         upBlockUntil[idx] = now + UP_BACKOFF_MS;
@@ -633,7 +773,7 @@ export function createEngine(container, opts = {}) {
       // therefore unsatisfiable while frames are presenting. The question is not
       // "is the frame under budget", which vsync forbids; it is "is the frame
       // MEETING vsync, and would it still meet it after paying for the pixels".
-      const meeting = p70 <= b * 1.02;
+      const meeting = p70 <= lock * 1.02;
       // ┌─────────────────────────────────────────────────────────────────────┐
       // │ `predUp === null ||` IS THE LOAD-BEARING CLAUSE AT 60 Hz. DO NOT     │
       // │ REMOVE IT. Every up-step at the shipped 60 fps target goes through   │
@@ -847,6 +987,14 @@ export function createEngine(container, opts = {}) {
         lastDecision,
         minResolutionScale: minScale,
         targetFps,
+        // The panel this session is actually being presented on, and the frame
+        // times it can present. `lockMs` is what the controller aims at; when it
+        // differs from `1000/targetFps` the target is not on this panel's ladder
+        // and the reachable rates are `1000 / ladder[k]`, nothing in between.
+        displayTick: displayTick ? +displayTick.toFixed(3) : null,
+        displayHz: displayTick ? +(1000 / displayTick).toFixed(1) : null,
+        vsyncLadder: ladder(),
+        lockMs: +lockMs().toFixed(2),
       };
     },
   };

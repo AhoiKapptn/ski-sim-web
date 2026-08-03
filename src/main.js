@@ -762,3 +762,19 @@ branding.ready.then(() => {
   harness.ready = true;
   document.getElementById('boot').classList.add('gone');
 });
+
+// --- dev-only perf ablation panel --------------------------------------------
+// `pnpm dev` only, and dynamically imported so the module is not in a production
+// bundle at all. Nine subsystem toggles on the number row plus the resolution
+// knob, a repeatable benchmark, and a results table — see src/core/debug-perf.js
+// for what each arm does and does not isolate. It holds `gfx.freeze()` while it
+// is open, because the adaptive resolution controller otherwise spends every win
+// you measure and makes each subsystem look free.
+if (import.meta.env?.DEV) {
+  import('./core/debug-perf.js')
+    .then((m) => m.createDebugPanel({
+      renderer, scene, camera, gfx, state, harness,
+      terrain, sky, scatter, spray, tracks, postfx, draglift, branding,
+    }))
+    .catch((e) => console.warn('[dbg] perf panel failed to load:', e));
+}
