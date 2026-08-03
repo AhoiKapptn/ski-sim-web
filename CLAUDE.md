@@ -268,6 +268,45 @@ Frame spikes are a **tail** statistic. The vsync mode-lock in trap 1 corrupts
 means, not tails: a 40 ms frame is 40 ms whichever mode the compositor holds.
 Quote p99 and count-over-20 ms, never fps.
 
+## `window.__harness` does not exist in a production build
+
+Every tool here is built on it, so this is the first thing to know before
+measuring a build rather than a dev server. `main.js` publishes it only under
+`pnpm dev` or when the bundle was built with **`VITE_HARNESS=1`**. Without the
+flag, `window.__harness=` is not merely guarded — Vite folds
+`import.meta.env.VITE_HARNESS` at build time and the assignment is dead-code
+eliminated, so it is absent from the bundle. The symptom of forgetting is a tool
+hanging on `waitForFunction('window.__harness…')` until it times out, which
+reads as a boot failure and not as a missing flag. `tools/frametime.mjs --prod`
+sets it already.
+
+It was a `?harness=1` URL parameter first. Do not go back to that: it leaves the
+whole surface in the shipped bundle behind a string anyone reading the source can
+find, and **the source is public** (`AhoiKapptn/ski-sim-web`). The `--prod` arm
+therefore measures a bundle differing from the deployed one by the harness
+publication and nothing else — the `import.meta.env.DEV` branches that mode
+exists to exclude are still compiled out.
+
+Two things that look like debug hooks and are load-bearing, so do not gate them:
+
+- **`window.__setAuto` is the project's only pause.** The Escape settings panel
+  drives it and `engine.js` monkey-patches it so the resolution controller pauses
+  with the sim. Gating it leaves the panel open over a running game.
+- **`camera.js` used to read the scatter pools off `__harness.debug.scatter`**, so
+  the boom ducking away from trees — gameplay — rode on the debug global. It takes
+  `scatter` as an argument now. This is the shape of bug to look for before
+  removing any global: a per-call-site reach through a debug object is evidence of
+  a missing dependency, and the failure was silent in the worst way, the boom just
+  quietly stopping to flinch.
+
+Deploy with `tools/deploy-pages.sh` (Pages serves the `gh-pages` branch; not a
+GitHub Actions workflow because pushing `.github/workflows/` needs the `workflow`
+OAuth scope this token lacks). `ALPINE_BASE` must match the repo name — a Pages
+project site is served from `/<repo>/`, and `vite.config.js` defaults to `/` so the
+dev server and every tool keep working. **Do not hard-code the subpath in the
+config**: it would 404 every tool at once, and the symptom is the harness never
+appearing rather than anything that mentions routing.
+
 ## Never use `git stash`
 
 It is a single ref shared by **every worktree** of the repo. Two agents stashing
